@@ -1,0 +1,40 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local tool/editor state
+.claude/
+.env
+.env.*
+
+# Large binaries, videos, and model artifacts
+*.exe
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.webm
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Sample workspaces and generated annotation outputs
+sampleInput*/
+annotation_test.json
+clips/
+segments/
+tracking_results*.json
+tracking_results.csv
+tracking_yolo/
+tracking_overview.mp4
+yoloset/
+annotation_project.json
+sam31_runs/
+sam31_cache/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
