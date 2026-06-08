@@ -39,6 +39,19 @@ def bbox_size(bbox: List[float]) -> Tuple[float, float, float]:
     return width, height, width * height
 
 
+def percentile(values: List[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * max(0.0, min(1.0, q))
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    weight = pos - lo
+    return ordered[lo] * (1.0 - weight) + ordered[hi] * weight
+
+
 def clip_bbox(bbox: List[float], width: int, height: int) -> List[float]:
     x1 = max(0.0, min(float(width), bbox[0]))
     y1 = max(0.0, min(float(height), bbox[1]))
@@ -69,6 +82,10 @@ class AnnotationState:
         self.frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = float(cap.get(cv2.CAP_PROP_FPS))
         cap.release()
+
+    def clear_tracks(self) -> None:
+        self.tracks = {}
+        self.next_track_id = 1
 
     def add_track(self, class_id: int = 0) -> int:
         tid = self.next_track_id
@@ -266,6 +283,139 @@ class AnnotationState:
             })
 
         return {"fixed_frames": fixed_frames, "intervals": intervals}
+
+    def detect_area_anomaly_segments(
+        self,
+        high_area_ratio: float = 3.0,
+        low_area_ratio: float = 0.25,
+        robust_z_threshold: float = 6.0,
+        min_track_frames: int = 8,
+        min_area: float = 1.0,
+        max_gap: int = 1,
+    ) -> Dict[str, Any]:
+        """Find suspicious intervals from each track's full-run area distribution."""
+        high_area_ratio = max(1.0, float(high_area_ratio))
+        low_area_ratio = max(0.0, min(1.0, float(low_area_ratio)))
+        robust_z_threshold = max(0.0, float(robust_z_threshold))
+        min_track_frames = max(1, int(min_track_frames))
+        min_area = max(0.0, float(min_area))
+        max_gap = max(0, int(max_gap))
+
+        tracks_out = []
+        for tid in sorted(self.tracks.keys()):
+            track = self.tracks[tid]
+            frame_ids = sorted(track.frames.keys())
+            area_rows = []
+            for frame_idx in frame_ids:
+                width, height, area = bbox_size(track.frames[frame_idx])
+                area_rows.append({
+                    "frame_idx": frame_idx,
+                    "width": width,
+                    "height": height,
+                    "area": area,
+                })
+
+            positive_areas = [row["area"] for row in area_rows if row["area"] >= min_area]
+            if len(positive_areas) < min_track_frames:
+                tracks_out.append({
+                    "track_id": tid,
+                    "class_id": track.class_id,
+                    "num_frames": len(frame_ids),
+                    "median_area": 0.0,
+                    "q1_area": 0.0,
+                    "q3_area": 0.0,
+                    "mad_area": 0.0,
+                    "segments": [],
+                })
+                continue
+
+            median_area = median(positive_areas)
+            q1_area = percentile(positive_areas, 0.25)
+            q3_area = percentile(positive_areas, 0.75)
+            mad_area = median([abs(area - median_area) for area in positive_areas])
+            suspicious = []
+
+            for row in area_rows:
+                area = row["area"]
+                reasons = []
+                area_ratio = area / median_area if median_area > 0 else 0.0
+                robust_z = 0.0
+                if mad_area > 0:
+                    robust_z = 0.6745 * (area - median_area) / mad_area
+
+                if area < min_area:
+                    reasons.append("degenerate_area")
+                elif median_area > 0 and area_ratio >= high_area_ratio:
+                    reasons.append("high_area_ratio")
+                elif median_area > 0 and low_area_ratio > 0 and area_ratio <= low_area_ratio:
+                    reasons.append("low_area_ratio")
+
+                if robust_z_threshold > 0 and abs(robust_z) >= robust_z_threshold:
+                    reasons.append("robust_z")
+
+                if reasons:
+                    suspicious.append({
+                        **row,
+                        "area_ratio": area_ratio,
+                        "robust_z": robust_z,
+                        "reasons": sorted(set(reasons)),
+                    })
+
+            groups: List[List[Dict[str, Any]]] = []
+            for row in suspicious:
+                if not groups or row["frame_idx"] - groups[-1][-1]["frame_idx"] > max_gap + 1:
+                    groups.append([row])
+                else:
+                    groups[-1].append(row)
+
+            segments = []
+            for group in groups:
+                areas = [row["area"] for row in group]
+                ratios = [row["area_ratio"] for row in group]
+                robust_zs = [row["robust_z"] for row in group]
+                reason_set = sorted({reason for row in group for reason in row["reasons"]})
+                segments.append({
+                    "start": int(group[0]["frame_idx"]),
+                    "end": int(group[-1]["frame_idx"]),
+                    "frames": len(group),
+                    "reasons": reason_set,
+                    "max_area": max(areas),
+                    "min_area": min(areas),
+                    "max_area_ratio": max(ratios) if ratios else 0.0,
+                    "min_area_ratio": min(ratios) if ratios else 0.0,
+                    "max_abs_robust_z": max((abs(value) for value in robust_zs), default=0.0),
+                })
+
+            tracks_out.append({
+                "track_id": tid,
+                "class_id": track.class_id,
+                "num_frames": len(frame_ids),
+                "median_area": median_area,
+                "q1_area": q1_area,
+                "q3_area": q3_area,
+                "mad_area": mad_area,
+                "segments": segments,
+            })
+
+        return {
+            "metadata": {
+                "video_path": self.video_path,
+                "fps": self.fps,
+                "width": self.width,
+                "height": self.height,
+                "frame_count": self.frame_count,
+                "num_tracks": len(tracks_out),
+            },
+            "parameters": {
+                "high_area_ratio": high_area_ratio,
+                "low_area_ratio": low_area_ratio,
+                "robust_z_threshold": robust_z_threshold,
+                "min_track_frames": min_track_frames,
+                "min_area": min_area,
+                "max_gap": max_gap,
+            },
+            "tracks": tracks_out,
+        }
 
     def get_track_ids(self) -> List[int]:
         return sorted(self.tracks.keys())

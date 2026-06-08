@@ -28,6 +28,7 @@ label { font-size: 11px; color: #aaa; display: block; margin-bottom: 2px; }
 .track-lane .bar { flex: 1; height: 14px; background: #111; border-radius: 2px; position: relative; }
 .track-lane .bar .filled { position: absolute; height: 100%; border-radius: 2px; opacity: 0.5; }
 .track-lane .bar .gap { position: absolute; height: 4px; top: 5px; background: #ff4444; border-radius: 1px; }
+.track-lane .bar .area-issue { position: absolute; height: 100%; top: 0; background: rgba(245, 158, 11, 0.78); border: 1px solid #fbbf24; border-radius: 2px; box-shadow: 0 0 0 1px rgba(0,0,0,0.35) inset; }
 .track-lane .bar .playhead { position: absolute; width: 2px; height: 100%; background: #fff; opacity: 0.8; }
 #info-bar { font-size: 11px; color: #aaa; margin-bottom: 6px; min-height: 16px; }
 </style>
@@ -178,17 +179,23 @@ let ANNOTATION_BUFFER_AHEAD = 60;
 let ANNOTATION_BATCH_SIZE = 60;
 let ANNOTATION_CACHE_LIMIT = 300;
 let videoVersion = 0;
+let clientGeneration = 0;
+let annotationGeneration = 0;
 let batchFetching = false;
 let batchFetchedUpTo = -1;
 let annotationBatchFetching = false;
 let annotationFetchedUpTo = -1;
 let sam31JobTimer = null;
+let overlayRaf = null;
+const mediaAborters = new Set();
+const MEDIA_FETCH_TIMEOUT_MS = 8000;
+let playbackWaitTicks = 0;
 
 // =========================================================================
 // API
 // =========================================================================
-async function api(method, url, body) {
-  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+async function api(method, url, body, extraOpts = {}) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' }, ...extraOpts };
   if (body !== undefined) opts.body = JSON.stringify(body);
   const r = await fetch(url, opts);
   if (!r.ok) {
@@ -196,6 +203,38 @@ async function api(method, url, body) {
     throw new Error(err.detail || 'API error');
   }
   return r.json();
+}
+
+function createMediaController(timeoutMs = 0) {
+  const controller = new AbortController();
+  if (timeoutMs > 0) {
+    controller.timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  }
+  mediaAborters.add(controller);
+  return controller;
+}
+
+function releaseMediaController(controller) {
+  if (controller.timeoutId) clearTimeout(controller.timeoutId);
+  mediaAborters.delete(controller);
+}
+
+function resetMediaState({ clearImage = true } = {}) {
+  clientGeneration++;
+  stopPlay();
+  for (const controller of mediaAborters) controller.abort();
+  mediaAborters.clear();
+  frameCache.forEach(url => URL.revokeObjectURL(url));
+  frameCache.clear();
+  clearAnnotationCache();
+  batchFetching = false;
+  batchFetchedUpTo = -1;
+  annotationBatchFetching = false;
+  annotationFetchedUpTo = -1;
+  playbackWaitTicks = 0;
+  currentBoxes = [];
+  if (clearImage) frameImg.removeAttribute('src');
+  renderOverlay();
 }
 
 // =========================================================================
@@ -206,12 +245,18 @@ function frameUrl(idx) { return `/api/frame-image/${idx}?v=${videoVersion}`; }
 async function fetchBatch(startIdx) {
   if (batchFetching) return;
   if (startIdx >= state.frame_count) return;
+  const requestGeneration = clientGeneration;
+  const requestVersion = videoVersion;
   const count = Math.min(BATCH_SIZE, state.frame_count - startIdx);
+  const controller = createMediaController(MEDIA_FETCH_TIMEOUT_MS);
   batchFetching = true;
   try {
-    const resp = await fetch(`/api/frame-batch/${startIdx}/${count}?v=${videoVersion}`);
-    if (!resp.ok) { batchFetching = false; return; }
+    const resp = await fetch(`/api/frame-batch/${startIdx}/${count}?v=${requestVersion}`, {
+      signal: controller.signal,
+    });
+    if (!resp.ok) return;
     const buffer = await resp.arrayBuffer();
+    if (requestGeneration !== clientGeneration || requestVersion !== videoVersion) return;
     const view = new DataView(buffer);
     let offset = 0;
     let idx = startIdx;
@@ -225,17 +270,32 @@ async function fetchBatch(startIdx) {
       frameCache.set(idx, url);
       idx++;
     }
-    batchFetchedUpTo = idx - 1;
-  } catch (e) {}
-  batchFetching = false;
+    batchFetchedUpTo = Math.max(batchFetchedUpTo, idx - 1);
+  } catch (e) {
+    if (e.name !== 'AbortError') console.warn(e);
+  } finally {
+    releaseMediaController(controller);
+    if (requestGeneration === clientGeneration) batchFetching = false;
+  }
+}
+
+function firstMissingFrame(fromIdx, lookAhead) {
+  const end = Math.min(state.frame_count - 1, fromIdx + lookAhead);
+  for (let idx = Math.max(0, fromIdx); idx <= end; idx++) {
+    if (!frameCache.has(idx)) return idx;
+  }
+  return null;
 }
 
 function ensureBuffer(fromIdx) {
-  // Trigger batch fetch if buffer is running low
-  const buffered = batchFetchedUpTo - fromIdx;
-  if (buffered < BUFFER_AHEAD / 2 && !batchFetching) {
-    const fetchFrom = Math.max(fromIdx, batchFetchedUpTo + 1);
-    fetchBatch(fetchFrom);
+  const missing = firstMissingFrame(fromIdx, Math.max(BUFFER_AHEAD, BATCH_SIZE));
+  if (missing !== null && !batchFetching) {
+    fetchBatch(missing);
+  } else {
+    const buffered = batchFetchedUpTo - fromIdx;
+    if (buffered < BUFFER_AHEAD / 2 && !batchFetching) {
+      fetchBatch(Math.max(fromIdx, batchFetchedUpTo + 1));
+    }
   }
   // Evict old frames to cap memory
   if (frameCache.size > FRAME_CACHE_LIMIT) {
@@ -254,25 +314,50 @@ async function fetchAnnotationBatch(startIdx) {
   if (annotationBatchFetching) return;
   if (startIdx >= state.frame_count) return;
   const count = Math.min(ANNOTATION_BATCH_SIZE, state.frame_count - startIdx);
+  const requestGeneration = clientGeneration;
+  const requestAnnotationGeneration = annotationGeneration;
   const requestVersion = videoVersion;
+  const controller = createMediaController(MEDIA_FETCH_TIMEOUT_MS);
   annotationBatchFetching = true;
   try {
-    const data = await api('GET', `/api/annotations-batch/${startIdx}/${count}?v=${videoVersion}`);
-    if (requestVersion === videoVersion) {
+    const data = await api('GET', `/api/annotations-batch/${startIdx}/${count}?v=${requestVersion}`, undefined, {
+      signal: controller.signal,
+    });
+    if (
+      requestGeneration === clientGeneration &&
+      requestAnnotationGeneration === annotationGeneration &&
+      requestVersion === videoVersion
+    ) {
       for (const frame of data.frames || []) {
         annotationCache.set(frame.frame_idx, frame.annotations || []);
         annotationFetchedUpTo = Math.max(annotationFetchedUpTo, frame.frame_idx);
       }
     }
-  } catch (e) {}
-  annotationBatchFetching = false;
+  } catch (e) {
+    if (e.name !== 'AbortError') console.warn(e);
+  } finally {
+    releaseMediaController(controller);
+    if (requestGeneration === clientGeneration) annotationBatchFetching = false;
+  }
+}
+
+function firstMissingAnnotationFrame(fromIdx, lookAhead) {
+  const end = Math.min(state.frame_count - 1, fromIdx + lookAhead);
+  for (let idx = Math.max(0, fromIdx); idx <= end; idx++) {
+    if (!annotationCache.has(idx)) return idx;
+  }
+  return null;
 }
 
 function ensureAnnotationBuffer(fromIdx) {
-  const buffered = annotationFetchedUpTo - fromIdx;
-  if (buffered < ANNOTATION_BUFFER_AHEAD / 2 && !annotationBatchFetching) {
-    const fetchFrom = Math.max(fromIdx, annotationFetchedUpTo + 1);
-    fetchAnnotationBatch(fetchFrom);
+  const missing = firstMissingAnnotationFrame(fromIdx, Math.max(ANNOTATION_BUFFER_AHEAD, ANNOTATION_BATCH_SIZE));
+  if (missing !== null && !annotationBatchFetching) {
+    fetchAnnotationBatch(missing);
+  } else {
+    const buffered = annotationFetchedUpTo - fromIdx;
+    if (buffered < ANNOTATION_BUFFER_AHEAD / 2 && !annotationBatchFetching) {
+      fetchAnnotationBatch(Math.max(fromIdx, annotationFetchedUpTo + 1));
+    }
   }
   if (annotationCache.size > ANNOTATION_CACHE_LIMIT) {
     const keepBehind = Math.max(5, Math.floor(ANNOTATION_BUFFER_AHEAD / 3));
@@ -286,6 +371,7 @@ function ensureAnnotationBuffer(fromIdx) {
 }
 
 function clearAnnotationCache() {
+  annotationGeneration++;
   annotationCache.clear();
   annotationFetchedUpTo = -1;
 }
@@ -304,6 +390,7 @@ function showFrame(idx) {
 // Core
 // =========================================================================
 function seekToFrame(idx) {
+  playbackWaitTicks = 0;
   idx = Math.max(0, Math.min(state.frame_count - 1, idx));
   currentFrame = idx;
   slider.value = idx;
@@ -325,16 +412,29 @@ async function fetchAnnotations(frameIdx) {
   if (isPlaying) return;
   currentBoxes = [];
   renderOverlay();
+  const requestGeneration = clientGeneration;
+  const requestAnnotationGeneration = annotationGeneration;
   const requestVersion = videoVersion;
+  const controller = createMediaController(MEDIA_FETCH_TIMEOUT_MS);
   try {
-    const data = await api('GET', `/api/frame/${frameIdx}`);
-    if (requestVersion !== videoVersion) return;
+    const data = await api('GET', `/api/frame/${frameIdx}?v=${requestVersion}`, undefined, {
+      signal: controller.signal,
+    });
+    if (
+      requestGeneration !== clientGeneration ||
+      requestAnnotationGeneration !== annotationGeneration ||
+      requestVersion !== videoVersion
+    ) return;
     annotationCache.set(frameIdx, data.annotations || []);
     if (frameIdx === currentFrame) {
       currentBoxes = data.annotations || [];
       renderOverlay();
     }
-  } catch (e) {}
+  } catch (e) {
+    if (e.name !== 'AbortError') console.warn(e);
+  } finally {
+    releaseMediaController(controller);
+  }
 }
 
 // =========================================================================
@@ -343,13 +443,17 @@ async function fetchAnnotations(frameIdx) {
 function togglePlay() { isPlaying ? stopPlay() : startPlay(); }
 function startPlay() {
   isPlaying = true;
+  playbackWaitTicks = 0;
   document.getElementById('play-btn').textContent = '⏸ Stop';
   const speed = parseFloat(document.getElementById('speed-select').value);
   const interval = 1000.0 / (state.fps * speed);
+  const playGeneration = clientGeneration;
   // Pre-fetch a batch ahead before starting
-  ensureBuffer(currentFrame);
-  ensureAnnotationBuffer(currentFrame);
+  ensureBuffer(currentFrame + 1);
+  ensureAnnotationBuffer(currentFrame + 1);
   Promise.all([fetchBatch(currentFrame + 1), fetchAnnotationBatch(currentFrame + 1)]).then(() => {
+    if (!isPlaying || playGeneration !== clientGeneration) return;
+    if (playTimer) clearInterval(playTimer);
     playTimer = setInterval(playTick, interval);
   });
 }
@@ -358,10 +462,15 @@ function playTick() {
   const nextFrame = currentFrame + 1;
   // Adaptive: skip frame display if not buffered (don't stutter, just wait)
   if (!frameCache.has(nextFrame) || !annotationCache.has(nextFrame)) {
-    ensureBuffer(currentFrame);
-    ensureAnnotationBuffer(currentFrame);
+    playbackWaitTicks++;
+    ensureBuffer(nextFrame);
+    ensureAnnotationBuffer(nextFrame);
+    if (playbackWaitTicks === 10) {
+      setStatus(`Buffering frame ${nextFrame}...`);
+    }
     return; // skip this tick, try next interval
   }
+  playbackWaitTicks = 0;
   currentFrame = nextFrame;
   slider.value = currentFrame;
   document.getElementById('frame-num').textContent = `${currentFrame}/${state.frame_count - 1}`;
@@ -372,6 +481,7 @@ function playTick() {
 }
 function stopPlay() {
   isPlaying = false;
+  playbackWaitTicks = 0;
   document.getElementById('play-btn').textContent = '▶ Play';
   if (playTimer) { clearInterval(playTimer); playTimer = null; }
   updateInfo(); renderTimeline();
@@ -409,6 +519,13 @@ slider.addEventListener('input', () => { if (isPlaying) stopPlay(); seekToFrame(
 // =========================================================================
 function resizeCanvas() { canvas.width = frameImg.clientWidth; canvas.height = frameImg.clientHeight; renderOverlay(); }
 function renderOverlay() {
+  if (overlayRaf !== null) return;
+  overlayRaf = requestAnimationFrame(() => {
+    overlayRaf = null;
+    paintOverlay();
+  });
+}
+function paintOverlay() {
   if (!canvas.width || !state.width) return;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   const scaleX = canvas.width / state.width, scaleY = canvas.height / state.height;
@@ -502,7 +619,7 @@ async function copyPrevAnnotation() {
   if (!t) return;
   const prev = t.annotated_indices.filter(i => i < currentFrame);
   if (!prev.length) { setStatus('No previous annotation'); return; }
-  const data = await api('GET', `/api/frame/${prev[prev.length-1]}`);
+  const data = await api('GET', `/api/frame/${prev[prev.length-1]}?v=${videoVersion}`);
   const prevBox = data.annotations.find(a => a.track_id === activeTrackId);
   if (!prevBox) return;
   const idx = currentBoxes.findIndex(b => b.track_id === activeTrackId);
@@ -663,12 +780,9 @@ async function openWorkspace() {
   const path = document.getElementById('workspace-path').value.trim();
   if (!path) return;
   try {
+    resetMediaState();
     const r = await api('POST', '/api/open-workspace', { path });
-    videoVersion++;
-    frameCache.forEach(url => URL.revokeObjectURL(url));
-    frameCache.clear();
-    clearAnnotationCache();
-    batchFetchedUpTo = -1;
+    videoVersion = r.version ?? (videoVersion + 1);
     await refreshState();
     seekToFrame(0);
     const info = [`Workspace: ${r.video}`, `${r.width}x${r.height}`, `${r.frame_count}f`, `${r.fps.toFixed(1)}fps`];
@@ -710,12 +824,9 @@ async function loadSegments() {
 
 async function openSegment(segPath) {
   try {
+    resetMediaState();
     const r = await api('POST', '/api/open-workspace', { path: segPath });
-    videoVersion++;
-    frameCache.forEach(url => URL.revokeObjectURL(url));
-    frameCache.clear();
-    clearAnnotationCache();
-    batchFetchedUpTo = -1;
+    videoVersion = r.version ?? (videoVersion + 1);
     await refreshState();
     seekToFrame(0);
     setStatus(`Segment: ${r.video} | ${r.frame_count}f | ${r.num_tracks} tracks`);
@@ -742,6 +853,7 @@ async function runAllSegments() {
 }
 async function refreshState() {
   state = await api('GET', '/api/state');
+  if (state.version != null) videoVersion = state.version;
   applyAnnotatorConfig(state.annotator || {});
   slider.max = Math.max(1, state.frame_count - 1);
   if (!state.tracks.find(t => t.track_id === activeTrackId))
@@ -763,7 +875,8 @@ async function runPipeline() {
   setStatus('Running pipeline...');
   try {
     const r = await api('POST', '/api/run-pipeline');
-    frameCache.clear(); clearAnnotationCache(); await refreshState(); seekToFrame(0);
+    resetMediaState({ clearImage: false });
+    await refreshState(); seekToFrame(0);
     setStatus(`Pipeline done: ${r.num_tracks} tracks`);
   } catch (e) { setStatus('Error: '+e.message); }
 }
@@ -779,11 +892,15 @@ async function saveProject() {
   catch (e) { setStatus('Error: '+e.message); }
 }
 async function loadProject() {
-  try { await api('POST', '/api/load'); clearAnnotationCache(); await refreshState(); seekToFrame(0); setStatus('Project loaded'); }
+  try { await api('POST', '/api/load'); resetMediaState({ clearImage: false }); await refreshState(); seekToFrame(0); setStatus('Project loaded'); }
   catch (e) { setStatus('Error: '+e.message); }
 }
 async function exportResults() {
-  try { const r = await api('POST', '/api/export'); setStatus(`Exported ${r.num_tracks} tracks → ${r.path}`); }
+  try {
+    const r = await api('POST', '/api/export');
+    const extra = r.area_anomaly_path ? ` | issues → ${r.area_anomaly_path}` : '';
+    setStatus(`Exported ${r.num_tracks} tracks → ${r.path}${extra}`);
+  }
   catch (e) { setStatus('Error: '+e.message); }
 }
 async function exportYolo() {
@@ -806,7 +923,9 @@ function renderTrackList() {
     div.style.borderLeft = `3px solid ${trackColor(t.track_id)}`;
     if (t.track_id === activeTrackId) div.style.background = '#333';
     const range = t.start_frame != null ? `${t.start_frame}-${t.end_frame}` : 'empty';
-    div.textContent = `T${t.track_id} c${t.class_id} [${range}] (${t.num_frames}f)`;
+    const issueCount = t.area_anomaly_count || 0;
+    const issueText = issueCount ? ` !${issueCount}` : '';
+    div.textContent = `T${t.track_id} c${t.class_id} [${range}] (${t.num_frames}f)${issueText}`;
     div.onclick = () => setActiveTrack(t.track_id);
     el.appendChild(div);
   }
@@ -832,6 +951,15 @@ function renderTimeline() {
           const gl=(idx[i-1]/maxF*100).toFixed(1), gw=((idx[i]-idx[i-1])/maxF*100).toFixed(1);
           bar += `<div class="gap" style="left:${gl}%;width:${gw}%"></div>`;
         }
+      }
+      for (const seg of (t.area_anomaly_segments || [])) {
+        const start = Math.max(0, Math.min(maxF, parseInt(seg.start)));
+        const end = Math.max(start, Math.min(maxF, parseInt(seg.end)));
+        const l = (start/maxF*100).toFixed(1);
+        const w = Math.max(0.5, ((end - start + 1)/maxF*100)).toFixed(1);
+        const reasons = (seg.reasons || []).join('+') || 'area';
+        const ratio = Number(seg.max_area_ratio || 0).toFixed(2);
+        bar += `<div class="area-issue" title="Area issue ${start}-${end} ${reasons} maxRatio=${ratio}" style="left:${l}%;width:${w}%"></div>`;
       }
     }
     bar += `<div class="playhead" style="left:${(currentFrame/maxF*100).toFixed(1)}%"></div>`;

@@ -4,7 +4,8 @@ import csv
 import json
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from statistics import median
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 
@@ -36,6 +37,148 @@ def get_video_metadata(video_path: Path) -> Tuple[int, int, int, float]:
     if width <= 0 or height <= 0 or frame_count <= 0:
         raise RuntimeError(f"Invalid video metadata for {video_path}")
     return width, height, frame_count, fps
+
+
+def _percentile(values: List[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * max(0.0, min(1.0, q))
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    weight = pos - lo
+    return ordered[lo] * (1.0 - weight) + ordered[hi] * weight
+
+
+def _bbox_area_xyxy(bbox: Sequence[float]) -> float:
+    return max(0.0, float(bbox[2]) - float(bbox[0])) * max(0.0, float(bbox[3]) - float(bbox[1]))
+
+
+def build_area_anomaly_report(payload: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = dict(config or {})
+    enabled = bool(cfg.get("enabled", True))
+    high_area_ratio = max(1.0, float(cfg.get("high_area_ratio", 3.0)))
+    low_area_ratio = max(0.0, min(1.0, float(cfg.get("low_area_ratio", 0.25))))
+    robust_z_threshold = max(0.0, float(cfg.get("robust_z_threshold", 6.0)))
+    min_track_frames = max(1, int(cfg.get("min_track_frames", 8)))
+    min_area = max(0.0, float(cfg.get("min_area", 1.0)))
+    max_gap = max(0, int(cfg.get("max_gap", 1)))
+
+    tracks_out = []
+    if enabled:
+        for track in payload.get("tracks", []):
+            rows = []
+            for frame in track.get("frames", []):
+                bbox = [float(value) for value in frame["bbox_xyxy"]]
+                rows.append({
+                    "frame_idx": int(frame["video_frame_idx"]),
+                    "area": _bbox_area_xyxy(bbox),
+                })
+
+            positive_areas = [row["area"] for row in rows if row["area"] >= min_area]
+            if len(positive_areas) < min_track_frames:
+                tracks_out.append({
+                    "track_id": int(track["track_id"]),
+                    "class_id": int(track["class_id"]),
+                    "num_frames": len(rows),
+                    "median_area": 0.0,
+                    "q1_area": 0.0,
+                    "q3_area": 0.0,
+                    "mad_area": 0.0,
+                    "segments": [],
+                })
+                continue
+
+            median_area = median(positive_areas)
+            q1_area = _percentile(positive_areas, 0.25)
+            q3_area = _percentile(positive_areas, 0.75)
+            mad_area = median([abs(area - median_area) for area in positive_areas])
+            suspicious = []
+            for row in rows:
+                area = row["area"]
+                area_ratio = area / median_area if median_area > 0 else 0.0
+                robust_z = 0.0
+                if mad_area > 0:
+                    robust_z = 0.6745 * (area - median_area) / mad_area
+                reasons = []
+                if area < min_area:
+                    reasons.append("degenerate_area")
+                elif median_area > 0 and area_ratio >= high_area_ratio:
+                    reasons.append("high_area_ratio")
+                elif median_area > 0 and low_area_ratio > 0 and area_ratio <= low_area_ratio:
+                    reasons.append("low_area_ratio")
+                if robust_z_threshold > 0 and abs(robust_z) >= robust_z_threshold:
+                    reasons.append("robust_z")
+                if reasons:
+                    suspicious.append({
+                        **row,
+                        "area_ratio": area_ratio,
+                        "robust_z": robust_z,
+                        "reasons": sorted(set(reasons)),
+                    })
+
+            groups: List[List[Dict[str, Any]]] = []
+            for row in suspicious:
+                if not groups or row["frame_idx"] - groups[-1][-1]["frame_idx"] > max_gap + 1:
+                    groups.append([row])
+                else:
+                    groups[-1].append(row)
+
+            segments = []
+            for group in groups:
+                areas = [row["area"] for row in group]
+                ratios = [row["area_ratio"] for row in group]
+                robust_zs = [row["robust_z"] for row in group]
+                segments.append({
+                    "start": int(group[0]["frame_idx"]),
+                    "end": int(group[-1]["frame_idx"]),
+                    "frames": len(group),
+                    "reasons": sorted({reason for row in group for reason in row["reasons"]}),
+                    "max_area": max(areas),
+                    "min_area": min(areas),
+                    "max_area_ratio": max(ratios) if ratios else 0.0,
+                    "min_area_ratio": min(ratios) if ratios else 0.0,
+                    "max_abs_robust_z": max((abs(value) for value in robust_zs), default=0.0),
+                })
+
+            tracks_out.append({
+                "track_id": int(track["track_id"]),
+                "class_id": int(track["class_id"]),
+                "num_frames": len(rows),
+                "median_area": median_area,
+                "q1_area": q1_area,
+                "q3_area": q3_area,
+                "mad_area": mad_area,
+                "segments": segments,
+            })
+
+    return {
+        "metadata": dict(payload.get("metadata", {})),
+        "parameters": {
+            "enabled": enabled,
+            "high_area_ratio": high_area_ratio,
+            "low_area_ratio": low_area_ratio,
+            "robust_z_threshold": robust_z_threshold,
+            "min_track_frames": min_track_frames,
+            "min_area": min_area,
+            "max_gap": max_gap,
+        },
+        "tracks": tracks_out,
+    }
+
+
+def write_area_anomaly_report(
+    payload: Dict[str, Any],
+    out_dir: Path,
+    config: Optional[Dict[str, Any]] = None,
+) -> Path:
+    cfg = dict(config or {})
+    path = out_dir / str(cfg.get("filename", "tracking_area_anomalies.json"))
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(build_area_anomaly_report(payload, cfg), handle, indent=2)
+    return path
 
 
 def load_annotations(
@@ -130,6 +273,7 @@ def write_tracking_outputs(
     frame_count: int,
     frame_offset: int,
     final_tracks: Sequence[FinalTrack],
+    area_anomaly_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Path, Path]:
     # 同时输出结构化 JSON 和扁平 CSV，便于后续分析和可视化工具接入。
     json_path = out_dir / "tracking_results.json"
@@ -192,6 +336,7 @@ def write_tracking_outputs(
     }
     with json_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
+    write_area_anomaly_report(payload, out_dir, area_anomaly_config)
 
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(

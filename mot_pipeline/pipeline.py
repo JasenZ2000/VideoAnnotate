@@ -154,6 +154,7 @@ def run_pipeline(video_path: Path, ann_dir: Path, out_dir: Path, config: Dict[st
         frame_count=frame_count,
         frame_offset=frame_offset,
         final_tracks=output_tracks,
+        area_anomaly_config=config.get("quality_control", {}).get("area_anomaly", {}),
     )
 
     exports_cfg = config["exports"]

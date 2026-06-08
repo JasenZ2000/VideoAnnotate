@@ -49,6 +49,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "annotation_cache_limit": 300,
         "annotation_batch_max": 200,
     },
+    "quality_control": {
+        "area_anomaly": {
+            "enabled": True,
+            "high_area_ratio": 3.0,
+            "low_area_ratio": 0.25,
+            "robust_z_threshold": 6.0,
+            "min_track_frames": 8,
+            "min_area": 1.0,
+            "max_gap": 1,
+            "filename": "tracking_area_anomalies.json",
+        },
+    },
     "sam31": {
         "runner": "remote",
         "server_url": "",

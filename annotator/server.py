@@ -10,6 +10,7 @@ import os
 import posixpath
 import shutil
 import sys
+import threading
 import urllib.error
 import urllib.request
 import uuid
@@ -34,7 +35,9 @@ app = FastAPI(title="Video Annotator")
 STATE = AnnotationState()
 _cap: Optional[cv2.VideoCapture] = None
 _cap_pos: int = -1  # tracks current read position to avoid unnecessary seeks
+_cap_lock = threading.Lock()
 _workspace: Optional[Path] = None
+_workspace_version: int = 0
 _sam31_jobs: dict[str, dict[str, Any]] = {}
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -172,6 +175,58 @@ def _get_annotator_config() -> dict[str, int]:
     }
 
 
+def _get_area_anomaly_config(workspace: Optional[Path] = None) -> dict[str, Any]:
+    config = _load_workspace_config(workspace).get("quality_control", {}).get("area_anomaly", {})
+    return {
+        "enabled": bool(config.get("enabled", True)),
+        "high_area_ratio": float(config.get("high_area_ratio", 3.0)),
+        "low_area_ratio": float(config.get("low_area_ratio", 0.25)),
+        "robust_z_threshold": float(config.get("robust_z_threshold", 6.0)),
+        "min_track_frames": int(config.get("min_track_frames", 8)),
+        "min_area": float(config.get("min_area", 1.0)),
+        "max_gap": int(config.get("max_gap", 1)),
+        "filename": str(config.get("filename", "tracking_area_anomalies.json")),
+    }
+
+
+def _area_anomaly_payload(state: AnnotationState = STATE, workspace: Optional[Path] = None) -> dict[str, Any]:
+    cfg = _get_area_anomaly_config(workspace)
+    if not cfg["enabled"]:
+        return {
+            "metadata": {
+                "video_path": state.video_path,
+                "fps": state.fps,
+                "width": state.width,
+                "height": state.height,
+                "frame_count": state.frame_count,
+                "num_tracks": len(state.tracks),
+            },
+            "parameters": cfg,
+            "tracks": [],
+        }
+    return state.detect_area_anomaly_segments(
+        high_area_ratio=cfg["high_area_ratio"],
+        low_area_ratio=cfg["low_area_ratio"],
+        robust_z_threshold=cfg["robust_z_threshold"],
+        min_track_frames=cfg["min_track_frames"],
+        min_area=cfg["min_area"],
+        max_gap=cfg["max_gap"],
+    )
+
+
+def _write_area_anomaly_json(workspace: Path, state: AnnotationState = STATE) -> Path:
+    filename = _get_area_anomaly_config(workspace)["filename"]
+    path = workspace / filename
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(_area_anomaly_payload(state, workspace), f, indent=2)
+    return path
+
+
+def _check_client_version(v: Optional[int]) -> None:
+    if v is not None and v != _workspace_version:
+        raise HTTPException(409, "Workspace changed; discard stale media request")
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -184,7 +239,7 @@ async def index():
 @app.post("/api/open-workspace")
 async def open_workspace(req: WorkspaceReq):
     """Open a workspace directory: auto-detect video + labels, ensure config, load video."""
-    global _cap, _workspace, _cap_pos
+    global _cap, _workspace, _cap_pos, _workspace_version
 
     ws = Path(req.path)
     if not ws.is_dir():
@@ -199,12 +254,15 @@ async def open_workspace(req: WorkspaceReq):
 
     # Load video into state
     STATE.load_video_metadata(str(video))
-    if _cap is not None:
-        _cap.release()
-    _cap = cv2.VideoCapture(str(video))
-    _cap_pos = -1
-
-    _workspace = ws
+    STATE.clear_tracks()
+    with _cap_lock:
+        if _cap is not None:
+            _cap.release()
+        _cap = cv2.VideoCapture(str(video))
+        _cap_pos = -1
+        _workspace = ws
+        _workspace_version += 1
+        version = _workspace_version
 
     # Load existing tracking results if available
     results_path = ws / "tracking_results.json"
@@ -225,14 +283,22 @@ async def open_workspace(req: WorkspaceReq):
         "width": STATE.width,
         "height": STATE.height,
         "num_tracks": len(STATE.tracks),
+        "version": version,
     }
 
 
 @app.get("/api/state")
 async def get_state():
+    area_payload = _area_anomaly_payload()
+    area_by_track = {
+        int(track["track_id"]): track
+        for track in area_payload.get("tracks", [])
+    }
     tracks_info = []
     for tid in STATE.get_track_ids():
         track = STATE.tracks[tid]
+        area_info = area_by_track.get(tid, {})
+        area_segments = area_info.get("segments", [])
         tracks_info.append({
             "track_id": tid,
             "class_id": track.class_id,
@@ -240,6 +306,9 @@ async def get_state():
             "end_frame": track.end_frame,
             "num_frames": len(track.frames),
             "annotated_indices": STATE.get_annotated_frame_indices(tid),
+            "area_anomaly_segments": area_segments,
+            "area_anomaly_count": len(area_segments),
+            "area_median": area_info.get("median_area", 0.0),
         })
     return {
         "workspace": str(_workspace) if _workspace else None,
@@ -250,53 +319,66 @@ async def get_state():
         "frame_count": STATE.frame_count,
         "tracks": tracks_info,
         "annotator": _get_annotator_config(),
+        "quality_control": {
+            "area_anomaly": {
+                "enabled": _get_area_anomaly_config()["enabled"],
+                "filename": _get_area_anomaly_config()["filename"],
+            }
+        },
+        "version": _workspace_version,
     }
 
 
 @app.get("/api/frame-image/{frame_idx}")
-async def get_frame_image(frame_idx: int):
+async def get_frame_image(frame_idx: int, v: Optional[int] = None):
     """Serve a video frame as JPEG. Avoids seeking when reading sequentially."""
     global _cap_pos
-    if _cap is None or not _cap.isOpened():
-        raise HTTPException(400, "No video loaded")
-    # Only seek if not already at the right position
-    if _cap_pos != frame_idx:
-        _cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-    ok, frame = _cap.read()
-    if not ok:
-        _cap_pos = -1
-        raise HTTPException(404, f"Cannot read frame {frame_idx}")
-    _cap_pos = frame_idx + 1
-    _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    _check_client_version(v)
+    with _cap_lock:
+        _check_client_version(v)
+        if _cap is None or not _cap.isOpened():
+            raise HTTPException(400, "No video loaded")
+        # Only seek if not already at the right position
+        if _cap_pos != frame_idx:
+            _cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame = _cap.read()
+        if not ok:
+            _cap_pos = -1
+            raise HTTPException(404, f"Cannot read frame {frame_idx}")
+        _cap_pos = frame_idx + 1
+        _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
     return Response(content=jpeg.tobytes(), media_type="image/jpeg",
                     headers={"Cache-Control": "public, max-age=3600"})
 
 
 @app.get("/api/frame-batch/{start}/{count}")
-async def get_frame_batch(start: int, count: int):
+async def get_frame_batch(start: int, count: int, v: Optional[int] = None):
     """Serve multiple consecutive frames as concatenated JPEGs with a length header.
 
     Response format: for each frame, 4 bytes (big-endian uint32) length + JPEG bytes.
     """
     global _cap_pos
-    if _cap is None or not _cap.isOpened():
-        raise HTTPException(400, "No video loaded")
-    count = min(count, _get_annotator_config()["frame_batch_max"])
-    if _cap_pos != start:
-        _cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+    _check_client_version(v)
+    with _cap_lock:
+        _check_client_version(v)
+        if _cap is None or not _cap.isOpened():
+            raise HTTPException(400, "No video loaded")
+        count = min(count, _get_annotator_config()["frame_batch_max"])
+        if _cap_pos != start:
+            _cap.set(cv2.CAP_PROP_POS_FRAMES, start)
 
-    chunks = bytearray()
-    frames_read = 0
-    for i in range(count):
-        ok, frame = _cap.read()
-        if not ok:
-            break
-        _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        data = jpeg.tobytes()
-        chunks.extend(len(data).to_bytes(4, 'big'))
-        chunks.extend(data)
-        frames_read += 1
-    _cap_pos = start + frames_read
+        chunks = bytearray()
+        frames_read = 0
+        for i in range(count):
+            ok, frame = _cap.read()
+            if not ok:
+                break
+            _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            data = jpeg.tobytes()
+            chunks.extend(len(data).to_bytes(4, 'big'))
+            chunks.extend(data)
+            frames_read += 1
+        _cap_pos = start + frames_read
 
     return Response(
         content=bytes(chunks),
@@ -309,7 +391,8 @@ async def get_frame_batch(start: int, count: int):
 
 
 @app.get("/api/frame/{frame_idx}")
-async def get_frame_annotations(frame_idx: int):
+async def get_frame_annotations(frame_idx: int, v: Optional[int] = None):
+    _check_client_version(v)
     all_bboxes = STATE.get_all_bboxes_at_frame(frame_idx)
     annotations = []
     for tid, bbox in all_bboxes:
@@ -318,7 +401,8 @@ async def get_frame_annotations(frame_idx: int):
 
 
 @app.get("/api/annotations-batch/{start}/{count}")
-async def get_annotations_batch(start: int, count: int):
+async def get_annotations_batch(start: int, count: int, v: Optional[int] = None):
+    _check_client_version(v)
     count = min(count, _get_annotator_config()["annotation_batch_max"])
     end = min(STATE.frame_count, max(0, start) + count)
     frames = []
@@ -685,6 +769,7 @@ async def _run_remote_sam31_box_track_job_impl(
     export_path = workspace / "tracking_results.json"
     with open(export_path, "w", encoding="utf-8") as f:
         json.dump(STATE.export_tracking_results(), f, indent=2)
+    anomaly_path = _write_area_anomaly_json(workspace)
 
     job["status"] = "done"
     fixed = merge_result["spike_fix"]["fixed_frames"]
@@ -694,6 +779,7 @@ async def _run_remote_sam31_box_track_job_impl(
     job["spike_fix"] = merge_result["spike_fix"]
     job["result_path"] = str(result_path)
     job["export_path"] = str(export_path)
+    job["area_anomaly_path"] = str(anomaly_path)
 
 
 async def _run_local_sam31_box_track_job_impl(job_id: str, req: Sam31BoxTrackReq, workspace: Path, video: Path) -> None:
@@ -777,6 +863,7 @@ async def _run_local_sam31_box_track_job_impl(job_id: str, req: Sam31BoxTrackReq
     export_path = workspace / "tracking_results.json"
     with open(export_path, "w", encoding="utf-8") as f:
         json.dump(STATE.export_tracking_results(), f, indent=2)
+    anomaly_path = _write_area_anomaly_json(workspace)
 
     job["status"] = "done"
     fixed = merge_result["spike_fix"]["fixed_frames"]
@@ -786,6 +873,7 @@ async def _run_local_sam31_box_track_job_impl(job_id: str, req: Sam31BoxTrackReq
     job["spike_fix"] = merge_result["spike_fix"]
     job["result_path"] = str(result_path)
     job["export_path"] = str(export_path)
+    job["area_anomaly_path"] = str(anomaly_path)
 
 
 async def _run_sam31_box_track_job(job_id: str, req: Sam31BoxTrackReq, workspace: Path, video: Path) -> None:
@@ -846,7 +934,7 @@ async def get_sam31_job(job_id: str):
 @app.post("/api/run-pipeline")
 async def run_pipeline_endpoint():
     """Run MOT pipeline using workspace config, output to workspace."""
-    global _cap
+    global _cap, _cap_pos
     if _workspace is None:
         raise HTTPException(400, "No workspace open")
 
@@ -875,11 +963,13 @@ async def run_pipeline_endpoint():
         raise HTTPException(500, "Pipeline produced no output")
     STATE.import_tracking_results(str(results_json))
     STATE.load_video_metadata(str(video))
-    if _cap is not None:
-        _cap.release()
-    _cap = cv2.VideoCapture(str(video))
-    _cap_pos = -1
-    return {"ok": True, "num_tracks": len(STATE.tracks)}
+    with _cap_lock:
+        if _cap is not None:
+            _cap.release()
+        _cap = cv2.VideoCapture(str(video))
+        _cap_pos = -1
+    anomaly_path = _write_area_anomaly_json(_workspace)
+    return {"ok": True, "num_tracks": len(STATE.tracks), "area_anomaly_path": str(anomaly_path)}
 
 
 @app.post("/api/render")
@@ -998,7 +1088,13 @@ async def export_results():
     path = _workspace / "tracking_results.json"
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
-    return {"ok": True, "path": str(path), "num_tracks": payload["metadata"]["num_tracks"]}
+    anomaly_path = _write_area_anomaly_json(_workspace)
+    return {
+        "ok": True,
+        "path": str(path),
+        "area_anomaly_path": str(anomaly_path),
+        "num_tracks": payload["metadata"]["num_tracks"],
+    }
 
 
 @app.post("/api/export-yolo")
@@ -1312,11 +1408,24 @@ async def run_pipeline_all_segments():
             # Count tracks from output
             results_json = seg_dir / "tracking_results.json"
             num_tracks = 0
+            anomaly_path = None
+            anomaly_segments = 0
             if results_json.exists():
                 with open(results_json, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 num_tracks = data["metadata"]["num_tracks"]
-            results.append({"name": seg_dir.name, "num_tracks": num_tracks, "ok": True})
+                seg_state = AnnotationState()
+                seg_state.import_tracking_results(str(results_json))
+                anomaly_path = _write_area_anomaly_json(seg_dir, seg_state)
+                anomaly_payload = _area_anomaly_payload(seg_state, seg_dir)
+                anomaly_segments = sum(len(track.get("segments", [])) for track in anomaly_payload.get("tracks", []))
+            results.append({
+                "name": seg_dir.name,
+                "num_tracks": num_tracks,
+                "area_anomaly_segments": anomaly_segments,
+                "area_anomaly_path": str(anomaly_path) if anomaly_path else None,
+                "ok": True,
+            })
         except Exception as e:
             results.append({"name": seg_dir.name, "num_tracks": 0, "ok": False, "error": str(e)})
 
