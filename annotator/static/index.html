@@ -40,6 +40,7 @@ label { font-size: 11px; color: #aaa; display: block; margin-bottom: 2px; }
   <label style="display:inline">Workspace:</label>
   <input id="workspace-path" type="text" style="width:350px" placeholder="path/to/workspace_directory">
   <button class="primary" onclick="openWorkspace()">Open</button>
+  <button onclick="window.open('/config', '_blank')">Config</button>
   <label style="display:inline; margin-left:10px">Split every</label>
   <input id="split-length" type="number" style="width:55px" value="300" min="1">
   <label style="display:inline">f</label>
@@ -112,6 +113,17 @@ label { font-size: 11px; color: #aaa; display: block; margin-bottom: 2px; }
       </div>
     </div>
     <div class="panel">
+      <label>LocateAnything YOLO</label>
+      <input id="locany-prompt" type="text" style="width:100%; margin-bottom:4px" value="person" placeholder="prompt">
+      <button id="locany-btn" class="primary" onclick="startLocateAnythingYolo()" style="width:100%; margin-bottom:4px">Remote Infer YOLO</button>
+      <div class="row" style="margin-top:4px">
+        <label style="display:inline; margin:0">Max f:</label>
+        <input id="locany-max-frames" type="number" style="width:64px" value="0" min="0">
+        <label style="display:inline; margin:0">GPU:</label>
+        <input id="locany-cuda-device" type="number" style="width:44px" min="0" placeholder="#">
+      </div>
+    </div>
+    <div class="panel">
       <label>Interpolation</label>
       <div class="row">
         <span style="font-size:11px">A:</span>
@@ -125,6 +137,11 @@ label { font-size: 11px; color: #aaa; display: block; margin-bottom: 2px; }
       </div>
       <button class="danger" onclick="deleteBetweenAB()" style="width:100%; margin-bottom:4px">Delete A-B</button>
       <button onclick="fixBboxSpikes()" style="width:100%; margin-bottom:4px">Fix Spikes</button>
+      <div class="row" style="margin-bottom:4px">
+        <label style="display:inline; margin:0; font-size:11px">Gap &lt;:</label>
+        <input id="bulk-interp-gap" type="number" style="width:55px" value="5" min="0">
+        <button onclick="interpolateShortGaps()" style="flex:1">Auto Fill Gaps</button>
+      </div>
       <button class="primary" onclick="doInterpolate()" style="width:100%">Interpolate A→B (R)</button>
     </div>
     <div id="status" style="font-size:11px; color:#888; padding:4px;"></div>
@@ -186,6 +203,7 @@ let batchFetchedUpTo = -1;
 let annotationBatchFetching = false;
 let annotationFetchedUpTo = -1;
 let sam31JobTimer = null;
+let locanyJobTimer = null;
 let overlayRaf = null;
 const mediaAborters = new Set();
 const MEDIA_FETCH_TIMEOUT_MS = 8000;
@@ -683,6 +701,59 @@ function pollSam31Job(jobId) {
   }, 2000);
 }
 
+async function startLocateAnythingYolo() {
+  const prompt = document.getElementById('locany-prompt').value.trim();
+  if (!prompt) { setStatus('Enter a LocateAnything prompt first'); return; }
+  const maxFrames = parseInt(document.getElementById('locany-max-frames').value) || 0;
+  const cudaRaw = document.getElementById('locany-cuda-device').value.trim();
+  const cudaDevice = cudaRaw === '' ? null : parseInt(cudaRaw);
+  if (cudaRaw !== '' && (!Number.isInteger(cudaDevice) || cudaDevice < 0)) {
+    setStatus('CUDA device must be a non-negative integer');
+    return;
+  }
+  const btn = document.getElementById('locany-btn');
+  if (!confirm(`Run remote LocateAnything YOLO inference for prompt "${prompt}"? Results will be saved in a separate locateanything_runs folder.`)) return;
+  try {
+    btn.disabled = true;
+    setStatus('Starting LocateAnything job...');
+    const r = await api('POST', '/api/locateanything/yolo', {
+      prompt,
+      task: 'ground_multi',
+      max_frames: maxFrames,
+      start_frame: 0,
+      frame_step: 1,
+      cuda_device: cudaDevice,
+    });
+    pollLocateAnythingJob(r.job_id);
+  } catch (e) {
+    btn.disabled = false;
+    setStatus('Error: '+e.message);
+  }
+}
+
+function pollLocateAnythingJob(jobId) {
+  if (locanyJobTimer) clearInterval(locanyJobTimer);
+  locanyJobTimer = setInterval(async () => {
+    try {
+      const job = await api('GET', `/api/locateanything/job/${jobId}`);
+      setStatus(`LocateAnything ${job.status}: ${job.message || ''}`);
+      if (job.status === 'done') {
+        clearInterval(locanyJobTimer); locanyJobTimer = null;
+        document.getElementById('locany-btn').disabled = false;
+        setStatus(job.message || `LocateAnything done: ${job.output_dir || ''}`);
+      } else if (job.status === 'failed') {
+        clearInterval(locanyJobTimer); locanyJobTimer = null;
+        document.getElementById('locany-btn').disabled = false;
+        setStatus(`LocateAnything failed: ${job.message || ''}`);
+      }
+    } catch (e) {
+      clearInterval(locanyJobTimer); locanyJobTimer = null;
+      document.getElementById('locany-btn').disabled = false;
+      setStatus('Error: '+e.message);
+    }
+  }, 3000);
+}
+
 // =========================================================================
 // Interpolation
 // =========================================================================
@@ -720,6 +791,23 @@ async function fixBboxSpikes() {
     await refreshState(); fetchAnnotations(currentFrame);
     const intervals = (r.intervals || []).map(x => `${x.start}-${x.end}`).join(', ');
     setStatus(`Fixed ${r.fixed_frames} spike frames${intervals ? ': ' + intervals : ''}`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+
+async function interpolateShortGaps() {
+  const maxGap = parseInt(document.getElementById('bulk-interp-gap').value, 10);
+  if (!Number.isInteger(maxGap) || maxGap < 0) {
+    setStatus('Set a non-negative max gap');
+    return;
+  }
+  if (!confirm(`Interpolate all track gaps under ${maxGap} missing frame${maxGap === 1 ? '' : 's'}?`)) return;
+  try {
+    const r = await api('POST', '/api/interpolate-short-gaps', { max_gap: maxGap });
+    clearAnnotationCache();
+    await refreshState(); fetchAnnotations(currentFrame);
+    renderTimeline();
+    const gapText = (r.gaps || []).length ? ` across ${r.gaps.length} gaps` : '';
+    setStatus(`Interpolated ${r.filled_frames} frames on ${r.filled_tracks} tracks${gapText}`);
   } catch (e) { setStatus('Error: '+e.message); }
 }
 
@@ -959,7 +1047,9 @@ function renderTimeline() {
         const w = Math.max(0.5, ((end - start + 1)/maxF*100)).toFixed(1);
         const reasons = (seg.reasons || []).join('+') || 'area';
         const ratio = Number(seg.max_area_ratio || 0).toFixed(2);
-        bar += `<div class="area-issue" title="Area issue ${start}-${end} ${reasons} maxRatio=${ratio}" style="left:${l}%;width:${w}%"></div>`;
+        const jumpRatio = Number(seg.max_frame_change_ratio || 1).toFixed(2);
+        const jumpAbs = Number(seg.max_frame_change_abs || 0).toFixed(0);
+        bar += `<div class="area-issue" title="Area issue ${start}-${end} ${reasons} maxRatio=${ratio} jumpRatio=${jumpRatio} jumpAbs=${jumpAbs}" style="left:${l}%;width:${w}%"></div>`;
       }
     }
     bar += `<div class="playhead" style="left:${(currentFrame/maxF*100).toFixed(1)}%"></div>`;

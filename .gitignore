@@ -34,6 +34,11 @@ yoloset/
 annotation_project.json
 sam31_runs/
 sam31_cache/
+locateanything_runs/
+locany_cache/
+OPD_method_tests/
+vid1/
+vid2/
 
 # OS/editor noise
 .DS_Store

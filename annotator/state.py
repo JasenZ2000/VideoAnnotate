@@ -191,6 +191,46 @@ class AnnotationState:
             count += 1
         return count
 
+    def interpolate_short_gaps(self, max_gap: int) -> Dict[str, Any]:
+        """Fill every internal track gap whose missing-frame count is less than max_gap."""
+        max_gap = max(0, int(max_gap))
+        total_filled = 0
+        filled_tracks = 0
+        gaps_out = []
+
+        for tid in sorted(self.tracks.keys()):
+            track = self.tracks[tid]
+            frame_ids = sorted(track.frames.keys())
+            if len(frame_ids) < 2:
+                continue
+
+            track_filled = 0
+            for prev_frame, next_frame in zip(frame_ids, frame_ids[1:]):
+                missing = next_frame - prev_frame - 1
+                if missing <= 0 or missing >= max_gap:
+                    continue
+                filled = self.interpolate_range(tid, prev_frame, next_frame)
+                if filled <= 0:
+                    continue
+                track_filled += filled
+                total_filled += filled
+                gaps_out.append({
+                    "track_id": tid,
+                    "start": prev_frame,
+                    "end": next_frame,
+                    "missing": missing,
+                    "filled": filled,
+                })
+
+            if track_filled > 0:
+                filled_tracks += 1
+
+        return {
+            "filled_frames": total_filled,
+            "filled_tracks": filled_tracks,
+            "gaps": gaps_out,
+        }
+
     def fix_bbox_spikes(
         self,
         track_id: int,
@@ -288,6 +328,8 @@ class AnnotationState:
         self,
         high_area_ratio: float = 3.0,
         low_area_ratio: float = 0.25,
+        frame_area_change_ratio: float = 2.5,
+        frame_area_change_abs: float = 800.0,
         robust_z_threshold: float = 6.0,
         min_track_frames: int = 8,
         min_area: float = 1.0,
@@ -296,6 +338,8 @@ class AnnotationState:
         """Find suspicious intervals from each track's full-run area distribution."""
         high_area_ratio = max(1.0, float(high_area_ratio))
         low_area_ratio = max(0.0, min(1.0, float(low_area_ratio)))
+        frame_area_change_ratio = max(1.0, float(frame_area_change_ratio))
+        frame_area_change_abs = max(0.0, float(frame_area_change_abs))
         robust_z_threshold = max(0.0, float(robust_z_threshold))
         min_track_frames = max(1, int(min_track_frames))
         min_area = max(0.0, float(min_area))
@@ -334,14 +378,23 @@ class AnnotationState:
             q3_area = percentile(positive_areas, 0.75)
             mad_area = median([abs(area - median_area) for area in positive_areas])
             suspicious = []
+            previous_positive_area = None
 
             for row in area_rows:
                 area = row["area"]
                 reasons = []
                 area_ratio = area / median_area if median_area > 0 else 0.0
+                frame_change_ratio = 1.0
+                frame_change_abs = 0.0
                 robust_z = 0.0
                 if mad_area > 0:
                     robust_z = 0.6745 * (area - median_area) / mad_area
+
+                if previous_positive_area is not None and area >= min_area:
+                    smaller = max(min(previous_positive_area, area), min_area)
+                    larger = max(previous_positive_area, area)
+                    frame_change_ratio = larger / smaller if smaller > 0 else 1.0
+                    frame_change_abs = abs(area - previous_positive_area)
 
                 if area < min_area:
                     reasons.append("degenerate_area")
@@ -350,6 +403,14 @@ class AnnotationState:
                 elif median_area > 0 and low_area_ratio > 0 and area_ratio <= low_area_ratio:
                     reasons.append("low_area_ratio")
 
+                if (
+                    previous_positive_area is not None
+                    and area >= min_area
+                    and frame_change_ratio >= frame_area_change_ratio
+                    and frame_change_abs >= frame_area_change_abs
+                ):
+                    reasons.append("frame_area_jump")
+
                 if robust_z_threshold > 0 and abs(robust_z) >= robust_z_threshold:
                     reasons.append("robust_z")
 
@@ -357,9 +418,14 @@ class AnnotationState:
                     suspicious.append({
                         **row,
                         "area_ratio": area_ratio,
+                        "frame_change_ratio": frame_change_ratio,
+                        "frame_change_abs": frame_change_abs,
                         "robust_z": robust_z,
                         "reasons": sorted(set(reasons)),
                     })
+
+                if area >= min_area:
+                    previous_positive_area = area
 
             groups: List[List[Dict[str, Any]]] = []
             for row in suspicious:
@@ -372,6 +438,8 @@ class AnnotationState:
             for group in groups:
                 areas = [row["area"] for row in group]
                 ratios = [row["area_ratio"] for row in group]
+                change_ratios = [row.get("frame_change_ratio", 1.0) for row in group]
+                change_abs_values = [row.get("frame_change_abs", 0.0) for row in group]
                 robust_zs = [row["robust_z"] for row in group]
                 reason_set = sorted({reason for row in group for reason in row["reasons"]})
                 segments.append({
@@ -383,6 +451,8 @@ class AnnotationState:
                     "min_area": min(areas),
                     "max_area_ratio": max(ratios) if ratios else 0.0,
                     "min_area_ratio": min(ratios) if ratios else 0.0,
+                    "max_frame_change_ratio": max(change_ratios) if change_ratios else 1.0,
+                    "max_frame_change_abs": max(change_abs_values) if change_abs_values else 0.0,
                     "max_abs_robust_z": max((abs(value) for value in robust_zs), default=0.0),
                 })
 
@@ -409,6 +479,8 @@ class AnnotationState:
             "parameters": {
                 "high_area_ratio": high_area_ratio,
                 "low_area_ratio": low_area_ratio,
+                "frame_area_change_ratio": frame_area_change_ratio,
+                "frame_area_change_abs": frame_area_change_abs,
                 "robust_z_threshold": robust_z_threshold,
                 "min_track_frames": min_track_frames,
                 "min_area": min_area,

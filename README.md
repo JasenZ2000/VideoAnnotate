@@ -77,9 +77,15 @@ Example config:
 ```json
 {
   "tracking": {
+    "method": "sparse_track",
     "iou_match": 0.3,
     "max_missed": 15,
-    "disable_kalman": false
+    "disable_kalman": false,
+    "class_agnostic": false,
+    "score_high": 0.5,
+    "score_low": 0.1,
+    "new_track_score": 0.6,
+    "low_iou_match": 0.15
   },
   "fusion": {
     "iou_fuse": 0.5,
@@ -126,6 +132,53 @@ Example config:
 - Change format conversion behavior in `mot_pipeline/utils/converters.py`
 
 The current refactor preserves the original algorithm and keeps the components replaceable through the small registries in `tracking.py` and `fusion.py`.
+
+### Tracking Methods
+
+Set `tracking.method` to one of:
+
+- `iou_kalman`: original project tracker. It runs greedy IoU association over a constant-velocity / Kalman prediction.
+- `sort`: alias for the original SORT-style IoU + Kalman pass.
+- `bytetrack`: ByteTrack-style two-stage association. High-confidence detections are matched first, then unmatched tracks can recover from low-confidence detections.
+- `oc_sort`: OC-SORT-style observation-centric association. It uses recent observed motion direction to recover from short occlusions and nonlinear motion.
+- `bot_sort`: local BoT-SORT-inspired pass. It combines ByteTrack-style stages, confidence-fused IoU, and observation-gap velocity updates. Camera motion compensation and ReID require extra inputs and are not computed from plain YOLO txt labels.
+- `hybrid_sort`: Hybrid-SORT-inspired pass. It adds weak cues from velocity direction, detection confidence, and bbox height consistency.
+- `deep_oc_sort`: Deep OC-SORT-inspired pass. It uses the local motion/weak-cue fallback because this project does not currently parse or compute ReID embeddings.
+- `cbiou`: C-BIoU-inspired cascaded buffered IoU tracker. It expands track/detection boxes with small and large buffers to recover irregular non-overlapping motion.
+- `sparse_track`: SparseTrack-inspired pseudo-depth cascading tracker. It groups detections/tracks by bbox pseudo-depth and matches near-to-far to reduce crowded-scene ambiguity.
+
+The parser accepts both `class cx cy w h` and `class cx cy w h confidence` YOLO lines. If confidence is missing, detections are treated as score `1.0`, so ByteTrack's low-confidence recovery only has an effect when detector scores are exported.
+
+Example ByteTrack config:
+
+```json
+{
+  "tracking": {
+    "method": "bytetrack",
+    "iou_match": 0.3,
+    "max_missed": 30,
+    "score_high": 0.5,
+    "score_low": 0.1,
+    "new_track_score": 0.6,
+    "low_iou_match": 0.15,
+    "disable_kalman": false
+  }
+}
+```
+
+### Fusion Methods
+
+Set `fusion.method` to one of:
+
+- `bidirectional_iou`: original conservative mutual-best forward/backward fusion.
+- `forward_only`: use only forward tracklets as the final components.
+- `backward_only`: use only backward tracklets, mainly for debugging.
+- `bidirectional_iou_forward_primary`: keep forward tracklets as primary and merge only mutual-best backward matches.
+- `bidirectional_iou_forward_unique`: keep forward tracklets, merge mutual-best backward matches, and keep only backward tracklets that are not duplicates of any forward tracklet.
+- `bidirectional_iou_all_pairs`: merge every compatible forward/backward pair, more aggressive for fragmented tracks.
+- `bidirectional_iou_nms`: run the original fusion and then suppress duplicate overlapping components.
+
+See `FUSION_METHODS.md` for the trade-off table and suggested trial order.
 
 ## Remote SAM3.1-Assisted Annotation
 
@@ -208,6 +261,60 @@ The annotator loads the project root `config.json` first, then overlays the
 opened workspace or segment `config.json`. Existing workspaces that do not have
 a `sam31` section will therefore inherit the root SAM31 server settings.
 
+## Remote LocateAnything YOLO Proposal
+
+The annotator can also submit the opened workspace video to a remote
+LocateAnything service. The remote service runs prompt-based grounding on video
+frames, writes YOLO txt labels, zips the result, and the local annotator
+downloads it into a separate run folder. It does not merge with existing labels
+yet.
+
+Start the remote LocateAnything service on the GPU server:
+
+```bash
+LOCANY_PORT=9011 \
+LOCANY_CACHE_DIR=/data/cache/object-reid-locany \
+LOCANY_ALLOWED_ROOTS=/data2/DET_Group/ZZS/locateanything/tmp \
+./run_locateanything_server.sh
+```
+
+Configure `config.json`:
+
+```json
+{
+  "locateanything": {
+    "server_url": "http://gpu-server:9011",
+    "video_transfer": "sftp",
+    "sftp_host": "gpu-server",
+    "sftp_username": "your-user",
+    "sftp_password_env": "SAM31_SFTP_PASSWORD",
+    "sftp_remote_dir": "/data2/DET_Group/ZZS/locateanything/tmp/videos",
+    "device": "cuda",
+    "dtype": "bf16",
+    "resize_long_edge": 1024,
+    "generation_mode": "slow",
+    "max_new_tokens": 512,
+    "frame_offset": 1,
+    "class_id": 0,
+    "score": 1.0
+  }
+}
+```
+
+In the annotator sidebar, enter a prompt in `LocateAnything YOLO` and click
+`Remote Infer YOLO`. Results are saved under:
+
+```text
+<workspace>/locateanything_runs/<job_id>/<video_stem>/<video_stem>_1.txt
+```
+
+There is one txt per video frame. Empty frames are represented by empty txt
+files. Each non-empty line uses:
+
+```text
+class x_center y_center width height score
+```
+
 SAM31 bbox post-processing can interpolate short area/size spikes caused by mask
 outliers:
 
@@ -230,7 +337,7 @@ repairing an existing track manually.
 
 ## Label Format Notes
 
-- YOLO txt uses `class cx cy w h` with normalized center coordinates.
+- YOLO txt uses `class cx cy w h` with normalized center coordinates. An optional sixth `confidence` column is supported for ByteTrack-style methods.
 - `tracking_results.json` is the dense internal/result format used by this project.
 - Label Studio video tracking uses:
   - top-level `video` path like `"/data/local-files/?d=" + relative_video_path`

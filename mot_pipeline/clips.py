@@ -205,17 +205,10 @@ def prepare_track_clips(
     crop_margin: float,
     crop_min_size: int,
 ) -> List[FinalTrack]:
-    # 为视频导出准备轨迹：先确定固定裁剪大小，再把轨迹转换为逐视频帧的稠密表示。
-    max_video_frame_idx = frame_count - 1
+    # 为视频导出准备轨迹：先确定固定裁剪大小，保留原始目标出现区间。
     prepared_tracks: List[FinalTrack] = []
     for track in final_tracks:
         track.clip_size = compute_clip_size(track.frames, crop_margin, crop_min_size)
-        dense_boxes = build_dense_track_boxes(track, pad_frames, max_video_frame_idx)
-        if not dense_boxes:
-            continue
-        remapped_frames = {video_idx: bbox for video_idx, bbox in dense_boxes.items()}
-        track.video_frames = {video_idx: video_idx for video_idx in remapped_frames}
-        track.frames = remapped_frames
         prepared_tracks.append(track)
     return prepared_tracks
 
@@ -224,6 +217,7 @@ def build_clip_render_specs(
     clips_dir: Path,
     final_tracks: Sequence[FinalTrack],
     frame_count: int,
+    pad_frames: int,
 ) -> Tuple[Dict[int, Dict[str, object]], Dict[int, List[int]], Dict[int, List[int]]]:
     # 为每个轨迹准备裁剪区间、逐帧框和 writer 占位结构。
     render_specs: Dict[int, Dict[str, object]] = {}
@@ -231,16 +225,22 @@ def build_clip_render_specs(
     end_map: Dict[int, List[int]] = defaultdict(list)
 
     for track in final_tracks:
-        dense_boxes = build_dense_track_boxes(track, pad_frames=0, max_video_frame_idx=frame_count - 1)
-        ordered_video_frames = sorted(dense_boxes)
-        start_idx = ordered_video_frames[0]
-        end_idx = ordered_video_frames[-1]
+        draw_boxes = build_dense_track_boxes(track, pad_frames=0, max_video_frame_idx=frame_count - 1)
+        crop_boxes = build_dense_track_boxes(track, pad_frames=pad_frames, max_video_frame_idx=frame_count - 1)
+        if not draw_boxes or not crop_boxes:
+            continue
+        ordered_video_frames = sorted(draw_boxes)
+        start_idx = min(crop_boxes)
+        end_idx = max(crop_boxes)
         clip_path = clips_dir / f"track_{track.track_id:04d}.mp4"
         track.clip_path = clip_path
         render_specs[track.track_id] = {
-            "dense_boxes": dense_boxes,
+            "draw_boxes": draw_boxes,
+            "crop_boxes": crop_boxes,
             "start": start_idx,
             "end": end_idx,
+            "box_start": ordered_video_frames[0],
+            "box_end": ordered_video_frames[-1],
             "clip_size": track.clip_size,
             "clip_path": clip_path,
             "writer": None,
@@ -277,6 +277,8 @@ def render_tracking_overview(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fourcc = cv2.VideoWriter_fourcc(*codec)
+    if output_path.exists():
+        output_path.unlink()
     writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
     if not writer.isOpened():
         cap.release()
@@ -307,6 +309,7 @@ def extract_track_clips(
     fps: float,
     frame_count: int,
     codec: str,
+    pad_frames: int = 0,
     box_thickness: int = 2,
     font_scale: float = 0.7,
 ) -> None:
@@ -315,8 +318,17 @@ def extract_track_clips(
         return
 
     ensure_dir(clips_dir)
+    for old_clip in clips_dir.glob("track_*.mp4"):
+        old_clip.unlink()
     fourcc = cv2.VideoWriter_fourcc(*codec)
-    render_specs, start_map, end_map = build_clip_render_specs(clips_dir, final_tracks, frame_count)
+    render_specs, start_map, end_map = build_clip_render_specs(
+        clips_dir,
+        final_tracks,
+        frame_count,
+        pad_frames=pad_frames,
+    )
+    if not render_specs:
+        return
 
     max_end = max(spec["end"] for spec in render_specs.values())
     active_ids = set()
@@ -333,6 +345,9 @@ def extract_track_clips(
         for track_id in start_map.get(frame_idx, []):
             spec = render_specs[track_id]
             crop_w, crop_h = spec["clip_size"]
+            clip_path = Path(spec["clip_path"])
+            if clip_path.exists():
+                clip_path.unlink()
             spec["writer"] = cv2.VideoWriter(str(spec["clip_path"]), fourcc, fps, (crop_w, crop_h))
             if not spec["writer"].isOpened():
                 raise RuntimeError(f"Unable to open writer for {spec['clip_path']}")
@@ -340,16 +355,19 @@ def extract_track_clips(
 
         for track_id in list(active_ids):
             spec = render_specs[track_id]
-            bbox = spec["dense_boxes"].get(frame_idx)
-            if bbox is None:
+            crop_bbox = spec["crop_boxes"].get(frame_idx)
+            if crop_bbox is None:
                 continue
-            rendered_frame = draw_target_on_frame(
-                frame.copy(),
-                bbox,
-                box_thickness=box_thickness,
-                font_scale=font_scale,
-            )
-            center_x, center_y = bbox_center(bbox)
+            rendered_frame = frame.copy()
+            draw_bbox = spec["draw_boxes"].get(frame_idx)
+            if draw_bbox is not None:
+                rendered_frame = draw_target_on_frame(
+                    rendered_frame,
+                    draw_bbox,
+                    box_thickness=box_thickness,
+                    font_scale=font_scale,
+                )
+            center_x, center_y = bbox_center(crop_bbox)
             crop_w, crop_h = spec["clip_size"]
             crop = crop_with_padding(rendered_frame, center_x, center_y, crop_w, crop_h)
             spec["writer"].write(crop)

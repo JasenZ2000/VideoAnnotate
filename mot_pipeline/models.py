@@ -14,6 +14,7 @@ class Detection:
     video_frame_idx: int
     class_id: int
     bbox: BBox
+    score: float = 1.0
 
 
 @dataclass
@@ -70,4 +71,3 @@ class FinalTrack:
     @property
     def length(self) -> int:
         return len(self.frames)
-

@@ -55,13 +55,16 @@ def run_pipeline(video_path: Path, ann_dir: Path, out_dir: Path, config: Dict[st
     tracking_cfg = config["tracking"]
     fusion_cfg = config["fusion"]
     clips_cfg = config["clips"]
+    pad_frames = int(clips_cfg.get("pad_frames", 10))
 
     tracker_name = tracking_cfg.get("method", "iou_kalman")
     if tracker_name not in TRACKER_REGISTRY:
-        raise ValueError(f"Unknown tracking method: {tracker_name}")
+        available = ", ".join(sorted(TRACKER_REGISTRY))
+        raise ValueError(f"Unknown tracking method: {tracker_name}. Available: {available}")
     fusion_name = fusion_cfg.get("method", "bidirectional_iou")
     if fusion_name not in FUSION_REGISTRY:
-        raise ValueError(f"Unknown fusion method: {fusion_name}")
+        available = ", ".join(sorted(FUSION_REGISTRY))
+        raise ValueError(f"Unknown fusion method: {fusion_name}. Available: {available}")
 
     use_kalman = not tracking_cfg.get("disable_kalman", False)
     if np is None and use_kalman:
@@ -80,6 +83,7 @@ def run_pipeline(video_path: Path, ann_dir: Path, out_dir: Path, config: Dict[st
         min_iou=tracking_cfg["iou_match"],
         max_missed=tracking_cfg["max_missed"],
         use_kalman=use_kalman,
+        tracking_config=tracking_cfg,
     )
     backward_tracks = tracker(
         frames=frames,
@@ -87,6 +91,7 @@ def run_pipeline(video_path: Path, ann_dir: Path, out_dir: Path, config: Dict[st
         min_iou=tracking_cfg["iou_match"],
         max_missed=tracking_cfg["max_missed"],
         use_kalman=use_kalman,
+        tracking_config=tracking_cfg,
     )
     print(
         f"Tracking produced {len(forward_tracks)} forward tracklets and "
@@ -109,7 +114,7 @@ def run_pipeline(video_path: Path, ann_dir: Path, out_dir: Path, config: Dict[st
     output_tracks = clone_final_tracks(final_tracks)
     clip_tracks = prepare_track_clips(
         final_tracks=clone_final_tracks(final_tracks),
-        pad_frames=clips_cfg["pad_frames"],
+        pad_frames=pad_frames,
         frame_count=frame_count,
         crop_margin=clips_cfg["crop_margin"],
         crop_min_size=clips_cfg["crop_min_size"],
@@ -137,6 +142,7 @@ def run_pipeline(video_path: Path, ann_dir: Path, out_dir: Path, config: Dict[st
         fps=fps,
         frame_count=frame_count,
         codec=clips_cfg["codec"],
+        pad_frames=pad_frames,
         box_thickness=clips_cfg["overview_box_thickness"],
         font_scale=clips_cfg["overview_font_scale"],
     )

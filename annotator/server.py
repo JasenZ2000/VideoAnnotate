@@ -14,6 +14,7 @@ import threading
 import urllib.error
 import urllib.request
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -39,6 +40,7 @@ _cap_lock = threading.Lock()
 _workspace: Optional[Path] = None
 _workspace_version: int = 0
 _sam31_jobs: dict[str, dict[str, Any]] = {}
+_locany_jobs: dict[str, dict[str, Any]] = {}
 
 STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -76,6 +78,9 @@ class InterpolateReq(BaseModel):
     frame_a: int
     frame_b: int
 
+class InterpolateShortGapsReq(BaseModel):
+    max_gap: int = 5
+
 class FixSpikesReq(BaseModel):
     track_id: int
     area_ratio: Optional[float] = None
@@ -109,6 +114,24 @@ class Sam31BoxTrackReq(BaseModel):
     replace_after: bool = True
     cuda_device: Optional[int] = None
     use_rect_mask: Optional[bool] = None
+
+class LocateAnythingRemoteReq(BaseModel):
+    prompt: str
+    task: str = "ground_multi"
+    max_frames: int = 0
+    start_frame: int = 0
+    frame_step: int = 1
+    resize_long_edge: Optional[int] = None
+    max_new_tokens: Optional[int] = None
+    cuda_device: Optional[int] = None
+
+class ConfigInspectReq(BaseModel):
+    path: Optional[str] = None
+
+class ConfigSaveReq(BaseModel):
+    path: Optional[str] = None
+    target: str
+    config: dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +184,78 @@ def _get_workspace_config() -> dict[str, Any]:
     return _load_workspace_config(_workspace)
 
 
+def _config_workspace_from_req(path: Optional[str]) -> Path:
+    workspace = Path(path) if path else _workspace
+    if workspace is None:
+        raise HTTPException(400, "No workspace path provided and no workspace open")
+    if not workspace.is_dir():
+        raise HTTPException(400, f"Not a directory: {workspace}")
+    return workspace
+
+
+def _read_config_file(path: Path) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write_config_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+
+
+def _segment_config_targets(workspace: Path) -> list[dict[str, Any]]:
+    segments_dir = workspace / "segments"
+    if not segments_dir.is_dir():
+        return []
+    targets = []
+    for seg_dir in sorted(segments_dir.iterdir()):
+        if not seg_dir.is_dir():
+            continue
+        video = _find_video(seg_dir)
+        targets.append({
+            "name": seg_dir.name,
+            "path": str(seg_dir),
+            "config_path": str(seg_dir / "config.json"),
+            "has_config": (seg_dir / "config.json").exists(),
+            "video": video.name if video else None,
+        })
+    return targets
+
+
+def _config_payload_for_workspace(workspace: Path) -> dict[str, Any]:
+    from mot_pipeline.config import DEFAULT_CONFIG
+
+    root_config_path = _ensure_config(workspace)
+    root_raw = _read_config_file(root_config_path)
+    root_effective = _load_workspace_config(workspace)
+    segments = []
+    for target in _segment_config_targets(workspace):
+        seg_dir = Path(target["path"])
+        seg_config_path = _ensure_config(seg_dir)
+        segments.append({
+            **target,
+            "config_path": str(seg_config_path),
+            "has_config": True,
+            "raw": _read_config_file(seg_config_path),
+            "effective": _load_workspace_config(seg_dir),
+        })
+
+    return {
+        "workspace": str(workspace),
+        "root": {
+            "name": workspace.name,
+            "path": str(workspace),
+            "config_path": str(root_config_path),
+            "raw": root_raw,
+            "effective": root_effective,
+        },
+        "segments": segments,
+        "default_config": DEFAULT_CONFIG,
+    }
+
+
 def _get_annotator_config() -> dict[str, int]:
     config = _get_workspace_config().get("annotator", {})
     return {
@@ -181,6 +276,8 @@ def _get_area_anomaly_config(workspace: Optional[Path] = None) -> dict[str, Any]
         "enabled": bool(config.get("enabled", True)),
         "high_area_ratio": float(config.get("high_area_ratio", 3.0)),
         "low_area_ratio": float(config.get("low_area_ratio", 0.25)),
+        "frame_area_change_ratio": float(config.get("frame_area_change_ratio", 2.5)),
+        "frame_area_change_abs": float(config.get("frame_area_change_abs", 800.0)),
         "robust_z_threshold": float(config.get("robust_z_threshold", 6.0)),
         "min_track_frames": int(config.get("min_track_frames", 8)),
         "min_area": float(config.get("min_area", 1.0)),
@@ -207,6 +304,8 @@ def _area_anomaly_payload(state: AnnotationState = STATE, workspace: Optional[Pa
     return state.detect_area_anomaly_segments(
         high_area_ratio=cfg["high_area_ratio"],
         low_area_ratio=cfg["low_area_ratio"],
+        frame_area_change_ratio=cfg["frame_area_change_ratio"],
+        frame_area_change_abs=cfg["frame_area_change_abs"],
         robust_z_threshold=cfg["robust_z_threshold"],
         min_track_frames=cfg["min_track_frames"],
         min_area=cfg["min_area"],
@@ -234,6 +333,43 @@ def _check_client_version(v: Optional[int]) -> None:
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+@app.get("/config", response_class=HTMLResponse)
+async def config_page():
+    return FileResponse(str(STATIC_DIR / "config.html"))
+
+
+@app.post("/api/config/inspect")
+async def inspect_config(req: ConfigInspectReq):
+    workspace = _config_workspace_from_req(req.path)
+    return _config_payload_for_workspace(workspace)
+
+
+@app.post("/api/config/save")
+async def save_config(req: ConfigSaveReq):
+    workspace = _config_workspace_from_req(req.path)
+    if req.target == "root":
+        target_paths = [_ensure_config(workspace)]
+    elif req.target == "all_segments":
+        segments = _segment_config_targets(workspace)
+        if not segments:
+            raise HTTPException(400, "No segments directory or no segment folders")
+        target_paths = [_ensure_config(Path(item["path"])) for item in segments]
+    else:
+        seg_dir = workspace / "segments" / req.target
+        if not seg_dir.is_dir():
+            raise HTTPException(400, f"Segment not found: {req.target}")
+        target_paths = [_ensure_config(seg_dir)]
+
+    for path in target_paths:
+        _write_config_file(path, req.config)
+    return {
+        "ok": True,
+        "target": req.target,
+        "written": [str(path) for path in target_paths],
+        "count": len(target_paths),
+    }
 
 
 @app.post("/api/open-workspace")
@@ -463,6 +599,13 @@ async def interpolate(req: InterpolateReq):
     return {"ok": True, "interpolated_count": count}
 
 
+@app.post("/api/interpolate-short-gaps")
+async def interpolate_short_gaps(req: InterpolateShortGapsReq):
+    max_gap = max(0, int(req.max_gap))
+    result = STATE.interpolate_short_gaps(max_gap)
+    return {"ok": True, "max_gap": max_gap, **result}
+
+
 def _spike_fix_params(overrides: Optional[FixSpikesReq] = None) -> dict[str, Any]:
     sam_cfg = _get_workspace_config().get("sam31", {})
     params = {
@@ -563,7 +706,13 @@ def _apply_sam31_tracking_result(
     return {"updated_frames": updated, "spike_fix": spike_fix}
 
 
-def _json_http_request(method: str, url: str, payload: Optional[dict[str, Any]] = None, timeout: float = 30.0) -> dict[str, Any]:
+def _json_http_request(
+    method: str,
+    url: str,
+    payload: Optional[dict[str, Any]] = None,
+    timeout: float = 30.0,
+    service_name: str = "remote service",
+) -> dict[str, Any]:
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -576,9 +725,23 @@ def _json_http_request(method: str, url: str, payload: Optional[dict[str, Any]] 
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Remote SAM31 HTTP {exc.code}: {detail}") from exc
+        raise RuntimeError(f"{service_name} HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Remote SAM31 request failed: {exc}") from exc
+        raise RuntimeError(f"{service_name} request failed: {exc}") from exc
+
+
+def _download_binary(url: str, output_path: Path, timeout: float = 60.0, service_name: str = "remote service") -> None:
+    request = urllib.request.Request(url, method="GET")
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            with open(output_path, "wb") as f:
+                shutil.copyfileobj(response, f)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{service_name} HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"{service_name} request failed: {exc}") from exc
 
 
 def _map_video_path_for_sam31(video: Path, sam_cfg: dict[str, Any]) -> str:
@@ -686,6 +849,40 @@ def _prepare_video_path_for_sam31(video: Path, sam_cfg: dict[str, Any], job: dic
     if transfer == "sftp":
         return _upload_video_via_sftp(video, sam_cfg, job)
     raise RuntimeError(f"Unknown sam31.video_transfer: {transfer}")
+
+
+def _locany_config(config: dict[str, Any]) -> dict[str, Any]:
+    cfg = dict(config.get("sam31", {}))
+    for key, value in config.get("locateanything", {}).items():
+        if value == "":
+            continue
+        cfg[key] = value
+    return cfg
+
+
+def _map_video_path_for_locany(video: Path, loc_cfg: dict[str, Any]) -> str:
+    try:
+        return _map_video_path_for_sam31(video, loc_cfg)
+    except RuntimeError as exc:
+        message = str(exc).replace("SAM31", "LocateAnything").replace("sam31.", "locateanything.")
+        raise RuntimeError(message) from exc
+
+
+def _upload_video_via_sftp_for_locany(video: Path, loc_cfg: dict[str, Any], job: dict[str, Any]) -> str:
+    try:
+        return _upload_video_via_sftp(video, loc_cfg, job)
+    except RuntimeError as exc:
+        message = str(exc).replace("sam31.", "locateanything.")
+        raise RuntimeError(message) from exc
+
+
+def _prepare_video_path_for_locany(video: Path, loc_cfg: dict[str, Any], job: dict[str, Any]) -> str:
+    transfer = str(loc_cfg.get("video_transfer", "path")).lower()
+    if transfer == "path":
+        return _map_video_path_for_locany(video, loc_cfg)
+    if transfer == "sftp":
+        return _upload_video_via_sftp_for_locany(video, loc_cfg, job)
+    raise RuntimeError(f"Unknown locateanything.video_transfer: {transfer}")
 
 
 async def _run_remote_sam31_box_track_job_impl(
@@ -931,6 +1128,176 @@ async def get_sam31_job(job_id: str):
     return job
 
 
+def _safe_extract_zip(zip_path: Path, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    root = output_dir.resolve()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.infolist():
+            target = (output_dir / member.filename).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError as exc:
+                raise RuntimeError(f"Unsafe zip member path: {member.filename}") from exc
+        zf.extractall(output_dir)
+
+
+async def _run_remote_locany_job_impl(
+    job_id: str,
+    req: LocateAnythingRemoteReq,
+    workspace: Path,
+    video: Path,
+    loc_cfg: dict[str, Any],
+) -> None:
+    job = _locany_jobs[job_id]
+    job["status"] = "running"
+    server_url = str(loc_cfg.get("server_url", "")).rstrip("/")
+    if not server_url:
+        raise RuntimeError("locateanything.server_url is required")
+
+    timeout = float(loc_cfg.get("request_timeout", 30))
+    download_timeout = float(loc_cfg.get("download_timeout", 300))
+    poll_interval = float(loc_cfg.get("poll_interval", 5))
+    device = str(loc_cfg.get("device", "cuda"))
+    if req.cuda_device is not None:
+        if req.cuda_device < 0:
+            raise RuntimeError("cuda_device must be >= 0")
+        device = f"cuda:{req.cuda_device}"
+
+    remote_video_path = await asyncio.to_thread(_prepare_video_path_for_locany, video, loc_cfg, job)
+    frame_offset = int(loc_cfg.get("frame_offset", 1))
+    class_id = int(loc_cfg.get("class_id", 0))
+    score = float(loc_cfg.get("score", 1.0))
+
+    payload = {
+        "video_path": remote_video_path,
+        "prompt": req.prompt,
+        "task": req.task or str(loc_cfg.get("task", "ground_multi")),
+        "class_id": class_id,
+        "score": score,
+        "start_frame": max(0, req.start_frame),
+        "max_frames": max(0, req.max_frames),
+        "frame_step": max(1, req.frame_step),
+        "frame_offset": frame_offset,
+        "file_prefix": video.stem,
+        "resize_long_edge": int(req.resize_long_edge or loc_cfg.get("resize_long_edge", 1024)),
+        "generation_mode": str(loc_cfg.get("generation_mode", "slow")),
+        "max_new_tokens": int(req.max_new_tokens or loc_cfg.get("max_new_tokens", 512)),
+        "temperature": float(loc_cfg.get("temperature", 0.0)),
+        "use_cache": bool(loc_cfg.get("use_cache", True)),
+        "device": device,
+        "dtype": str(loc_cfg.get("dtype", "bf16")),
+    }
+
+    job["message"] = "Submitting remote LocateAnything job"
+    remote = await asyncio.to_thread(
+        _json_http_request,
+        "POST",
+        f"{server_url}/api/jobs",
+        payload,
+        timeout,
+        "Remote LocateAnything",
+    )
+    remote_job_id = remote["job_id"]
+    job["remote_job_id"] = remote_job_id
+    job["remote_server_url"] = server_url
+    job["remote_video_path"] = remote_video_path
+
+    while True:
+        remote_status = await asyncio.to_thread(
+            _json_http_request,
+            "GET",
+            f"{server_url}/api/jobs/{remote_job_id}",
+            None,
+            timeout,
+            "Remote LocateAnything",
+        )
+        job["message"] = remote_status.get("message", remote_status.get("status", ""))
+        job["remote_status"] = remote_status
+        if remote_status.get("status") == "done":
+            break
+        if remote_status.get("status") == "failed":
+            raise RuntimeError(remote_status.get("message", "Remote LocateAnything failed"))
+        await asyncio.sleep(poll_interval)
+
+    out_dir = workspace / "locateanything_runs" / job_id
+    zip_path = out_dir / "locateanything_yolo.zip"
+    extract_dir = out_dir / "extracted"
+    job["message"] = "Downloading LocateAnything YOLO zip"
+    await asyncio.to_thread(
+        _download_binary,
+        f"{server_url}/api/jobs/{remote_job_id}/yolo-zip",
+        zip_path,
+        download_timeout,
+        "Remote LocateAnything",
+    )
+    _safe_extract_zip(zip_path, extract_dir)
+
+    labels_src = extract_dir / "labels"
+    labels_dst = out_dir / video.stem
+    if labels_dst.exists():
+        shutil.rmtree(labels_dst)
+    if labels_src.is_dir():
+        shutil.move(str(labels_src), str(labels_dst))
+    else:
+        labels_dst.mkdir(parents=True, exist_ok=True)
+
+    metadata_src = extract_dir / "metadata.json"
+    raw_src = extract_dir / "raw_answers.jsonl"
+    if metadata_src.exists():
+        shutil.copy2(str(metadata_src), str(out_dir / "metadata.json"))
+    if raw_src.exists():
+        shutil.copy2(str(raw_src), str(out_dir / "raw_answers.jsonl"))
+
+    job["status"] = "done"
+    job["message"] = f"LocateAnything results saved to {labels_dst}"
+    job["output_dir"] = str(labels_dst)
+    job["zip_path"] = str(zip_path)
+    job["metadata_path"] = str(out_dir / "metadata.json")
+    job["raw_answers_path"] = str(out_dir / "raw_answers.jsonl")
+
+
+async def _run_locany_job(job_id: str, req: LocateAnythingRemoteReq, workspace: Path, video: Path) -> None:
+    try:
+        config = _load_workspace_config(workspace)
+        loc_cfg = _locany_config(config)
+        await _run_remote_locany_job_impl(job_id, req, workspace, video, loc_cfg)
+    except Exception as exc:
+        job = _locany_jobs.get(job_id)
+        if job is not None:
+            job["status"] = "failed"
+            job["message"] = str(exc)
+
+
+@app.post("/api/locateanything/yolo")
+async def start_locany_yolo(req: LocateAnythingRemoteReq):
+    if _workspace is None:
+        raise HTTPException(400, "No workspace open")
+    if not req.prompt.strip():
+        raise HTTPException(400, "Prompt is required")
+    video = _find_video(_workspace)
+    if not video:
+        raise HTTPException(400, "No video in workspace")
+
+    job_id = uuid.uuid4().hex
+    _locany_jobs[job_id] = {
+        "id": job_id,
+        "status": "queued",
+        "message": "Queued",
+        "prompt": req.prompt,
+        "video": str(video),
+    }
+    asyncio.create_task(_run_locany_job(job_id, req, _workspace, video))
+    return {"ok": True, "job_id": job_id}
+
+
+@app.get("/api/locateanything/job/{job_id}")
+async def get_locany_job(job_id: str):
+    job = _locany_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "LocateAnything job not found")
+    return job
+
+
 @app.post("/api/run-pipeline")
 async def run_pipeline_endpoint():
     """Run MOT pipeline using workspace config, output to workspace."""
@@ -994,6 +1361,7 @@ async def render_clips_and_overview():
     config_path = _ensure_config(_workspace)
     config = load_config(str(config_path))
     clips_cfg = config["clips"]
+    pad_frames = int(clips_cfg.get("pad_frames", 10))
 
     # Build FinalTrack objects from current annotation state
     final_tracks: list[FinalTrack] = []
@@ -1033,7 +1401,7 @@ async def render_clips_and_overview():
     # Prepare and extract clips (densifies + pads tracks)
     clip_tracks = prepare_track_clips(
         final_tracks=clone_final_tracks(final_tracks),
-        pad_frames=clips_cfg["pad_frames"],
+        pad_frames=pad_frames,
         frame_count=STATE.frame_count,
         crop_margin=clips_cfg["crop_margin"],
         crop_min_size=clips_cfg["crop_min_size"],
@@ -1045,6 +1413,7 @@ async def render_clips_and_overview():
         fps=STATE.fps,
         frame_count=STATE.frame_count,
         codec=clips_cfg["codec"],
+        pad_frames=pad_frames,
         box_thickness=clips_cfg["overview_box_thickness"],
         font_scale=clips_cfg["overview_font_scale"],
     )

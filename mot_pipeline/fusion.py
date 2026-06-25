@@ -114,6 +114,178 @@ def fuse_tracklets(
     return list(components.values())
 
 
+def _as_components(tracklets: Sequence[Tracklet]) -> List[List[Tracklet]]:
+    return [[tracklet] for tracklet in tracklets]
+
+
+def _compatible_pair_candidates(
+    forward_tracks: Sequence[Tracklet],
+    backward_tracks: Sequence[Tracklet],
+    iou_fuse: float,
+) -> List[Tuple[float, int, int, Dict[str, float]]]:
+    candidates: List[Tuple[float, int, int, Dict[str, float]]] = []
+    for f_idx, f_track in enumerate(forward_tracks):
+        for b_idx, b_track in enumerate(backward_tracks):
+            stats = track_overlap_stats(f_track, b_track)
+            if stats is None:
+                continue
+            if stats["mean_iou"] < iou_fuse:
+                continue
+            if stats["normalized_gap"] > 1.5:
+                continue
+            candidates.append((stats["score"], f_idx, b_idx, stats))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates
+
+
+def _mutual_best_pairs(
+    forward_tracks: Sequence[Tracklet],
+    backward_tracks: Sequence[Tracklet],
+    iou_fuse: float,
+) -> Tuple[List[Tuple[int, int]], List[Tuple[float, int, int, Dict[str, float]]]]:
+    candidates = _compatible_pair_candidates(forward_tracks, backward_tracks, iou_fuse)
+    forward_best: Dict[int, Tuple[float, int]] = {}
+    backward_best: Dict[int, Tuple[float, int]] = {}
+    for score, f_idx, b_idx, _ in candidates:
+        if score > forward_best.get(f_idx, (-1.0, -1))[0]:
+            forward_best[f_idx] = (score, b_idx)
+        if score > backward_best.get(b_idx, (-1.0, -1))[0]:
+            backward_best[b_idx] = (score, f_idx)
+
+    pairs = []
+    for f_idx, (_, b_idx) in forward_best.items():
+        back_match = backward_best.get(b_idx)
+        if back_match is None or back_match[1] != f_idx:
+            continue
+        pairs.append((f_idx, b_idx))
+    return pairs, candidates
+
+
+def fuse_forward_only(
+    forward_tracks: Sequence[Tracklet],
+    backward_tracks: Sequence[Tracklet],
+    iou_fuse: float,
+) -> List[List[Tracklet]]:
+    return _as_components(forward_tracks)
+
+
+def fuse_backward_only(
+    forward_tracks: Sequence[Tracklet],
+    backward_tracks: Sequence[Tracklet],
+    iou_fuse: float,
+) -> List[List[Tracklet]]:
+    return _as_components(backward_tracks)
+
+
+def fuse_tracklets_forward_primary(
+    forward_tracks: Sequence[Tracklet],
+    backward_tracks: Sequence[Tracklet],
+    iou_fuse: float,
+) -> List[List[Tracklet]]:
+    if not forward_tracks:
+        return _as_components(backward_tracks)
+    pairs, _ = _mutual_best_pairs(forward_tracks, backward_tracks, iou_fuse)
+    backward_by_forward = {f_idx: b_idx for f_idx, b_idx in pairs}
+
+    components: List[List[Tracklet]] = []
+    for f_idx, f_track in enumerate(forward_tracks):
+        component = [f_track]
+        b_idx = backward_by_forward.get(f_idx)
+        if b_idx is not None:
+            component.append(backward_tracks[b_idx])
+        components.append(component)
+    return components
+
+
+def fuse_tracklets_forward_unique(
+    forward_tracks: Sequence[Tracklet],
+    backward_tracks: Sequence[Tracklet],
+    iou_fuse: float,
+) -> List[List[Tracklet]]:
+    if not forward_tracks:
+        return _as_components(backward_tracks)
+    pairs, candidates = _mutual_best_pairs(forward_tracks, backward_tracks, iou_fuse)
+    matched_backward = {b_idx for _, b_idx in pairs}
+    duplicate_backward = {b_idx for _, _, b_idx, _ in candidates}
+    backward_by_forward = {f_idx: b_idx for f_idx, b_idx in pairs}
+
+    components: List[List[Tracklet]] = []
+    for f_idx, f_track in enumerate(forward_tracks):
+        component = [f_track]
+        b_idx = backward_by_forward.get(f_idx)
+        if b_idx is not None:
+            component.append(backward_tracks[b_idx])
+        components.append(component)
+
+    for b_idx, b_track in enumerate(backward_tracks):
+        if b_idx in matched_backward or b_idx in duplicate_backward:
+            continue
+        components.append([b_track])
+    return components
+
+
+def fuse_tracklets_all_pairs(
+    forward_tracks: Sequence[Tracklet],
+    backward_tracks: Sequence[Tracklet],
+    iou_fuse: float,
+) -> List[List[Tracklet]]:
+    all_tracklets = list(forward_tracks) + list(backward_tracks)
+    uf = UnionFind(len(all_tracklets))
+    offset = len(forward_tracks)
+    for _, f_idx, b_idx, _ in _compatible_pair_candidates(forward_tracks, backward_tracks, iou_fuse):
+        uf.union(f_idx, offset + b_idx)
+
+    components: Dict[int, List[Tracklet]] = defaultdict(list)
+    for idx, tracklet in enumerate(all_tracklets):
+        components[uf.find(idx)].append(tracklet)
+    return list(components.values())
+
+
+def _component_score(component: Sequence[Tracklet]) -> float:
+    if not component:
+        return 0.0
+    length = max(tracklet.length for tracklet in component)
+    quality = max(tracklet.quality for tracklet in component)
+    support = len(component)
+    return length + quality + 0.25 * support
+
+
+def _components_overlap(
+    a: Sequence[Tracklet],
+    b: Sequence[Tracklet],
+    iou_fuse: float,
+) -> bool:
+    for a_track in a:
+        for b_track in b:
+            stats = track_overlap_stats(a_track, b_track)
+            if stats is None:
+                continue
+            if stats["mean_iou"] < iou_fuse:
+                continue
+            if stats["overlap_ratio"] < 0.6:
+                continue
+            if stats["normalized_gap"] > 1.5:
+                continue
+            return True
+    return False
+
+
+def fuse_tracklets_nms(
+    forward_tracks: Sequence[Tracklet],
+    backward_tracks: Sequence[Tracklet],
+    iou_fuse: float,
+) -> List[List[Tracklet]]:
+    components = fuse_tracklets(forward_tracks, backward_tracks, iou_fuse)
+    ordered = sorted(components, key=_component_score, reverse=True)
+    kept: List[List[Tracklet]] = []
+    for component in ordered:
+        if any(_components_overlap(component, kept_component, iou_fuse) for kept_component in kept):
+            continue
+        kept.append(component)
+    kept.sort(key=lambda component: min(tracklet.start_frame for tracklet in component))
+    return kept
+
+
 def merge_component(
     tracklets: Sequence[Tracklet],
     image_w: int,
@@ -209,4 +381,10 @@ def build_final_tracks(
 
 FUSION_REGISTRY = {
     "bidirectional_iou": fuse_tracklets,
+    "forward_only": fuse_forward_only,
+    "backward_only": fuse_backward_only,
+    "bidirectional_iou_forward_primary": fuse_tracklets_forward_primary,
+    "bidirectional_iou_forward_unique": fuse_tracklets_forward_unique,
+    "bidirectional_iou_all_pairs": fuse_tracklets_all_pairs,
+    "bidirectional_iou_nms": fuse_tracklets_nms,
 }

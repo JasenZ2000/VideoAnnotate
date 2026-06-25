@@ -61,6 +61,8 @@ def build_area_anomaly_report(payload: Dict[str, Any], config: Optional[Dict[str
     enabled = bool(cfg.get("enabled", True))
     high_area_ratio = max(1.0, float(cfg.get("high_area_ratio", 3.0)))
     low_area_ratio = max(0.0, min(1.0, float(cfg.get("low_area_ratio", 0.25))))
+    frame_area_change_ratio = max(1.0, float(cfg.get("frame_area_change_ratio", 2.5)))
+    frame_area_change_abs = max(0.0, float(cfg.get("frame_area_change_abs", 800.0)))
     robust_z_threshold = max(0.0, float(cfg.get("robust_z_threshold", 6.0)))
     min_track_frames = max(1, int(cfg.get("min_track_frames", 8)))
     min_area = max(0.0, float(cfg.get("min_area", 1.0)))
@@ -96,12 +98,20 @@ def build_area_anomaly_report(payload: Dict[str, Any], config: Optional[Dict[str
             q3_area = _percentile(positive_areas, 0.75)
             mad_area = median([abs(area - median_area) for area in positive_areas])
             suspicious = []
+            previous_positive_area = None
             for row in rows:
                 area = row["area"]
                 area_ratio = area / median_area if median_area > 0 else 0.0
+                frame_change_ratio = 1.0
+                frame_change_abs = 0.0
                 robust_z = 0.0
                 if mad_area > 0:
                     robust_z = 0.6745 * (area - median_area) / mad_area
+                if previous_positive_area is not None and area >= min_area:
+                    smaller = max(min(previous_positive_area, area), min_area)
+                    larger = max(previous_positive_area, area)
+                    frame_change_ratio = larger / smaller if smaller > 0 else 1.0
+                    frame_change_abs = abs(area - previous_positive_area)
                 reasons = []
                 if area < min_area:
                     reasons.append("degenerate_area")
@@ -109,15 +119,26 @@ def build_area_anomaly_report(payload: Dict[str, Any], config: Optional[Dict[str
                     reasons.append("high_area_ratio")
                 elif median_area > 0 and low_area_ratio > 0 and area_ratio <= low_area_ratio:
                     reasons.append("low_area_ratio")
+                if (
+                    previous_positive_area is not None
+                    and area >= min_area
+                    and frame_change_ratio >= frame_area_change_ratio
+                    and frame_change_abs >= frame_area_change_abs
+                ):
+                    reasons.append("frame_area_jump")
                 if robust_z_threshold > 0 and abs(robust_z) >= robust_z_threshold:
                     reasons.append("robust_z")
                 if reasons:
                     suspicious.append({
                         **row,
                         "area_ratio": area_ratio,
+                        "frame_change_ratio": frame_change_ratio,
+                        "frame_change_abs": frame_change_abs,
                         "robust_z": robust_z,
                         "reasons": sorted(set(reasons)),
                     })
+                if area >= min_area:
+                    previous_positive_area = area
 
             groups: List[List[Dict[str, Any]]] = []
             for row in suspicious:
@@ -130,6 +151,8 @@ def build_area_anomaly_report(payload: Dict[str, Any], config: Optional[Dict[str
             for group in groups:
                 areas = [row["area"] for row in group]
                 ratios = [row["area_ratio"] for row in group]
+                change_ratios = [row.get("frame_change_ratio", 1.0) for row in group]
+                change_abs_values = [row.get("frame_change_abs", 0.0) for row in group]
                 robust_zs = [row["robust_z"] for row in group]
                 segments.append({
                     "start": int(group[0]["frame_idx"]),
@@ -140,6 +163,8 @@ def build_area_anomaly_report(payload: Dict[str, Any], config: Optional[Dict[str
                     "min_area": min(areas),
                     "max_area_ratio": max(ratios) if ratios else 0.0,
                     "min_area_ratio": min(ratios) if ratios else 0.0,
+                    "max_frame_change_ratio": max(change_ratios) if change_ratios else 1.0,
+                    "max_frame_change_abs": max(change_abs_values) if change_abs_values else 0.0,
                     "max_abs_robust_z": max((abs(value) for value in robust_zs), default=0.0),
                 })
 
@@ -160,6 +185,8 @@ def build_area_anomaly_report(payload: Dict[str, Any], config: Optional[Dict[str
             "enabled": enabled,
             "high_area_ratio": high_area_ratio,
             "low_area_ratio": low_area_ratio,
+            "frame_area_change_ratio": frame_area_change_ratio,
+            "frame_area_change_abs": frame_area_change_abs,
             "robust_z_threshold": robust_z_threshold,
             "min_track_frames": min_track_frames,
             "min_area": min_area,
@@ -223,19 +250,21 @@ def load_annotations(
                 if not line:
                     continue
                 parts = line.split()
-                if len(parts) != 5:
+                if len(parts) not in (5, 6):
                     warnings.append(
                         f"Skipping malformed annotation line {line_no} in {path.name}: {line}"
                     )
                     continue
                 try:
                     class_id = int(float(parts[0]))
-                    cx, cy, w, h = [float(v) for v in parts[1:]]
+                    cx, cy, w, h = [float(v) for v in parts[1:5]]
+                    score = float(parts[5]) if len(parts) == 6 else 1.0
                 except ValueError:
                     warnings.append(
                         f"Skipping non-numeric annotation line {line_no} in {path.name}: {line}"
                     )
                     continue
+                score = max(0.0, min(1.0, score))
                 bbox = yolo_to_xyxy(cx, cy, w, h, image_w, image_h)
                 if bbox is None:
                     warnings.append(
@@ -248,6 +277,7 @@ def load_annotations(
                         video_frame_idx=video_idx,
                         class_id=class_id,
                         bbox=bbox,
+                        score=score,
                     )
                 )
         frames.append(
