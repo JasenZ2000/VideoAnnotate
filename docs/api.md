@@ -1,8 +1,8 @@
-# HTTP API Summary
+# HTTP API 概览
 
-Interactive OpenAPI documentation is available at `/docs` on every FastAPI service.
+每个 FastAPI 服务都在 `/docs` 路径提供可交互的 OpenAPI 文档。
 
-## Workflow Platform
+## 作业流程平台
 
 - `GET /api/health`
 - `GET|POST /api/tasks`
@@ -14,7 +14,7 @@ Interactive OpenAPI documentation is available at `/docs` on every FastAPI servi
 - `POST /api/tasks/{task_id}/run-segment-locateanything`
 - `POST /api/tasks/{task_id}/run-tracking`
 - `POST /api/tasks/{task_id}/run-segment-tracking`
-- package, reviewed upload and YOLO export endpoints under the same task path
+- 同一任务路径下还提供标注包生成、审核结果上传和 YOLO 导出接口
 
 ## LocateAnything
 
@@ -30,4 +30,4 @@ Interactive OpenAPI documentation is available at `/docs` on every FastAPI servi
 - `GET /api/jobs/{job_id}`
 - `GET /api/jobs/{job_id}/tracking-results`
 
-The job services return `queued`, `running`, `done` or `failed`. Clients should poll with a bounded interval and fetch artifacts only after `done`.
+任务服务会返回 `queued`、`running`、`done` 或 `failed` 状态。客户端应按合理的固定间隔轮询，仅在状态变为 `done` 后获取结果文件。

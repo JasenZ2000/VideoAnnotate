@@ -1,24 +1,24 @@
-# Roadmap And Known Limitations
+# 路线图与已知限制
 
-## Required For Production Workflow
+## 正式生产流程必需能力
 
-- Make package generation, reviewed-result upload and final export fully segment-aware.
-- Add segment assignment/progress controls and final multi-segment merge validation.
-- Persist remote job state so service restarts do not lose polling metadata.
-- Add authentication, authorization and audit identities to the platform.
-- Add cancellation, retry and queue visibility for long GPU jobs.
-- Package Annotator as a tested Windows distribution with upgrade/version reporting.
+- 让标注包生成、审核结果上传和最终导出完整支持视频分段。
+- 增加分段任务分配、进度控制和最终多分段合并校验。
+- 持久化远端任务状态，避免服务重启后丢失轮询信息。
+- 为平台增加身份认证、权限控制和带操作人员身份的审计记录。
+- 为长时间 GPU 任务增加取消、重试和队列可视化。
+- 将 Annotator 打包为经过测试、可报告版本和升级状态的 Windows 安装包。
 
-## Data Quality
+## 数据质量
 
-- Define strict behavior for unknown LocateAnything class labels instead of silently using the fallback class ID.
-- Add automatic frame-offset validation for uploaded YOLO archives.
-- Add dataset-level checks for missing frames, invalid boxes, class drift and duplicate trajectories.
+- 为 LocateAnything 返回的未知类别定义严格处理规则，不再静默使用默认类别 ID。
+- 为上传的 YOLO 压缩包增加帧偏移自动校验。
+- 增加数据集级别的缺帧、无效框、类别漂移和重复轨迹检查。
 
-## Operations
+## 运维能力
 
-- Add retention/cleanup policy for GPU caches and old task artifacts.
-- Add structured logs and basic service metrics.
-- Add backup/restore drills and a task schema migration mechanism.
+- 为 GPU 缓存和历史任务产物制定保留与清理策略。
+- 增加结构化日志和基础服务指标。
+- 增加备份恢复演练和任务数据结构迁移机制。
 
-These items are explicit so operators can distinguish available MVP behavior from intended platform behavior.
+明确列出这些事项，是为了让运维和使用人员能够区分当前已经可用的 MVP 能力与计划中的平台能力。

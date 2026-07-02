@@ -1,58 +1,58 @@
-# Architecture
+# 系统架构
 
-## Deployment Topology
+## 部署拓扑
 
-The system is intentionally split by latency and hardware responsibility:
+系统按照交互延迟和硬件职责拆分为三类节点：
 
-- The **Windows public machine** owns task state and shared files. It exposes the workflow platform to the team and runs CPU-side segmentation, tracking, packaging and export work.
-- The **Linux GPU server** hosts two independent services. LocateAnything produces prompt-based YOLO prelabels; SAM3.1 extends a manually supplied box through a video segment.
-- Each **employee Windows PC** runs Annotator locally. Video frames and interaction stay local, while only explicit GPU jobs are sent to SAM3.1.
+- **Windows 公共机**负责保存任务状态和共享文件，向团队提供作业流程平台，并执行视频分段、跟踪、打包和导出等 CPU 任务。
+- **Linux GPU 服务器**运行两个独立服务。LocateAnything 根据文本提示生成 YOLO 预标注；SAM3.1 根据人工给定的目标框，在视频片段中延伸目标轨迹。
+- 每台**员工 Windows 电脑**都在本地运行 Annotator。视频帧浏览和标注编辑在本机完成，只有明确触发的 GPU 任务才会发送到 SAM3.1 服务。
 
-The services are independent Python processes and should use separate environments. LocateAnything and SAM3.1 have different CUDA and dependency constraints.
+各服务都是独立的 Python 进程，并应使用彼此隔离的运行环境。LocateAnything 和 SAM3.1 对 CUDA 及依赖版本的要求不同，不应安装在同一个环境中。
 
-## Component Boundaries
+## 组件职责边界
 
-### Workflow Platform
+### 作业流程平台
 
-`workflow_platform/server.py` is the task orchestrator and filesystem API. It owns:
+`workflow_platform/server.py` 是任务编排器和文件系统接口，负责：
 
-- task creation, assignment, notes and soft deletion;
-- video and YOLO ZIP ingestion;
-- video/label segmentation;
-- asynchronous LocateAnything requests and result download;
-- MOT pipeline execution;
-- package creation, reviewed-result upload and YOLO export.
+- 创建任务、分配人员、记录备注和软删除；
+- 接收视频和 YOLO ZIP；
+- 对视频及其标注进行分段；
+- 异步提交 LocateAnything 任务并下载结果；
+- 执行 MOT 跟踪流水线；
+- 生成标注包、接收审核结果并导出 YOLO。
 
-Task metadata is stored in `task.json`; the audit stream is `events.jsonl`. There is no database in the current MVP.
+任务元数据保存在 `task.json`，审计事件流保存在 `events.jsonl`。当前 MVP 不使用数据库。
 
-### Annotator
+### 本地标注器
 
-`annotator/server.py` and `annotator/static/` form a local web application. It owns interactive track editing, interpolation, quality checks, local save/export and remote SAM3.1 calls. It must not be treated as the central task database.
+`annotator/server.py` 与 `annotator/static/` 组成一个本地 Web 应用，负责交互式轨迹编辑、插值、质量检查、本地保存与导出，以及远端 SAM3.1 调用。Annotator 不应被当作中央任务数据库使用。
 
-### MOT Pipeline
+### MOT 流水线
 
-`mot_pipeline/` is shared domain logic. It reads frame-level YOLO detections, runs a selected tracker in both directions, fuses tracklets, smooths trajectories and writes `tracking_results.json`, YOLO and visualization outputs.
+`mot_pipeline/` 存放可复用的领域逻辑。它读取逐帧 YOLO 检测框，分别执行正向和反向跟踪，融合轨迹片段，平滑轨迹，并输出 `tracking_results.json`、YOLO 标注和可视化结果。
 
-### GPU Services
+### GPU 服务
 
-Both GPU APIs use asynchronous jobs:
+两个 GPU API 都采用异步任务模式：
 
-1. Client submits `POST /api/jobs`.
-2. Service returns a `job_id` immediately.
-3. Client polls `GET /api/jobs/{job_id}`.
-4. Client downloads the result after status becomes `done`.
+1. 客户端通过 `POST /api/jobs` 提交任务。
+2. 服务立即返回 `job_id`。
+3. 客户端轮询 `GET /api/jobs/{job_id}`。
+4. 状态变为 `done` 后，客户端下载结果。
 
-This avoids HTTP read timeouts during long inference. Job state is currently held in process memory; result artifacts are written under each service cache directory.
+这种方式可以避免长时间推理导致 HTTP 读取超时。当前任务状态保存在服务进程内存中，结果文件则写入各服务的缓存目录。
 
-## Video Transfer Modes
+## 视频传输方式
 
-Two transfer modes are supported by clients:
+客户端支持两种传输方式：
 
-- `path`: Windows and Linux see the same storage through different path prefixes. This is preferred for large videos.
-- `sftp`: the client uploads the video to an allowed directory on the GPU server. Passwords are read from named environment variables, not stored in task metadata.
+- `path`：Windows 和 Linux 通过不同路径前缀访问同一份共享存储。大视频优先使用这种方式。
+- `sftp`：客户端先把视频上传到 GPU 服务器允许访问的目录。密码从指定环境变量读取，不写入任务元数据。
 
-The GPU services validate `video_path` against `*_ALLOWED_ROOTS`. Always configure this in shared deployments.
+GPU 服务会根据 `*_ALLOWED_ROOTS` 校验 `video_path`。多人共享部署时必须配置允许访问的根目录。
 
-## Trust Boundary
+## 安全边界
 
-The current APIs do not implement user authentication, authorization or TLS. Deploy them only on a trusted internal network, restrict ports with host/network firewalls, use dedicated SFTP accounts, and limit allowed filesystem roots. An authenticated reverse proxy is required before exposure outside the trusted LAN.
+当前 API 尚未实现用户认证、权限控制和 TLS。服务只能部署在可信内部网络中，应使用主机或网络防火墙限制端口，使用专用 SFTP 账号，并严格限制服务可访问的文件系统根目录。若要暴露到可信局域网之外，必须在前方增加带认证和 HTTPS 的反向代理。

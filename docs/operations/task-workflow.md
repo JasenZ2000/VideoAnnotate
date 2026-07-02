@@ -1,8 +1,8 @@
-# Task Operating Procedure
+# 任务标准作业流程
 
-## 1. Create The Task
+## 1. 创建任务
 
-Enter a clear task name, assignee, notes and class table. Keep class IDs stable for the whole task:
+填写清晰的任务名称、负责人、备注和类别表。同一任务内的类别 ID 必须保持稳定：
 
 ```text
 0 person
@@ -10,40 +10,40 @@ Enter a clear task name, assignee, notes and class table. Keep class IDs stable 
 2 bicycle
 ```
 
-The same table is sent to multi-class LocateAnything jobs and used when exporting YOLO labels. Changing IDs after prelabels have been generated can make old labels inconsistent.
+该类别表既会发送给多类别 LocateAnything 任务，也会在导出 YOLO 标注时使用。生成预标注后再修改类别 ID，可能导致新旧标注不一致。
 
-## 2. Upload Source Material
+## 2. 上传原始资料
 
-A task may contain multiple complete videos. Upload each original video without manually splitting it first. If an employee model already produced YOLO labels, upload one ZIP whose TXT filenames follow the source frame numbering.
+一个任务可以包含多个完整视频。应直接上传每个原始视频，不要预先手工拆分。如果员工自己的模型已经生成 YOLO 标注，则上传一个 ZIP，其中 TXT 文件名应与源视频帧编号对应。
 
-Select the intended video in the task UI before starting video-specific operations.
+开始任何视频相关操作前，先在任务界面中选中目标视频。
 
-## 3. Split Long Videos
+## 3. 拆分长视频
 
-Choose segment length in frames based on video duration, target density and expected review effort. The platform writes segment videos and remaps matching full-video YOLO files to segment-local frame numbers.
+根据视频时长、目标密度和预计审核工作量，以帧数设置分段长度。平台会生成分段视频，并把匹配的整段视频 YOLO 文件重新映射为分段内的局部帧编号。
 
-Do not split again after downstream work has started unless the old segment outputs have been deliberately archived. Segment identity is part of the review contract.
+下游处理开始后不要再次拆分，除非已经有意归档旧分段的全部结果。分段身份是审核数据约定的一部分。
 
-## 4. Choose A Prelabel Source
+## 4. 选择预标注来源
 
-- **Uploaded YOLO**: use labels produced by an employee model.
-- **LocateAnything**: run prompt-based inference on all segments. Multi-class tasks automatically use detection categories and map returned labels to task class IDs.
-- **None**: start manual work without prelabels.
+- **上传的 YOLO**：使用员工模型生成的标注。
+- **LocateAnything**：对所有分段运行文本提示推理。多类别任务会自动发送检测类别，并把返回标签映射到任务类别 ID。
+- **无预标注**：直接从人工标注开始。
 
-LocateAnything runs sequentially per segment because a model instance normally occupies most of one GPU. The platform polls the remote job instead of holding a long HTTP request open.
+LocateAnything 通常每个模型实例会占用一张 GPU 的大部分资源，因此分段任务按顺序执行。平台通过轮询远端任务状态等待结果，不会保持一个长时间不返回的 HTTP 请求。
 
-## 5. Build Initial Tracks
+## 5. 生成初始轨迹
 
-Run segment tracking after labels are available. The default pipeline performs forward/backward tracking and tracklet fusion. Inspect logs and generated overview media before assigning the task for review.
+标注准备好后执行分段跟踪。默认流水线会进行正向、反向跟踪和轨迹片段融合。把任务交给审核人员前，应检查日志和生成的全局预览视频。
 
-## 6. Review Locally
+## 6. 本地人工审核
 
-The employee downloads the package, opens its workspace in local Annotator, cleans IDs and boxes, and uses SAM3.1 only where a bbox-prompt continuation saves time. SAM3.1 credentials are supplied on the employee PC through the configured environment variable or SSH key.
+员工下载标注包，在本地 Annotator 中打开工作区，清理轨迹 ID 和目标框；只有当目标框提示跟踪确实能节省时间时才使用 SAM3.1。SAM3.1 凭据通过员工电脑上的环境变量或 SSH 密钥提供。
 
-## 7. Return And Export
+## 7. 回传与导出
 
-Upload reviewed `tracking_results.json`, then export YOLO. Preserve the task record after completion for traceability; use soft delete only when it should disappear from the normal task list.
+上传审核后的 `tracking_results.json`，再导出 YOLO。任务完成后仍应保留记录以便追溯；只有希望任务从正常列表中隐藏时才使用软删除。
 
-## Current MVP Caveat
+## 当前 MVP 注意事项
 
-The platform's full-video compatibility paths for package creation, reviewed upload and final export predate the segment hierarchy. Segment LocateAnything and segment tracking are available, but complete segment package/download/review/merge orchestration remains on the roadmap. Until that is implemented, verify package paths manually for segmented production work.
+平台生成标注包、上传审核结果和最终导出的整段视频兼容目录早于现有分段层级。当前已经支持分段 LocateAnything 和分段跟踪，但完整的分段标注包下载、审核回传和合并编排仍在路线图中。在该能力完成前，正式处理分段任务时必须人工核对标注包路径。

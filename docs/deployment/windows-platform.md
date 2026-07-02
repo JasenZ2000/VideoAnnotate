@@ -1,14 +1,14 @@
-# Windows Platform Deployment
+# Windows 公共平台部署
 
-## Prerequisites
+## 环境要求
 
-- Windows 10/11 or Windows Server
-- Python 3.10 or newer (3.11 recommended)
-- FFmpeg/OpenCV-compatible video codecs
-- A data volume with enough space for source videos, segment copies and exported packages
-- Network access to the Linux GPU service ports and, for SFTP mode, port 22
+- Windows 10、Windows 11 或 Windows Server
+- Python 3.10 以上版本，推荐 Python 3.11
+- FFmpeg 或 OpenCV 能够读取的视频编码
+- 足够保存源视频、分段副本和导出标注包的数据盘空间
+- 能够访问 Linux GPU 服务端口；使用 SFTP 时还需访问 22 端口
 
-## Install
+## 安装
 
 ```powershell
 git clone <repository-url> D:\video-annotation-workflow
@@ -20,9 +20,9 @@ pip install -r requirements\platform.txt
 Copy-Item configs\platform.example.json configs\platform.local.json
 ```
 
-Edit `configs\platform.local.json` with the LocateAnything URL and transfer settings. Do not commit this file.
+编辑 `configs\platform.local.json`，填写 LocateAnything 服务地址和文件传输配置。不要提交该本机配置文件。
 
-For password-based SFTP, set the password only in the service account environment:
+使用密码方式连接 SFTP 时，只把密码写入平台服务账号的环境变量：
 
 ```powershell
 [Environment]::SetEnvironmentVariable(
@@ -32,9 +32,9 @@ For password-based SFTP, set the password only in the service account environmen
 )
 ```
 
-Prefer an SSH key and a dedicated restricted Linux account for unattended operation.
+无人值守运行时，优先使用 SSH 密钥和权限受限的专用 Linux 账号。
 
-## Run
+## 启动
 
 ```powershell
 $env:ANNOTATION_PLATFORM_TASKS_DIR="D:\annotation_tasks"
@@ -42,14 +42,14 @@ $env:ANNOTATION_PLATFORM_CONFIG="$PWD\configs\platform.local.json"
 .\scripts\windows\run-platform.bat
 ```
 
-Health check:
+健康检查：
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8088/api/health
 ```
 
-Allow inbound TCP 8088 only from the department network. For persistent operation, run the command under a Windows service wrapper or Task Scheduler using a dedicated service account with read/write access to the task volume.
+只允许部门内部网络访问 TCP 8088 端口。长期运行时，可通过 Windows 服务包装工具或任务计划程序执行启动命令，并使用对任务数据盘具有读写权限的专用服务账号。
 
-## Backup
+## 备份
 
-Back up the entire tasks directory. Each task is filesystem-contained (`task.json`, events and artifacts), so no separate database dump is required in the MVP. Avoid backing up while a large upload or ZIP extraction is actively writing; use volume snapshots when available.
+备份完整任务根目录即可。当前 MVP 的每个任务都通过 `task.json`、事件记录和阶段产物自包含保存，不需要额外导出数据库。大文件上传或 ZIP 解压正在写入时不要直接复制备份；条件允许时优先使用卷快照。

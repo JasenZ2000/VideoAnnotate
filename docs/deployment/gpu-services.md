@@ -1,14 +1,14 @@
-# Linux GPU Service Deployment
+# Linux GPU 服务部署
 
-## General Rules
+## 通用要求
 
-Run SAM3.1 and LocateAnything in separate Python environments. Install a PyTorch build that matches the host driver/CUDA runtime before installing model dependencies. Bind service ports to the trusted network only.
+SAM3.1 和 LocateAnything 必须运行在独立的 Python 环境中。安装模型依赖前，应先安装与主机驱动和 CUDA 运行时匹配的 PyTorch。服务端口只能绑定到可信内部网络。
 
-Copy `configs/gpu-services.env.example` to a server-local environment file or export the variables from your process supervisor. Do not commit real model paths, hostnames or credentials.
+把 `configs/gpu-services.env.example` 复制为服务器本地环境文件，或通过进程管理器导出其中变量。真实模型路径、主机名和凭据不得提交到 Git。
 
 ## SAM3.1
 
-SAM3.1 depends on the existing ComfyUI installation and checkpoint:
+SAM3.1 依赖服务器上已有的 ComfyUI 和模型权重：
 
 ```bash
 conda activate sam31-comfy
@@ -23,7 +23,7 @@ export SAM31_DEVICE=cuda:0
 ./scripts/linux/run-sam31-server.sh
 ```
 
-Verify:
+验证服务：
 
 ```bash
 curl http://127.0.0.1:9001/api/health
@@ -31,12 +31,12 @@ curl http://127.0.0.1:9001/api/health
 
 ## LocateAnything
 
-Use Python 3.10 or newer. Python 3.9 cannot evaluate type-union annotations used by the Hugging Face remote processor code.
+必须使用 Python 3.10 以上版本。Python 3.9 无法解析 Hugging Face 远端处理器代码使用的联合类型注解。
 
 ```bash
 conda activate locateanything
 cd /srv/video-annotation-workflow
-# Install the CUDA-matched torch build first.
+# 先安装与 CUDA 匹配的 PyTorch
 pip install -r requirements/gpu-locateanything.txt
 
 export LOCANY_MODEL=nvidia/LocateAnything-3B
@@ -47,24 +47,24 @@ export LOCANY_DTYPE=bf16
 ./scripts/linux/run-locateanything-server.sh
 ```
 
-Verify:
+验证服务：
 
 ```bash
 curl http://127.0.0.1:9011/api/health
 ```
 
-The service serializes inference jobs around one model worker. Lowering frame resolution and splitting videos are the primary controls for memory and turnaround time. `max_memory` during model loading does not cap temporary KV-cache/attention allocations during `generate()`.
+服务会围绕单个模型工作进程串行执行推理任务。降低输入帧分辨率并提前拆分视频，是控制显存和任务周转时间的主要手段。模型加载阶段设置的 `max_memory` 无法限制 `generate()` 过程中 KV 缓存或注意力计算产生的临时显存峰值。
 
-## Process Supervision
+## 进程守护
 
-Use systemd, Supervisor or another process manager in production. Set the working directory to the repository root, load the service-specific environment, and restart on failure. Keep cache cleanup outside the running process and retain failed-job logs long enough for diagnosis.
+正式部署应使用 systemd、Supervisor 或其他进程管理器。工作目录应设置为仓库根目录，加载对应服务的环境变量，并在异常退出时自动重启。缓存清理由独立任务执行，不要在服务进程内部清理；失败任务日志应保留足够时间以便排查。
 
-## Updating
+## 更新流程
 
-1. Stop the target service.
-2. Pull a reviewed Git revision.
-3. Update only that service's environment.
-4. Start it and verify `/api/health`.
-5. Submit a short known-good video job before reopening team access.
+1. 停止目标服务。
+2. 拉取经过审核的 Git 版本。
+3. 只更新该服务对应的 Python 环境。
+4. 启动服务并检查 `/api/health`。
+5. 用一个已知结果的短视频测试成功后，再恢复团队访问。
 
-Restart LocateAnything after changes to `locateanything_video_server.py`, including class mapping behavior.
+修改 `locateanything_video_server.py` 后必须重启 LocateAnything 服务，其中也包括类别映射逻辑的修改。

@@ -1,41 +1,41 @@
-# Troubleshooting
+# 常见问题排查
 
-## A Long GPU Job Times Out Locally
+## 本地等待远端 GPU 任务时超时
 
-Only submit/poll/download requests should have HTTP timeouts. Confirm the client received a `job_id` and is polling `/api/jobs/{id}`. Do not turn one inference into a single multi-hour HTTP response. Increase `download_timeout` only for result ZIP transfer.
+HTTP 超时只应作用于提交、轮询和下载等单次请求。先确认客户端已经获得 `job_id`，并且正在轮询 `/api/jobs/{id}`。不要把一次推理实现成持续数小时的单个 HTTP 请求。只有结果 ZIP 下载确实超时时，才需要增加 `download_timeout`。
 
-## LocateAnything Runs Out Of GPU Memory In `generate()`
+## LocateAnything 在 `generate()` 阶段显存不足
 
-Model sharding or `max_memory` controls weight placement, not peak generation allocations. Split long videos, reduce `resize_long_edge`, reduce `max_new_tokens`, use the intended dtype and avoid concurrent jobs on the same model. Check for unrelated GPU processes before changing allocator settings.
+模型分片或 `max_memory` 只控制模型权重的放置，无法限制生成阶段的峰值临时显存。应拆分长视频、减小 `resize_long_edge`、降低 `max_new_tokens`、使用正确的数据类型，并避免同一模型并发执行多个任务。调整显存分配器之前，先检查 GPU 上是否存在无关进程。
 
-## LocateAnything Fails On `str | Image.Image`
+## LocateAnything 在 `str | Image.Image` 处报错
 
-The environment is using Python 3.9 or older. Recreate it with Python 3.10+.
+当前环境使用的是 Python 3.9 或更早版本。请使用 Python 3.10 以上版本重新创建环境。
 
-## Wrong CUDA Build
+## CUDA 或 PyTorch 版本错误
 
-Install PyTorch from the official index matching the server driver/runtime before project dependencies. The root requirements intentionally do not install PyTorch. Verify with:
+安装项目依赖前，先从 PyTorch 官方软件源安装与服务器驱动和 CUDA 运行时匹配的版本。根目录依赖文件有意不安装 PyTorch。可使用以下命令验证：
 
 ```bash
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
-## GPU Service Rejects A Video Path
+## GPU 服务拒绝视频路径
 
-The path must exist on Linux and be under `SAM31_ALLOWED_ROOTS` or `LOCANY_ALLOWED_ROOTS`. For shared storage, verify path-prefix mapping. For SFTP, verify upload directory, Linux account permissions and that the upload directory is allowed by the API.
+视频路径必须在 Linux 上真实存在，并位于 `SAM31_ALLOWED_ROOTS` 或 `LOCANY_ALLOWED_ROOTS` 之下。使用共享存储时检查本地与远端路径前缀映射；使用 SFTP 时检查上传目录、Linux 账号权限，并确认 API 允许访问该上传目录。
 
-## SFTP Asks For Login
+## SFTP 要求登录
 
-SFTP always authenticates. Configure a username plus either an SSH key or the password environment variable named by `sftp_password_env`. The platform does not infer server credentials.
+SFTP 始终需要身份认证。必须配置用户名，并提供 SSH 密钥，或者通过 `sftp_password_env` 指定的环境变量提供密码。平台不会自动推断服务器账号和密码。
 
-## Duplicate Tasks Appear
+## 任务列表出现重复任务
 
-The current list endpoint deduplicates records by `task_id`. If duplicates remain, compare `task.json` IDs in the tasks directory and check whether an old process is serving a different `ANNOTATION_PLATFORM_TASKS_DIR`.
+当前列表接口会根据 `task_id` 去重。如果仍然出现重复记录，应比较任务目录中各 `task.json` 的 ID，并检查是否有旧平台进程使用了不同的 `ANNOTATION_PLATFORM_TASKS_DIR`。
 
-## Uploaded Filename Disappears In The Browser
+## 浏览器中已选文件名消失
 
-Browser file inputs may clear after rerender. Confirm the selected file is retained in JavaScript state and inspect the network request. A successful upload appears in task detail and under the selected video's `raw/` directory.
+浏览器文件输入框可能在界面重新渲染后被清空。应确认选中的文件已经保存在 JavaScript 状态中，并检查实际网络请求。上传成功后，文件会显示在任务详情中，并出现在所选视频的 `raw/` 目录下。
 
-## First Checks
+## 推荐的首轮检查
 
-Run `python scripts/check-services.py` with deployed URLs, inspect each service console, then inspect task `events.jsonl`. Remote job status responses include the final error message and bounded stdout/stderr where available.
+先使用已部署服务地址运行 `python scripts/check-services.py`，然后依次检查各服务控制台和任务目录下的 `events.jsonl`。远端任务状态响应会在条件允许时包含最终错误信息，以及经过长度限制的标准输出和标准错误。

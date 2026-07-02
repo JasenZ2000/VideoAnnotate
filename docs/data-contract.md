@@ -1,6 +1,6 @@
-# Data And Directory Contract
+# 数据与目录约定
 
-## Platform Task Tree
+## 平台任务目录
 
 ```text
 <tasks-dir>/<task-id>/
@@ -20,33 +20,33 @@
           package/
           reviewed/
           exports/
-  tracking/    # temporary full-video compatibility path
-  package/     # temporary full-video compatibility path
-  reviewed/    # temporary full-video compatibility path
-  exports/     # temporary full-video compatibility path
+  tracking/    # 临时保留的整段视频兼容目录
+  package/     # 临时保留的整段视频兼容目录
+  reviewed/    # 临时保留的整段视频兼容目录
+  exports/     # 临时保留的整段视频兼容目录
 ```
 
-Artifacts are stage-specific and should not overwrite uploaded source labels or reviewed results.
+各阶段产物必须分别保存，不应覆盖用户上传的源标注或已经审核的结果。
 
-## YOLO Input And Output
+## YOLO 输入与输出
 
-One TXT file represents one video frame. Accepted rows are:
+每个 TXT 文件对应一帧视频。支持以下两种行格式：
 
 ```text
 class_id x_center y_center width height
 class_id x_center y_center width height score
 ```
 
-Coordinates and dimensions are normalized. LocateAnything output includes score. Class IDs are non-negative integers and must match the task class table.
+坐标和宽高均为归一化值。LocateAnything 输出包含 `score`。类别 ID 必须是非负整数，并与任务类别表一致。
 
-## Tracking Results
+## 跟踪结果
 
-`tracking_results.json` is the exchange format between the MOT pipeline, Annotator and SAM3.1. It contains video metadata and tracks with stable `track_id`, `class_id` and per-frame pixel-space bounding boxes. Treat it as the authoritative editable trajectory representation; derive YOLO files from it after review.
+`tracking_results.json` 是 MOT 流水线、Annotator 和 SAM3.1 之间的交换格式。它包含视频元数据，以及带有稳定 `track_id`、`class_id` 和逐帧像素坐标框的轨迹。该文件是可编辑轨迹的权威数据源；人工审核后再从它派生 YOLO 文件。
 
-## ZIP Portability
+## ZIP 跨平台约定
 
-ZIP member paths use relative forward-slash names. Clients must not rely on Windows drive letters or Linux absolute paths inside packages. Extraction code rejects paths escaping the destination directory.
+ZIP 内部文件路径必须使用相对路径和正斜杠。客户端不得依赖压缩包中的 Windows 盘符或 Linux 绝对路径。解压代码会拒绝任何试图逃逸目标目录的路径。
 
-## Frame Numbering
+## 帧编号
 
-Source labels commonly start at frame 1. Segment-local labels are renumbered from the configured frame offset. Always validate the first and last frame after splitting a new data source, especially when upstream models use zero-based filenames.
+源标注通常从第 1 帧开始编号。分段标注会从配置的帧偏移量重新编号。接入新的数据来源时，必须检查分段后的第一帧和最后一帧，尤其要注意上游模型是否使用从 0 开始的文件名。
