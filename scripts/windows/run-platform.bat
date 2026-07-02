@@ -1,0 +1,15 @@
+@echo off
+setlocal
+cd /d "%~dp0\..\.."
+
+if "%ANNOTATION_PLATFORM_HOST%"=="" set ANNOTATION_PLATFORM_HOST=0.0.0.0
+if "%ANNOTATION_PLATFORM_PORT%"=="" set ANNOTATION_PLATFORM_PORT=8088
+if "%ANNOTATION_PLATFORM_TASKS_DIR%"=="" set ANNOTATION_PLATFORM_TASKS_DIR=D:\annotation_tasks
+if "%ANNOTATION_PLATFORM_CONFIG%"=="" set ANNOTATION_PLATFORM_CONFIG=%CD%\config.json
+
+echo Starting annotation platform at http://%ANNOTATION_PLATFORM_HOST%:%ANNOTATION_PLATFORM_PORT%
+python -m workflow_platform.server ^
+  --host "%ANNOTATION_PLATFORM_HOST%" ^
+  --port "%ANNOTATION_PLATFORM_PORT%" ^
+  --tasks-dir "%ANNOTATION_PLATFORM_TASKS_DIR%" ^
+  --config "%ANNOTATION_PLATFORM_CONFIG%" %*

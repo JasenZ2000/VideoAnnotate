@@ -1,100 +1,50 @@
 {
   "tracking": {
+    "method": "sparse_track",
     "iou_match": 0.3,
     "max_missed": 15,
     "disable_kalman": false,
-    "method": "sparse_track",
+    "class_agnostic": false,
     "sparse_cross_depth_iou": 0.75
   },
   "fusion": {
+    "method": "bidirectional_iou_all_pairs",
     "iou_fuse": 0.5,
     "min_track_len": 10,
-    "smooth_window": 5,
-    "method": "bidirectional_iou_all_pairs"
+    "smooth_window": 5
   },
-  "clips": {
-    "pad_frames": 20,
-    "crop_margin": 1.2,
-    "crop_min_size": 128,
-    "codec": "mp4v"
-  },
-  "annotator": {
-    "frame_buffer_ahead": 30,
-    "frame_batch_size": 15,
-    "frame_cache_limit": 80,
-    "frame_batch_max": 30,
-    "annotation_buffer_ahead": 60,
-    "annotation_batch_size": 60,
-    "annotation_cache_limit": 300,
-    "annotation_batch_max": 200
-  },
-  "quality_control": {
-    "area_anomaly": {
-      "enabled": true,
-      "high_area_ratio": 3.0,
-      "low_area_ratio": 0.25,
-      "frame_area_change_ratio": 2.5,
-      "frame_area_change_abs": 800.0,
-      "robust_z_threshold": 6.0,
-      "min_track_frames": 8,
-      "min_area": 1.0,
-      "max_gap": 1,
-      "filename": "tracking_area_anomalies.json"
+  "exports": {
+    "class_labels": {
+      "0": "person"
     }
   },
   "sam31": {
     "runner": "remote",
-    "server_url": "http://192.168.21.226:10112",
-    "video_transfer": "sftp",
+    "server_url": "",
+    "video_transfer": "path",
     "local_path_prefix": "",
     "remote_path_prefix": "",
-    "request_timeout": 30,
-    "poll_interval": 2,
-    "sftp_host": "192.168.21.226",
+    "sftp_host": "",
     "sftp_port": 22,
-    "sftp_username": "hx",
+    "sftp_username": "",
     "sftp_password_env": "SAM31_SFTP_PASSWORD",
     "sftp_key_path": "",
-    "sftp_remote_dir": "/data2/DET_Group/ZZS/my_sam3/tmp/videos",
-    "sftp_reuse_existing": true,
-    "comfy_root": "/data2/DET_Group/ZZS/generate/update/ComfyUI",
-    "checkpoint": "/data2/DET_Group/ZZS/my_sam3/sam3.1_multiplex_fp16.safetensors",
-    "device": "cuda",
-    "dtype": "fp16",
-    "min_mask_area": 64,
-    "use_rect_mask": false,
-    "postprocess_spikes": true,
-    "spike_area_ratio": 4.0,
-    "spike_size_ratio": 3.0,
-    "spike_history": 10,
-    "spike_min_history": 3,
-    "spike_max_run": 10
+    "sftp_remote_dir": ""
   },
   "locateanything": {
-    "server_url": "http://192.168.21.226:10113",
-    "video_transfer": "sftp",
+    "server_url": "",
+    "video_transfer": "path",
     "local_path_prefix": "",
     "remote_path_prefix": "",
-    "request_timeout": 30,
-    "download_timeout": 300,
-    "poll_interval": 5,
-    "sftp_host": "192.168.21.226",
+    "sftp_host": "",
     "sftp_port": 22,
-    "sftp_username": "hx",
-    "sftp_password_env": "SAM31_SFTP_PASSWORD",
+    "sftp_username": "",
+    "sftp_password_env": "LOCANY_SFTP_PASSWORD",
     "sftp_key_path": "",
-    "sftp_remote_dir": "/data2/DET_Group/ZZS/locateAnything/eagle/Embodied/fast_tmp/videos",
-    "sftp_reuse_existing": true,
-    "device": "cuda",
-    "dtype": "bf16",
+    "sftp_remote_dir": "",
     "task": "ground_multi",
-    "class_id": 0,
-    "score": 1.0,
-    "frame_offset": 1,
     "resize_long_edge": 1024,
     "generation_mode": "slow",
-    "max_new_tokens": 512,
-    "temperature": 0.0,
-    "use_cache": true
+    "max_new_tokens": 512
   }
 }

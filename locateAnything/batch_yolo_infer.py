@@ -23,6 +23,40 @@ def parse_extensions(raw: str) -> set[str]:
     return {item.strip().lower() for item in raw.split(",") if item.strip()}
 
 
+def parse_categories(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def normalize_label(label: str) -> str:
+    return " ".join(label.strip().lower().split())
+
+
+def parse_class_map(raw: str) -> dict[str, int]:
+    mapping: dict[str, int] = {}
+    for chunk in raw.replace("\n", ",").split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        label = ""
+        class_id = ""
+        if "=" in item:
+            label, class_id = item.split("=", 1)
+        elif ":" in item:
+            left, right = item.split(":", 1)
+            if left.strip().isdigit():
+                class_id, label = left, right
+            else:
+                label, class_id = left, right
+        else:
+            parts = item.split(maxsplit=1)
+            if len(parts) == 2 and parts[0].isdigit():
+                class_id, label = parts
+        normalized = normalize_label(label)
+        if normalized and str(class_id).strip().lstrip("-").isdigit():
+            mapping[normalized] = int(class_id)
+    return mapping
+
+
 def iter_images(root: Path, extensions: set[str]) -> Iterable[Path]:
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
@@ -98,7 +132,8 @@ def run_model(worker: LocateAnythingWorker, image: Image.Image, args: argparse.N
     if args.question:
         return worker.predict(image, args.question, **common)
     if args.task == "detect":
-        return worker.detect(image, [args.target], **common)
+        categories = parse_categories(args.categories) or [args.target]
+        return worker.detect(image, categories, **common)
     if args.task == "ground_single":
         return worker.ground_single(image, args.target, **common)
     return worker.ground_multi(image, args.target, **common)
@@ -126,19 +161,23 @@ def process_image(
 
     answer = str(result.get("answer", ""))
     items = extract_items(answer, original.width, original.height)
+    class_map = parse_class_map(args.class_map)
     lines = []
     boxes = []
     for item in items:
         if item.get("type") != "box":
             continue
         box = [float(value) for value in item["bbox_xyxy"]]
-        line = box_to_yolo_line(box, original.width, original.height, args.class_id, args.score)
+        label = normalize_label(str(item.get("label", "")))
+        class_id = class_map.get(label, args.class_id)
+        line = box_to_yolo_line(box, original.width, original.height, class_id, args.score)
         if line is None:
             continue
         lines.append(line)
         boxes.append(
             {
                 "label": item.get("label", ""),
+                "class_id": class_id,
                 "bbox_xyxy": box,
                 "normalized_token_box": item.get("normalized"),
             }
@@ -203,9 +242,11 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--model", default="nvidia/LocateAnything-3B")
     parser.add_argument("--task", choices=["ground_multi", "ground_single", "detect"], default="ground_multi")
-    parser.add_argument("--target", default="person", help="Target phrase/category. Class id is still written as --class-id.")
+    parser.add_argument("--target", default="person", help="Target phrase/category for grounding tasks.")
+    parser.add_argument("--categories", default="", help="Comma-separated categories for task=detect.")
     parser.add_argument("--question", default="", help="Raw prompt override.")
     parser.add_argument("--class-id", type=int, default=0)
+    parser.add_argument("--class-map", default="", help="Map LocateAnything labels to YOLO ids, e.g. 'person=0,car=1' or '0 person,1 car'.")
     parser.add_argument("--score", type=float, default=1.0, help="LocateAnything has no confidence score; this value is written.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")

@@ -3,13 +3,9 @@
 This directory contains the server-side tools used to run SAM3.1 from a ComfyUI
 environment and return this project's `tracking_results.json` format.
 
-The tools depend on the real server ComfyUI installation, not on copied Comfy
-source files. Defaults are set in `sam31_track.py`:
-
-- Comfy root: `/data2/DET_Group/ZZS/generate/update/ComfyUI`
-- Checkpoint: `sam3.1_multiplex_fp16.safetensors`
-
-Both can be overridden from the command line.
+The tools depend on the real server ComfyUI installation and checkpoint. Set
+`SAM31_COMFY_ROOT` and `SAM31_CHECKPOINT`, or pass the equivalent command-line
+arguments. No department-specific server path is stored in the repository.
 
 ## Run the Remote Job Server
 
@@ -18,8 +14,10 @@ On the GPU server:
 ```bash
 SAM31_PORT=9001 \
 SAM31_CACHE_DIR=/data/cache/object-reid-sam31 \
+SAM31_COMFY_ROOT=/opt/ComfyUI \
+SAM31_CHECKPOINT=/models/sam3.1_multiplex_fp16.safetensors \
 SAM31_ALLOWED_ROOTS=/data/object-reid-clip \
-./run_sam31_server.sh
+./scripts/linux/run-sam31-server.sh
 ```
 
 The annotator sends only paths and bbox prompts to this server. Videos must be

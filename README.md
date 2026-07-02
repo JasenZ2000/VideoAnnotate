@@ -1,351 +1,143 @@
-# MOT Clip Extraction
+# Video Annotation Workflow
 
-Minimal, modular pipeline for:
-- parsing YOLO frame annotations
-- running bidirectional multi-object tracking
-- fusing forward/backward tracklets
-- smoothing trajectories
-- extracting one cropped clip per final ID
-- rendering one full-video tracking overview with all IDs drawn on the source video
-- converting tracking outputs to YOLO frame labels and Label Studio video-tracking JSON
+面向团队的视频目标检测与跟踪标注作业平台。项目把长视频任务登记、预标注、分段、轨迹生成、人工清理和 YOLO 数据集导出串成一条可追踪的流程，同时把耗时的 LocateAnything 与 SAM3.1 推理放在 Linux GPU 服务器上。
 
-## Project Structure
+> 当前状态：内部 MVP。任务登记、视频/YOLO 上传、长视频分段、LocateAnything 分段推理、跟踪融合和基础导出已经可用；segment 级标注包、回传与最终合并仍在完善中，详见 [Roadmap](docs/roadmap.md)。
 
-- `main.py`: CLI entrypoint
-- `mot_pipeline/config.py`: default parameters and JSON config loading
-- `mot_pipeline/models.py`: shared data structures
-- `mot_pipeline/tracking.py`: tracking logic and tracker registry
-- `mot_pipeline/fusion.py`: fusion, smoothing, and final track building
-- `mot_pipeline/clips.py`: clip sizing, dense boxes, and video extraction
-- `mot_pipeline/utils/io.py`: annotation/video I/O and output writing
-- `mot_pipeline/utils/bbox.py`: bbox conversion and geometry helpers
-- `mot_pipeline/utils/converters.py`: tracking_results / YOLO / Label Studio conversions
+## System Overview
 
-## How To Run
+```mermaid
+flowchart LR
+    P["Windows public machine<br/>Workflow Platform"]
+    L["Linux GPU server<br/>LocateAnything API"]
+    S["Linux GPU server<br/>SAM3.1 API"]
+    A["Employee Windows PC<br/>Local Annotator"]
+    D["Task storage<br/>videos / segments / labels / results"]
 
-Default parameters:
-
-```bash
-python main.py --video path/to/video.mp4 --label-dir path/to/labels --out-dir path/to/output
+    P --> D
+    P -->|"async prelabel jobs"| L
+    A -->|"download / review / upload"| P
+    A -->|"interactive bbox tracking"| S
 ```
 
-With a config file:
+| Component | Runs on | Responsibility |
+| --- | --- | --- |
+| `workflow_platform` | Windows public machine | Task registration, upload, assignment, segmentation, remote LocateAnything jobs, tracking and result distribution |
+| `annotator` | Employee Windows PC | Low-latency manual inspection and cleanup; calls remote SAM3.1 when needed |
+| `mot_pipeline` | Platform or annotator | YOLO parsing, bidirectional tracking, trajectory fusion, smoothing and format conversion |
+| `locateAnything` | Linux GPU server | Prompt/multi-class video detection and YOLO prelabel generation |
+| `sam31` | Linux GPU server | Bbox-prompt video tracking and `tracking_results.json` generation |
 
-```bash
-python main.py --video path/to/video.mp4 --label-dir path/to/labels --out-dir path/to/output --config config.json
-```
+## Annotation Flow
 
-Run the local annotator on a Linux server:
+1. Publisher creates a task, class table, assignee and notes on the platform.
+2. Upload one or more complete videos and optional full-video YOLO label ZIPs.
+3. Split each long video into segments based on scene density and workload.
+4. Use uploaded YOLO labels, run segment LocateAnything, or start without prelabels.
+5. Run the default MOT tracking/fusion pipeline for each segment.
+6. Download an annotation package and clean tracks locally with Annotator.
+7. Use remote SAM3.1 interactively for difficult gaps or occlusions.
+8. Upload reviewed results and export the final YOLO dataset.
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-ANNOTATOR_PORT=7860 ./run_annotator.sh
-```
-
-You can also pass host/port directly:
-
-```bash
-python -m annotator --host 0.0.0.0 --port 7860
-```
-
-Annotator frame loading can be tuned per workspace in `config.json`:
-
-```json
-{
-  "annotator": {
-    "frame_buffer_ahead": 30,
-    "frame_batch_size": 15,
-    "frame_cache_limit": 80,
-    "frame_batch_max": 30,
-    "annotation_buffer_ahead": 60,
-    "annotation_batch_size": 60,
-    "annotation_cache_limit": 300,
-    "annotation_batch_max": 200
-  }
-}
-```
-
-`frame_buffer_ahead` controls how many upcoming image frames the browser tries
-to keep ready. `annotation_buffer_ahead` does the same for bbox overlays.
-`frame_batch_size` and `annotation_batch_size` control normal fetch chunk sizes,
-while `frame_batch_max` and `annotation_batch_max` are backend safety caps.
-
-Example config:
-
-```json
-{
-  "tracking": {
-    "method": "sparse_track",
-    "iou_match": 0.3,
-    "max_missed": 15,
-    "disable_kalman": false,
-    "class_agnostic": false,
-    "score_high": 0.5,
-    "score_low": 0.1,
-    "new_track_score": 0.6,
-    "low_iou_match": 0.15
-  },
-  "fusion": {
-    "iou_fuse": 0.5,
-    "min_track_len": 10,
-    "smooth_window": 5
-  },
-  "clips": {
-    "pad_frames": 10,
-    "crop_margin": 1.2,
-    "crop_min_size": 128,
-    "codec": "mp4v",
-    "overview_filename": "tracking_overview.mp4",
-    "overview_box_thickness": 2,
-    "overview_font_scale": 0.7
-  },
-  "exports": {
-    "export_yolo_from_tracking": true,
-    "yolo_dirname": "tracking_yolo",
-    "export_label_studio": true,
-    "label_studio_filename": "tracking_results.label_studio.json",
-    "label_studio_local_files_prefix": "/data/local-files/?d=",
-    "class_labels": {
-      "0": "Man"
-    }
-  }
-}
-```
-
-## Outputs
-
-- `tracking_results.json`: structured tracking result
-- `tracking_results.csv`: flat tracking result
-- `tracking_yolo/*.txt`: per-frame YOLO labels converted from `tracking_results.json`
-- `tracking_results.label_studio.json`: Label Studio video-tracking JSON converted from `tracking_results.json`
-- `clips/track_XXXX.mp4`: one cropped clip per final ID
-- `tracking_overview.mp4`: full original video with all final IDs and boxes overlaid
-
-## Where To Modify Things
-
-- Change tracking behavior in `mot_pipeline/tracking.py`
-- Change fusion behavior in `mot_pipeline/fusion.py`
-- Change clip extraction behavior in `mot_pipeline/clips.py`
-- Change default parameters in `mot_pipeline/config.py`
-- Change format conversion behavior in `mot_pipeline/utils/converters.py`
-
-The current refactor preserves the original algorithm and keeps the components replaceable through the small registries in `tracking.py` and `fusion.py`.
-
-### Tracking Methods
-
-Set `tracking.method` to one of:
-
-- `iou_kalman`: original project tracker. It runs greedy IoU association over a constant-velocity / Kalman prediction.
-- `sort`: alias for the original SORT-style IoU + Kalman pass.
-- `bytetrack`: ByteTrack-style two-stage association. High-confidence detections are matched first, then unmatched tracks can recover from low-confidence detections.
-- `oc_sort`: OC-SORT-style observation-centric association. It uses recent observed motion direction to recover from short occlusions and nonlinear motion.
-- `bot_sort`: local BoT-SORT-inspired pass. It combines ByteTrack-style stages, confidence-fused IoU, and observation-gap velocity updates. Camera motion compensation and ReID require extra inputs and are not computed from plain YOLO txt labels.
-- `hybrid_sort`: Hybrid-SORT-inspired pass. It adds weak cues from velocity direction, detection confidence, and bbox height consistency.
-- `deep_oc_sort`: Deep OC-SORT-inspired pass. It uses the local motion/weak-cue fallback because this project does not currently parse or compute ReID embeddings.
-- `cbiou`: C-BIoU-inspired cascaded buffered IoU tracker. It expands track/detection boxes with small and large buffers to recover irregular non-overlapping motion.
-- `sparse_track`: SparseTrack-inspired pseudo-depth cascading tracker. It groups detections/tracks by bbox pseudo-depth and matches near-to-far to reduce crowded-scene ambiguity.
-
-The parser accepts both `class cx cy w h` and `class cx cy w h confidence` YOLO lines. If confidence is missing, detections are treated as score `1.0`, so ByteTrack's low-confidence recovery only has an effect when detector scores are exported.
-
-Example ByteTrack config:
-
-```json
-{
-  "tracking": {
-    "method": "bytetrack",
-    "iou_match": 0.3,
-    "max_missed": 30,
-    "score_high": 0.5,
-    "score_low": 0.1,
-    "new_track_score": 0.6,
-    "low_iou_match": 0.15,
-    "disable_kalman": false
-  }
-}
-```
-
-### Fusion Methods
-
-Set `fusion.method` to one of:
-
-- `bidirectional_iou`: original conservative mutual-best forward/backward fusion.
-- `forward_only`: use only forward tracklets as the final components.
-- `backward_only`: use only backward tracklets, mainly for debugging.
-- `bidirectional_iou_forward_primary`: keep forward tracklets as primary and merge only mutual-best backward matches.
-- `bidirectional_iou_forward_unique`: keep forward tracklets, merge mutual-best backward matches, and keep only backward tracklets that are not duplicates of any forward tracklet.
-- `bidirectional_iou_all_pairs`: merge every compatible forward/backward pair, more aggressive for fragmented tracks.
-- `bidirectional_iou_nms`: run the original fusion and then suppress duplicate overlapping components.
-
-See `FUSION_METHODS.md` for the trade-off table and suggested trial order.
-
-## Remote SAM3.1-Assisted Annotation
-
-The local annotator can start a SAM3.1 bbox-prompt tracking job from the active
-frame:
-
-1. Open a workspace in the annotator.
-2. Select or create the target track.
-3. Draw/save a bbox on the current frame.
-4. Click `SAM31 Track Box` in the Annotation panel.
-
-The annotator sends a lightweight job to a remote SAM31 FastAPI server. It does
-not upload the video. The GPU server reads the video through shared storage,
-runs `sam31/sam31_track.py`, and returns `tracking_results.json`. When the job
-finishes, the generated boxes are written back to the same active track from the
-prompt frame onward, and the workspace `tracking_results.json` is refreshed.
-
-Start the remote SAM31 service on the GPU server:
-
-```bash
-SAM31_PORT=9001 \
-SAM31_CACHE_DIR=/data/cache/object-reid-sam31 \
-SAM31_ALLOWED_ROOTS=/data/object-reid-clip \
-./run_sam31_server.sh
-```
-
-Configure each annotator workspace `config.json`:
-
-```json
-{
-  "sam31": {
-    "runner": "remote",
-    "server_url": "http://gpu-server:9001",
-    "local_path_prefix": "Z:/object-reid-clip",
-    "remote_path_prefix": "/data/object-reid-clip",
-    "poll_interval": 2
-  }
-}
-```
-
-`local_path_prefix` and `remote_path_prefix` describe the same shared storage
-from the annotator machine and the GPU server. If the annotator is already using
-server paths, leave both prefix fields empty. The optional `GPU` field in the
-annotator overrides the configured device by passing `cuda:<n>` to the remote
-job; leave it empty to use the server default.
-
-If the GPU server cannot see the same path, use SFTP transfer instead:
-
-```json
-{
-  "sam31": {
-    "runner": "remote",
-    "server_url": "http://gpu-server:9001",
-    "video_transfer": "sftp",
-    "sftp_host": "gpu-server",
-    "sftp_port": 22,
-    "sftp_username": "your-user",
-    "sftp_password_env": "SAM31_SFTP_PASSWORD",
-    "sftp_key_path": "",
-    "sftp_remote_dir": "/data2/DET_Group/ZZS/my_sam3/tmp/videos",
-    "sftp_reuse_existing": true
-  }
-}
-```
-
-Set the password outside config:
-
-```bash
-export SAM31_SFTP_PASSWORD='your-password'
-```
-
-or use `sftp_key_path` for key-based SSH auth. The SAM31 server must allow the
-upload directory, for example:
-
-```bash
-SAM31_ALLOWED_ROOTS=/data2/DET_Group/ZZS/my_sam3/tmp ./run_sam31_server.sh
-```
-
-The annotator loads the project root `config.json` first, then overlays the
-opened workspace or segment `config.json`. Existing workspaces that do not have
-a `sam31` section will therefore inherit the root SAM31 server settings.
-
-## Remote LocateAnything YOLO Proposal
-
-The annotator can also submit the opened workspace video to a remote
-LocateAnything service. The remote service runs prompt-based grounding on video
-frames, writes YOLO txt labels, zips the result, and the local annotator
-downloads it into a separate run folder. It does not merge with existing labels
-yet.
-
-Start the remote LocateAnything service on the GPU server:
-
-```bash
-LOCANY_PORT=9011 \
-LOCANY_CACHE_DIR=/data/cache/object-reid-locany \
-LOCANY_ALLOWED_ROOTS=/data2/DET_Group/ZZS/locateanything/tmp \
-./run_locateanything_server.sh
-```
-
-Configure `config.json`:
-
-```json
-{
-  "locateanything": {
-    "server_url": "http://gpu-server:9011",
-    "video_transfer": "sftp",
-    "sftp_host": "gpu-server",
-    "sftp_username": "your-user",
-    "sftp_password_env": "SAM31_SFTP_PASSWORD",
-    "sftp_remote_dir": "/data2/DET_Group/ZZS/locateanything/tmp/videos",
-    "device": "cuda",
-    "dtype": "bf16",
-    "resize_long_edge": 1024,
-    "generation_mode": "slow",
-    "max_new_tokens": 512,
-    "frame_offset": 1,
-    "class_id": 0,
-    "score": 1.0
-  }
-}
-```
-
-In the annotator sidebar, enter a prompt in `LocateAnything YOLO` and click
-`Remote Infer YOLO`. Results are saved under:
+The canonical YOLO line is:
 
 ```text
-<workspace>/locateanything_runs/<job_id>/<video_stem>/<video_stem>_1.txt
+class_id x_center y_center width height score
 ```
 
-There is one txt per video frame. Empty frames are represented by empty txt
-files. Each non-empty line uses:
+Coordinates are normalized to `[0, 1]`. Input without `score` is also accepted.
+
+## Quick Start
+
+### Windows public platform
+
+```powershell
+py -3.11 -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements\platform.txt
+Copy-Item configs\platform.example.json configs\platform.local.json
+$env:ANNOTATION_PLATFORM_CONFIG="$PWD\configs\platform.local.json"
+$env:ANNOTATION_PLATFORM_TASKS_DIR="D:\annotation_tasks"
+.\scripts\windows\run-platform.bat
+```
+
+Open `http://<public-machine>:8088`.
+
+### Employee annotator
+
+```powershell
+py -3.11 -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements\annotator.txt
+.\scripts\windows\run-annotator.bat
+```
+
+Open `http://127.0.0.1:7860`. SAM3.1 credentials remain on the employee machine and are supplied through workspace config/environment variables.
+
+### Linux GPU services
+
+```bash
+# Run each service in its own prepared Python environment.
+source /path/to/sam31-env/bin/activate
+export SAM31_COMFY_ROOT=/opt/ComfyUI
+export SAM31_CHECKPOINT=/models/sam3.1_multiplex_fp16.safetensors
+./scripts/linux/run-sam31-server.sh
+
+source /path/to/locateanything-env/bin/activate
+./scripts/linux/run-locateanything-server.sh
+```
+
+LocateAnything requires Python 3.10+ and a PyTorch build matching the server CUDA runtime. SAM3.1 should run inside the existing ComfyUI environment. Do not install or upgrade GPU PyTorch from the root requirements file.
+
+Verify all deployed endpoints:
+
+```bash
+python scripts/check-services.py \
+  --platform http://windows-host:8088 \
+  --sam31 http://gpu-host:9001 \
+  --locateanything http://gpu-host:9011
+```
+
+## Repository Layout
 
 ```text
-class x_center y_center width height score
+annotator/             employee-side annotation UI and API
+workflow_platform/     shared task platform UI and API
+mot_pipeline/          tracking, fusion and converters
+sam31/                 SAM3.1 remote job service and runner
+locateAnything/        vendored LocateAnything code plus project adapters
+configs/               safe configuration examples
+requirements/          dependencies split by deployment role
+scripts/windows/       Windows launchers
+scripts/linux/         Linux launchers
+docs/                  architecture, deployment and operations manuals
+tests/                 fast unit and project smoke tests
 ```
 
-SAM31 bbox post-processing can interpolate short area/size spikes caused by mask
-outliers:
+`locateAnything/` contains upstream research code and model-license material together with this project's adapters (`locateanything_worker.py`, `locateanything_video_server.py`, `batch_yolo_infer.py`). Treat upstream internals as vendor code; platform-specific changes should stay in the adapter files when possible.
 
-```json
-{
-  "sam31": {
-    "postprocess_spikes": true,
-    "spike_area_ratio": 4.0,
-    "spike_size_ratio": 3.0,
-    "spike_history": 10,
-    "spike_min_history": 3,
-    "spike_max_run": 10
-  }
-}
+See `locateAnything/PROJECT_ADAPTERS.md` before updating that vendor tree.
+
+## Documentation
+
+- [Architecture and boundaries](docs/architecture.md)
+- [Windows platform deployment](docs/deployment/windows-platform.md)
+- [Linux GPU service deployment](docs/deployment/gpu-services.md)
+- [Employee annotator setup](docs/deployment/windows-annotator.md)
+- [Task operating procedure](docs/operations/task-workflow.md)
+- [HTTP API summary](docs/api.md)
+- [Configuration reference](docs/configuration.md)
+- [Data formats and directory contract](docs/data-contract.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Development and verification](docs/development.md)
+- [Roadmap and known limitations](docs/roadmap.md)
+
+## Development
+
+```bash
+pip install -r requirements/dev.txt
+python -m pytest
+python -m compileall annotator workflow_platform mot_pipeline sam31
 ```
 
-This runs automatically when SAM31 results are merged into the active track.
-The annotator also has a `Fix Spikes` button in the Interpolation panel for
-repairing an existing track manually.
-
-## Label Format Notes
-
-- YOLO txt uses `class cx cy w h` with normalized center coordinates. An optional sixth `confidence` column is supported for ByteTrack-style methods.
-- `tracking_results.json` is the dense internal/result format used by this project.
-- Label Studio video tracking uses:
-  - top-level `video` path like `"/data/local-files/?d=" + relative_video_path`
-  - `box[].sequence[].x/y` as top-left percentages, not center coordinates
-  - `width/height` as percentage values
-  - `enabled=false` as the terminal keyframe for that sequence
-
-The converter module supports:
-- `tracking_results.json -> YOLO`
-- `tracking_results.json -> Label Studio JSON`
-- `Label Studio JSON -> tracking_results.json`
+Generated videos, task data, model weights, credentials and local `*.local.json` files are intentionally ignored by Git. This repository currently has no public redistribution license; check internal policy and the separate LocateAnything model license before distributing binaries or model assets.

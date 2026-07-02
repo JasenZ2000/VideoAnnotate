@@ -138,6 +138,12 @@ class ConfigSaveReq(BaseModel):
 # Workspace helpers
 # ---------------------------------------------------------------------------
 
+def _project_config_path() -> Path:
+    configured = os.environ.get("ANNOTATOR_CONFIG")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path(__file__).resolve().parents[1] / "config.json"
+
 def _find_video(workspace: Path) -> Optional[Path]:
     for f in sorted(workspace.iterdir()):
         if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS:
@@ -155,7 +161,7 @@ def _find_label_dir(workspace: Path, video_stem: str) -> Optional[Path]:
 def _ensure_config(workspace: Path) -> Path:
     config_path = workspace / "config.json"
     if not config_path.exists():
-        project_config = Path(__file__).resolve().parents[1] / "config.json"
+        project_config = _project_config_path()
         if project_config.exists():
             shutil.copy2(str(project_config), str(config_path))
             return config_path
@@ -168,7 +174,7 @@ def _ensure_config(workspace: Path) -> Path:
 def _load_workspace_config(workspace: Optional[Path]) -> dict[str, Any]:
     from mot_pipeline.config import deep_update, load_config
 
-    project_config = Path(__file__).resolve().parents[1] / "config.json"
+    project_config = _project_config_path()
     config = load_config(str(project_config)) if project_config.exists() else load_config(None)
     if workspace is None:
         return config

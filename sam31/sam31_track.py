@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-DEFAULT_COMFY_ROOT = Path("/data2/DET_Group/ZZS/generate/update/ComfyUI")
-DEFAULT_CHECKPOINT = Path("/data2/DET_Group/ZZS/my_sam3/sam3.1_multiplex_fp16.safetensors")
+DEFAULT_COMFY_ROOT = Path(os.environ.get("SAM31_COMFY_ROOT", "/opt/ComfyUI"))
+DEFAULT_CHECKPOINT = Path(
+    os.environ.get("SAM31_CHECKPOINT", "/models/sam3.1_multiplex_fp16.safetensors")
+)
 IMAGE_SIZE = 1008
 
 

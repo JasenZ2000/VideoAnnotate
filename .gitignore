@@ -1,6 +1,10 @@
 # Python caches and virtual environments
 __pycache__/
 *.py[cod]
+*.log
+*.egg-info/
+build/
+dist/
 .venv/
 venv/
 
@@ -8,6 +12,9 @@ venv/
 .claude/
 .env
 .env.*
+!.env.example
+*.local.json
+configs/*.local.json
 
 # Large binaries, videos, and model artifacts
 *.exe
@@ -36,6 +43,7 @@ sam31_runs/
 sam31_cache/
 locateanything_runs/
 locany_cache/
+platform_tasks/
 OPD_method_tests/
 vid1/
 vid2/

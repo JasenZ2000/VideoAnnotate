@@ -1,0 +1,26 @@
+{
+  "exports": {
+    "class_labels": {
+      "0": "person",
+      "1": "car"
+    }
+  },
+  "sam31": {
+    "runner": "remote",
+    "server_url": "http://gpu-server:9001",
+    "video_transfer": "sftp",
+    "request_timeout": 30,
+    "poll_interval": 2,
+    "sftp_host": "gpu-server",
+    "sftp_port": 22,
+    "sftp_username": "employee-name",
+    "sftp_password_env": "SAM31_SFTP_PASSWORD",
+    "sftp_key_path": "",
+    "sftp_remote_dir": "/data/annotation-transfer/sam31/videos",
+    "sftp_reuse_existing": true,
+    "device": "cuda",
+    "dtype": "fp16",
+    "min_mask_area": 64,
+    "use_rect_mask": false
+  }
+}

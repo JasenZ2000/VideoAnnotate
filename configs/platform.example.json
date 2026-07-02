@@ -1,0 +1,38 @@
+{
+  "tracking": {
+    "method": "sparse_track",
+    "iou_match": 0.3,
+    "max_missed": 15
+  },
+  "fusion": {
+    "method": "bidirectional_iou_all_pairs",
+    "iou_fuse": 0.5,
+    "min_track_len": 10,
+    "smooth_window": 5
+  },
+  "locateanything": {
+    "server_url": "http://gpu-server:9011",
+    "video_transfer": "sftp",
+    "request_timeout": 30,
+    "download_timeout": 300,
+    "poll_interval": 5,
+    "sftp_host": "gpu-server",
+    "sftp_port": 22,
+    "sftp_username": "annotation-service",
+    "sftp_password_env": "LOCANY_SFTP_PASSWORD",
+    "sftp_key_path": "",
+    "sftp_remote_dir": "/data/annotation-transfer/locateanything/videos",
+    "sftp_reuse_existing": true,
+    "device": "cuda",
+    "dtype": "bf16",
+    "task": "ground_multi",
+    "class_id": 0,
+    "score": 1.0,
+    "frame_offset": 1,
+    "resize_long_edge": 1024,
+    "generation_mode": "slow",
+    "max_new_tokens": 512,
+    "temperature": 0.0,
+    "use_cache": true
+  }
+}

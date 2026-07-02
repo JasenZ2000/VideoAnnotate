@@ -77,7 +77,7 @@ not need shared storage.
 Base64 mode:
 
 ```bash
-python check_locateanything_server.py \
+python check_image_server.py \
   --server http://127.0.0.1:9011 \
   --image /path/to/test.jpg \
   --task ground_multi \
@@ -87,7 +87,7 @@ python check_locateanything_server.py \
 Shared path mode:
 
 ```bash
-python check_locateanything_server.py \
+python check_image_server.py \
   --server http://127.0.0.1:9011 \
   --image /data/object-reid-clip/sample.jpg \
   --use-path \
@@ -111,11 +111,11 @@ The batch script accepts multiple image roots and mirrors their directory
 structure under the output directory. Each output line is:
 
 ```text
-0 x_center y_center width height score
+class_id x_center y_center width height score
 ```
 
 All coordinates are normalized to `[0, 1]`. LocateAnything does not emit a
-confidence score, so `score` defaults to `1.0`.
+calibrated confidence score, so `score` defaults to the configured value.
 
 Single process:
 

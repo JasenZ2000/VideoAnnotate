@@ -14,8 +14,8 @@ from pydantic import BaseModel
 import uvicorn
 
 
-DEFAULT_COMFY_ROOT = Path(os.environ.get("SAM31_COMFY_ROOT", "/data2/DET_Group/ZZS/generate/update/ComfyUI"))
-DEFAULT_CHECKPOINT = Path(os.environ.get("SAM31_CHECKPOINT", "/data2/DET_Group/ZZS/my_sam3/sam3.1_multiplex_fp16.safetensors"))
+DEFAULT_COMFY_ROOT = Path(os.environ.get("SAM31_COMFY_ROOT", "/opt/ComfyUI"))
+DEFAULT_CHECKPOINT = Path(os.environ.get("SAM31_CHECKPOINT", "/models/sam3.1_multiplex_fp16.safetensors"))
 DEFAULT_CACHE_DIR = Path(os.environ.get("SAM31_CACHE_DIR", "/tmp/object-reid-sam31"))
 
 app = FastAPI(title="SAM31 Job Server")

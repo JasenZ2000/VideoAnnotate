@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Annotation Workflow</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; font-family: "Segoe UI", Arial, sans-serif; background: #f5f6f8; color: #20242a; }
+header { height: 52px; display: flex; align-items: center; padding: 0 18px; background: #20242a; color: #fff; }
+main { display: grid; grid-template-columns: 360px 1fr; gap: 14px; padding: 14px; }
+section { background: #fff; border: 1px solid #d7dbe0; border-radius: 6px; padding: 12px; }
+h2 { font-size: 15px; margin: 0 0 10px; }
+h3 { font-size: 13px; margin: 14px 0 8px; }
+label { display: block; font-size: 12px; color: #5c6470; margin: 8px 0 3px; }
+input, select, textarea { width: 100%; padding: 7px 8px; border: 1px solid #c9ced6; border-radius: 4px; font-size: 13px; }
+button { border: 1px solid #8c96a3; background: #fff; color: #20242a; border-radius: 4px; padding: 7px 10px; cursor: pointer; font-size: 13px; }
+button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+button.danger { background: #dc2626; border-color: #dc2626; color: #fff; }
+button:disabled { opacity: .5; cursor: wait; }
+.row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+.row > * { flex: 1; }
+.task { border: 1px solid #dde2e8; border-radius: 5px; padding: 8px; margin-bottom: 8px; cursor: pointer; }
+.task.active { border-color: #2563eb; background: #eff6ff; }
+.task-title { font-weight: 600; font-size: 13px; }
+.task-meta { color: #69717d; font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
+.stages { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+.stage { border: 1px solid #dde2e8; border-radius: 5px; padding: 8px; min-height: 64px; }
+.stage b { display: block; font-size: 12px; margin-bottom: 4px; }
+.stage span { font-size: 12px; color: #58616d; overflow-wrap: anywhere; }
+.done { border-color: #22c55e; }
+.running, .queued { border-color: #f59e0b; }
+.failed { border-color: #ef4444; }
+.video, .segment { border: 1px solid #dde2e8; border-radius: 5px; padding: 8px; margin-top: 8px; }
+.segment { margin-left: 14px; background: #fafbfc; }
+#events { max-height: 220px; overflow: auto; background: #111827; color: #d1d5db; padding: 8px; border-radius: 5px; font-family: Consolas, monospace; font-size: 12px; }
+#status { font-size: 12px; color: #58616d; min-height: 18px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<header><strong>Annotation Workflow Platform</strong></header>
+<main>
+  <section>
+    <h2>Create Task</h2>
+    <label>Task name</label>
+    <input id="task-name" placeholder="20260625_road_cam_01">
+    <label>Assignee</label>
+    <input id="assignee" placeholder="employee name">
+    <label>Initial label source</label>
+    <select id="prelabel-source">
+      <option value="none">None</option>
+      <option value="yolo">Upload YOLO labels</option>
+      <option value="locateanything">Generate with LocateAnything</option>
+    </select>
+    <label>Prompt</label>
+    <input id="prompt" value="person">
+    <label>Classes</label>
+    <textarea id="classes" rows="3">0 person</textarea>
+    <label>Notes</label>
+    <textarea id="notes" rows="2"></textarea>
+    <button class="primary" onclick="createTask()" style="width:100%; margin-top:10px">Create Task</button>
+    <h2 style="margin-top:16px">Tasks</h2>
+    <div id="task-list"></div>
+  </section>
+  <section>
+    <h2>Task Detail</h2>
+    <div id="detail">Select or create a task.</div>
+  </section>
+</main>
+<script>
+let tasks = [];
+let selected = null;
+let refreshTimer = null;
+
+async function api(method, url, body, isForm=false) {
+  const opts = { method };
+  if (body !== undefined) {
+    if (isForm) opts.body = body;
+    else {
+      opts.headers = { 'Content-Type': 'application/json' };
+      opts.body = JSON.stringify(body);
+    }
+  }
+  const r = await fetch(url, opts);
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(err.detail || r.statusText);
+  }
+  const type = r.headers.get('content-type') || '';
+  return type.includes('application/json') ? r.json() : r;
+}
+
+function uniqTasks(items) {
+  const map = new Map();
+  for (const task of items || []) map.set(task.task_id, task);
+  return Array.from(map.values());
+}
+
+function setStatus(msg) {
+  const el = document.getElementById('status');
+  if (el) el.textContent = msg;
+}
+
+function hasPendingFileSelection() {
+  return ['video-file', 'labels-file', 'reviewed-file'].some(id => {
+    const el = document.getElementById(id);
+    return el && el.files && el.files.length > 0;
+  });
+}
+
+async function loadTasks(options = {}) {
+  const refreshDetail = options.refreshDetail !== false;
+  const data = await api('GET', '/api/tasks');
+  tasks = uniqTasks(data.tasks || []);
+  renderTaskList();
+  if (selected && refreshDetail && !hasPendingFileSelection()) await loadDetail(selected.task_id);
+}
+
+function renderTaskList() {
+  const el = document.getElementById('task-list');
+  el.innerHTML = '';
+  for (const task of tasks) {
+    const div = document.createElement('div');
+    div.className = 'task' + (selected && selected.task_id === task.task_id ? ' active' : '');
+    div.onclick = () => loadDetail(task.task_id);
+    const videoCount = (task.videos || []).length;
+    div.innerHTML = `<div class="task-title">${escapeHtml(task.name)}</div>
+      <div class="task-meta">${task.status || ''} | ${task.assignee || 'unassigned'} | ${videoCount} video(s)</div>
+      <div class="task-meta">${task.task_id}</div>`;
+    el.appendChild(div);
+  }
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+
+async function createTask() {
+  const payload = {
+    name: document.getElementById('task-name').value.trim(),
+    assignee: document.getElementById('assignee').value.trim(),
+    prelabel_source: document.getElementById('prelabel-source').value,
+    prompt: document.getElementById('prompt').value.trim() || 'person',
+    classes: document.getElementById('classes').value.trim() || '0 person',
+    notes: document.getElementById('notes').value.trim(),
+  };
+  if (!payload.name) return alert('Enter a task name');
+  const data = await api('POST', '/api/tasks', payload);
+  selected = data.task;
+  await loadTasks();
+  await loadDetail(selected.task_id);
+}
+
+function stageCard(name, data) {
+  const status = (data && data.status) || 'pending';
+  const message = (data && data.message) || '';
+  return `<div class="stage ${status}"><b>${name}: ${status}</b><span>${escapeHtml(message)}</span></div>`;
+}
+
+function videoHtml(video) {
+  const meta = video.metadata ? `${video.metadata.width}x${video.metadata.height}, ${video.metadata.frame_count}f` : '';
+  const split = video.split ? `${video.split.status || ''} ${video.split.segments ? '(' + video.split.segments + ' segments)' : ''}` : 'not split';
+  const segments = (video.segments || []).map(seg => `
+    <div class="segment">
+      <b>${seg.segment_id}</b>
+      <div class="task-meta">frames ${seg.start_frame}-${seg.end_frame}, ${seg.frame_count}f | labels ${seg.labels_copied || 0}</div>
+      <div class="task-meta">locateanything: ${(seg.locateanything && seg.locateanything.status) || 'pending'}</div>
+      <div class="task-meta">tracking: ${(seg.tracking && seg.tracking.status) || 'pending'}</div>
+    </div>
+  `).join('');
+  return `<div class="video">
+    <b>${escapeHtml(video.name || video.video_id)}</b>
+    <div class="task-meta">${video.video_id} | ${meta}</div>
+    <div class="task-meta">split: ${escapeHtml(split)}</div>
+    ${segments}
+  </div>`;
+}
+
+async function loadDetail(taskId) {
+  selected = await api('GET', `/api/tasks/${taskId}`);
+  renderTaskList();
+  const stages = selected.stages || {};
+  const videos = selected.videos || [];
+  document.getElementById('detail').innerHTML = `
+    <div><b>${escapeHtml(selected.name)}</b></div>
+    <div class="task-meta">${selected.task_id}</div>
+    <div class="task-meta">status: ${selected.status || ''} | source: ${selected.prelabel_source || ''}</div>
+    <div class="stages">
+      ${stageCard('Video', stages.video)}
+      ${stageCard('Prelabel', stages.prelabel)}
+      ${stageCard('LocateAnything', stages.locateanything)}
+      ${stageCard('Tracking', stages.tracking)}
+      ${stageCard('Package', stages.package)}
+      ${stageCard('Review', stages.review)}
+      ${stageCard('Export', stages.export)}
+    </div>
+    <h3>Task Notes</h3>
+    <label>Assignee</label>
+    <input id="edit-assignee" value="${escapeHtml(selected.assignee || '')}">
+    <label>Prompt</label>
+    <input id="edit-prompt" value="${escapeHtml(selected.prompt || 'person')}">
+    <label>Classes</label>
+    <textarea id="edit-classes" rows="4">${escapeHtml(selected.classes_text || '0 person')}</textarea>
+    <label>Notes</label>
+    <textarea id="edit-notes" rows="3">${escapeHtml(selected.notes || '')}</textarea>
+    <div class="row">
+      <button onclick="saveTaskMeta()">Save Notes</button>
+      <button class="danger" onclick="deleteTask()">Delete Task</button>
+    </div>
+    <h3>Videos</h3>
+    <div>${videos.length ? videos.map(videoHtml).join('') : '<div class="task-meta">No video uploaded.</div>'}</div>
+    <h3>Upload</h3>
+    <label>Upload full original video</label>
+    <input id="video-file" type="file" accept="video/*">
+    <button onclick="uploadVideo()" style="margin-top:6px">Upload Video</button>
+    <label>Upload full YOLO txt zip for current video</label>
+    <input id="labels-file" type="file" accept=".zip">
+    <button onclick="uploadLabels()" style="margin-top:6px">Upload YOLO Zip</button>
+    <h3>Split Current Video</h3>
+    <div class="row">
+      <input id="segment-length" type="number" value="300" min="1">
+      <select id="split-label-source">
+        <option value="input">Use uploaded YOLO labels</option>
+        <option value="locateanything">Use LocateAnything labels</option>
+        <option value="none">No labels</option>
+      </select>
+      <button onclick="splitCurrentVideo()">Split</button>
+    </div>
+    <h3>Pipeline</h3>
+    <div class="row">
+      <button class="primary" onclick="runLocany()">Run LocateAnything</button>
+      <button class="primary" onclick="runTracking()">Run Tracking</button>
+    </div>
+    <div class="row">
+      <button class="primary" onclick="runSegmentLocany()">Run Segment LocateAnything</button>
+      <button class="primary" onclick="runSegmentTracking()">Run Segment Tracking</button>
+    </div>
+    <div class="row">
+      <button onclick="makePackage()">Create Package</button>
+      <button onclick="downloadPackage()">Download Package</button>
+    </div>
+    <label>Upload reviewed tracking_results.json</label>
+    <input id="reviewed-file" type="file" accept=".json">
+    <div class="row">
+      <button onclick="uploadReviewed()">Upload Reviewed JSON</button>
+      <button onclick="exportYolo()">Export YOLO</button>
+    </div>
+    <div id="status"></div>
+    <h3>Events</h3>
+    <div id="events">${(selected.events || []).map(e => `[${e.time}] ${e.level}: ${escapeHtml(e.message)}`).join('<br>')}</div>
+  `;
+}
+
+async function saveTaskMeta() {
+  await api('PATCH', `/api/tasks/${selected.task_id}`, {
+    assignee: document.getElementById('edit-assignee').value.trim(),
+    prompt: document.getElementById('edit-prompt').value.trim(),
+    classes: document.getElementById('edit-classes').value.trim(),
+    notes: document.getElementById('edit-notes').value.trim(),
+  });
+  await loadDetail(selected.task_id);
+}
+
+async function deleteTask() {
+  if (!confirm(`Delete task ${selected.name}? The record will be hidden but files remain on disk.`)) return;
+  await api('DELETE', `/api/tasks/${selected.task_id}`);
+  selected = null;
+  document.getElementById('detail').textContent = 'Task deleted.';
+  await loadTasks({ refreshDetail: false });
+}
+
+async function uploadVideo() {
+  const file = document.getElementById('video-file').files[0];
+  if (!file) return alert('Choose a video first');
+  const form = new FormData();
+  form.append('file', file);
+  setStatus('Uploading video...');
+  await api('POST', `/api/tasks/${selected.task_id}/video`, form, true);
+  setStatus('Video uploaded');
+  await loadDetail(selected.task_id);
+}
+
+async function uploadLabels() {
+  const file = document.getElementById('labels-file').files[0];
+  if (!file) return alert('Choose a zip first');
+  const form = new FormData();
+  form.append('file', file);
+  setStatus('Uploading labels...');
+  await api('POST', `/api/tasks/${selected.task_id}/labels-zip`, form, true);
+  setStatus('Labels uploaded');
+  await loadDetail(selected.task_id);
+}
+
+async function splitCurrentVideo() {
+  const segmentLength = parseInt(document.getElementById('segment-length').value, 10);
+  if (!Number.isInteger(segmentLength) || segmentLength < 1) return alert('Set segment length >= 1');
+  await api('POST', `/api/tasks/${selected.task_id}/split-video`, {
+    segment_length: segmentLength,
+    label_source: document.getElementById('split-label-source').value,
+  });
+  setStatus('Split queued');
+}
+
+async function runLocany() {
+  setStatus('LocateAnything queued');
+  await api('POST', `/api/tasks/${selected.task_id}/run-locateanything`, { prompt: selected.prompt || 'person' });
+}
+
+async function runSegmentLocany() {
+  setStatus('Segment LocateAnything queued');
+  await api('POST', `/api/tasks/${selected.task_id}/run-segment-locateanything`, { prompt: selected.prompt || 'person' });
+}
+
+async function runTracking() {
+  setStatus('Tracking queued');
+  await api('POST', `/api/tasks/${selected.task_id}/run-tracking`, { label_source: 'auto', short_gap_max: 5 });
+}
+
+async function runSegmentTracking() {
+  setStatus('Segment tracking queued');
+  await api('POST', `/api/tasks/${selected.task_id}/run-segment-tracking`, { label_source: 'auto', short_gap_max: 5 });
+}
+
+async function makePackage() {
+  const r = await api('POST', `/api/tasks/${selected.task_id}/package`, { include_video: true });
+  setStatus(`Package created: ${r.package}`);
+  await loadDetail(selected.task_id);
+}
+
+function downloadPackage() {
+  window.location.href = `/api/tasks/${selected.task_id}/package/download`;
+}
+
+async function uploadReviewed() {
+  const file = document.getElementById('reviewed-file').files[0];
+  if (!file) return alert('Choose reviewed json first');
+  const form = new FormData();
+  form.append('file', file);
+  await api('POST', `/api/tasks/${selected.task_id}/reviewed`, form, true);
+  await loadDetail(selected.task_id);
+}
+
+async function exportYolo() {
+  const r = await api('POST', `/api/tasks/${selected.task_id}/export-yolo`, {});
+  setStatus(`YOLO exported: ${r.output_dir}`);
+  await loadDetail(selected.task_id);
+}
+
+loadTasks();
+refreshTimer = setInterval(() => loadTasks({ refreshDetail: false }), 5000);
+</script>
+</body>
+</html>

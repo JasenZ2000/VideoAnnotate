@@ -17,7 +17,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from PIL import Image
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from batch_yolo_infer import box_to_yolo_line, write_text_atomic
 from debug_infer import extract_items, parse_dtype, resize_for_inference
@@ -47,6 +47,8 @@ SETTINGS: dict[str, Any] = {
 class LocateAnythingVideoReq(BaseModel):
     video_path: str
     prompt: str = "person"
+    categories: list[str] = Field(default_factory=list)
+    class_map: dict[str, int] = Field(default_factory=dict)
     task: str = "ground_multi"
     question: str = ""
     class_id: int = 0
@@ -113,12 +115,38 @@ def _run_model(worker: LocateAnythingWorker, image: Image.Image, req: LocateAnyt
     if req.question:
         return worker.predict(image, req.question, **common)
     if req.task == "detect":
-        return worker.detect(image, [req.prompt], **common)
+        categories = [item.strip() for item in req.categories if item.strip()]
+        if not categories:
+            categories = [req.prompt]
+        return worker.detect(image, categories, **common)
     if req.task == "ground_single":
         return worker.ground_single(image, req.prompt, **common)
     if req.task == "ground_multi":
         return worker.ground_multi(image, req.prompt, **common)
     raise RuntimeError(f"Unsupported task: {req.task}")
+
+
+def _normalize_label(label: str) -> str:
+    return " ".join(label.strip().lower().split())
+
+
+def _normalized_class_map(req: LocateAnythingVideoReq) -> dict[str, int]:
+    mapped: dict[str, int] = {}
+    for label, class_id in req.class_map.items():
+        normalized = _normalize_label(str(label))
+        if normalized:
+            mapped[normalized] = int(class_id)
+    return mapped
+
+
+def _class_id_for_item(item: dict[str, Any], req: LocateAnythingVideoReq, class_map: dict[str, int]) -> int:
+    label = _normalize_label(str(item.get("label", "")))
+    if label and label in class_map:
+        return class_map[label]
+    prompt = _normalize_label(req.prompt)
+    if prompt and prompt in class_map:
+        return class_map[prompt]
+    return int(req.class_id)
 
 
 def _frame_to_image(frame: Any) -> Image.Image:
@@ -173,6 +201,8 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
             metadata = {
                 "video_path": str(video_path),
                 "prompt": req.prompt,
+                "categories": req.categories,
+                "class_map": req.class_map,
                 "task": req.task,
                 "question": req.question,
                 "class_id": req.class_id,
@@ -190,6 +220,7 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
             with open(metadata_path, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=2)
 
+            class_map = _normalized_class_map(req)
             processed = 0
             failed = 0
             started = time.perf_counter()
@@ -225,11 +256,16 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
                         if item.get("type") != "box":
                             continue
                         box = [float(value) for value in item["bbox_xyxy"]]
-                        line = box_to_yolo_line(box, width, height, req.class_id, req.score)
+                        mapped_class_id = _class_id_for_item(item, req, class_map)
+                        line = box_to_yolo_line(box, width, height, mapped_class_id, req.score)
                         if line is None:
                             continue
                         lines.append(line)
-                        boxes.append({"label": item.get("label", ""), "bbox_xyxy": box})
+                        boxes.append({
+                            "label": item.get("label", ""),
+                            "class_id": mapped_class_id,
+                            "bbox_xyxy": box,
+                        })
                     write_text_atomic(txt_path, "\n".join(lines) + ("\n" if lines else ""))
                     with open(raw_path, "a", encoding="utf-8") as f:
                         f.write(json.dumps({
@@ -299,8 +335,8 @@ async def health() -> dict[str, Any]:
 
 @app.post("/api/jobs")
 async def create_job(req: LocateAnythingVideoReq) -> dict[str, Any]:
-    if not req.prompt.strip() and not req.question.strip():
-        raise HTTPException(400, "prompt or question is required")
+    if not req.prompt.strip() and not req.question.strip() and not req.categories:
+        raise HTTPException(400, "prompt, categories, or question is required")
     video_path = _resolve_video_path(req.video_path)
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {
@@ -309,6 +345,7 @@ async def create_job(req: LocateAnythingVideoReq) -> dict[str, Any]:
         "message": "Queued",
         "video_path": str(video_path),
         "prompt": req.prompt,
+        "categories": req.categories,
     }
     asyncio.create_task(_run_job(job_id, req, video_path))
     return {"ok": True, "job_id": job_id, "status": "queued"}

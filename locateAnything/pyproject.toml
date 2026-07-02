@@ -7,7 +7,7 @@ name = "locate_anything"
 version = "1.0"
 description = "LocateAnything: Fast and High-Quality Vision-Language Grounding with Parallel Box Decoding"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: Apache Software License",
