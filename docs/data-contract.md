@@ -8,6 +8,7 @@
   platform.sqlite3-wal   # SQLite 运行期文件
   platform.sqlite3-shm   # SQLite 运行期文件
   <task-id>/
+    attachments/        # 任务或 Part 资料附件
     videos/
       <video-id>/
         raw/
@@ -30,7 +31,7 @@
 
 各阶段产物必须分别保存，不应覆盖用户上传的源标注或已经审核的结果。
 
-数据库只保存元数据、文件路径和处理状态，不保存视频二进制或逐帧目标框。旧任务目录中的 `task.json` 与 `events.jsonl` 会被自动导入并原样保留；导出的标注包仍包含一份由数据库即时生成的 `task.json` 快照，供离线查看。
+数据库只保存元数据、角色、Part、工时、附件索引、问题状态、文件路径和处理状态，不保存附件内容、视频二进制或逐帧目标框。旧任务目录中的 `task.json` 与 `events.jsonl` 会被自动导入并原样保留；导出的标注包仍包含一份由数据库即时生成的 `task.json` 快照，供离线查看。
 
 ## YOLO 输入与输出
 

@@ -1,6 +1,6 @@
 # Video Annotation Workflow
 
-面向团队的视频目标检测与跟踪标注作业平台。项目把长视频任务登记、预标注、分段、轨迹生成、人工清理和 YOLO 数据集导出串成一条可追踪的流程，同时把耗时的 LocateAnything 与 SAM3.1 推理放在 Linux GPU 服务器上。
+面向部门的通用标注作业平台，支持发布人、负责人、标注员、Part 动态领取、工时、资料附件和问题闭环。视频目标检测任务额外提供长视频分段、LocateAnything 预标注、轨迹融合、缺漏补全、人工清理和 YOLO 导出，并把耗时推理放在 Linux GPU 服务器上。
 
 > 当前状态：内部 MVP。任务登记、视频/YOLO 上传、长视频分段、LocateAnything 分段推理、跟踪融合和基础导出已经可用；segment 级标注包、回传与最终合并仍在完善中，详见 [Roadmap](docs/roadmap.md)。
 

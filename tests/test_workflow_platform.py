@@ -43,11 +43,42 @@ class WorkflowPlatformTests(unittest.TestCase):
                 response = asyncio.run(platform.create_task(CreateTaskReq(
                     name="SQLite API 测试",
                     classes="0 person\n1 car",
+                    task_type="general",
+                    publisher="publisher",
+                    manager="manager",
+                    annotators="ann-a, ann-b",
+                    instructions="任务说明",
+                    part_count=3,
                 )))
                 task_id = response["task"]["task_id"]
                 detail = asyncio.run(platform.get_task(task_id))
                 self.assertEqual(len(detail["classes"]), 2)
                 self.assertEqual(detail["events"][0]["message"], "Task created")
+                self.assertEqual(detail["publisher"], "publisher")
+                self.assertEqual(detail["annotators"], ["ann-a", "ann-b"])
+                self.assertEqual(detail["part_summary"]["total"], 3)
+                claimed = asyncio.run(platform.claim_next_part(
+                    task_id,
+                    platform.ActorReq(actor="ann-a"),
+                ))
+                self.assertEqual(claimed["part"]["status"], "in_progress")
+                submitted = asyncio.run(platform.submit_part(
+                    task_id,
+                    claimed["part"]["part_id"],
+                    platform.SubmitPartReq(actor="ann-a", note="完成"),
+                ))
+                self.assertEqual(submitted["part"]["status"], "submitted")
+                reviewed = asyncio.run(platform.review_part(
+                    task_id,
+                    claimed["part"]["part_id"],
+                    platform.ReviewPartReq(actor="manager", action="approve", note="通过"),
+                ))
+                self.assertEqual(reviewed["part"]["status"], "completed")
+                with self.assertRaises(HTTPException):
+                    asyncio.run(platform.claim_next_part(
+                        task_id,
+                        platform.ActorReq(actor="outsider"),
+                    ))
                 self.assertTrue((root / "metadata.sqlite3").exists())
                 self.assertFalse((root / task_id / "task.json").exists())
             finally:

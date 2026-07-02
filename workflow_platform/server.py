@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import cv2
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -59,6 +59,13 @@ _DATABASE_LOCK = threading.Lock()
 
 class CreateTaskReq(BaseModel):
     name: str
+    task_type: str = "general"  # general | video_detection
+    publisher: str = ""
+    manager: str = ""
+    annotators: str = ""
+    instructions: str = ""
+    part_count: int = 0
+    part_name_prefix: str = "Part"
     prelabel_source: str = "none"  # none | yolo | locateanything
     prompt: str = "person"
     classes: str = "0 person"
@@ -67,6 +74,7 @@ class CreateTaskReq(BaseModel):
 
 
 class RunLocateAnythingReq(BaseModel):
+    actor: str = ""
     prompt: Optional[str] = None
     video_id: Optional[str] = None
     max_frames: int = 0
@@ -76,26 +84,70 @@ class RunLocateAnythingReq(BaseModel):
 
 
 class RunTrackingReq(BaseModel):
+    actor: str = ""
     label_source: str = "auto"  # auto | input | locateanything
     short_gap_max: int = 5
 
 
 class PackageReq(BaseModel):
+    actor: str = ""
     include_video: bool = True
 
 
 class UpdateTaskReq(BaseModel):
+    actor: str = ""
     name: Optional[str] = None
     assignee: Optional[str] = None
     notes: Optional[str] = None
     prompt: Optional[str] = None
     classes: Optional[str] = None
+    task_type: Optional[str] = None
+    publisher: Optional[str] = None
+    manager: Optional[str] = None
+    annotators: Optional[str] = None
+    instructions: Optional[str] = None
 
 
 class SplitVideoReq(BaseModel):
+    actor: str = ""
     video_id: Optional[str] = None
     segment_length: int
     label_source: str = "input"  # input | locateanything | none
+
+
+class CreatePartsReq(BaseModel):
+    actor: str
+    count: int
+    name_prefix: str = "Part"
+    instructions: str = ""
+
+
+class ActorReq(BaseModel):
+    actor: str
+
+
+class SubmitPartReq(BaseModel):
+    actor: str
+    note: str = ""
+
+
+class ReviewPartReq(BaseModel):
+    actor: str
+    action: str  # approve | rework
+    note: str = ""
+
+
+class CreateIssueReq(BaseModel):
+    actor: str
+    part_id: Optional[int] = None
+    title: str
+    description: str = ""
+    severity: str = "normal"
+
+
+class ResolveIssueReq(BaseModel):
+    actor: str
+    resolution: str
 
 
 def now_iso() -> str:
@@ -115,6 +167,34 @@ def slugify(value: str) -> str:
 
 def normalize_label(label: str) -> str:
     return " ".join(label.strip().lower().split())
+
+
+def parse_people(raw: str) -> list[str]:
+    people: list[str] = []
+    seen: set[str] = set()
+    for item in raw.replace(";", "\n").replace(",", "\n").splitlines():
+        username = item.strip()
+        if username and username not in seen:
+            seen.add(username)
+            people.append(username)
+    return people
+
+
+def require_task_participant(task_id: str, actor: str) -> None:
+    if not database().is_participant(task_id, actor.strip()):
+        raise HTTPException(403, "当前操作人不是该任务的参与者")
+
+
+def require_task_manager(task_id: str, actor: str) -> None:
+    if not database().is_manager(task_id, actor.strip()):
+        raise HTTPException(403, "只有发布人或负责人可以执行该操作")
+
+
+def require_video_manager(task_id: str, actor: str) -> None:
+    task = database().load_task(task_id)
+    if task.get("task_type") != "video_detection":
+        raise HTTPException(400, "该任务不是视频目标检测标注任务")
+    require_task_manager(task_id, actor)
 
 
 def parse_classes_text(raw: str, default_prompt: str = "person") -> list[dict[str, Any]]:
@@ -262,6 +342,7 @@ def ensure_task_dirs(path: Path) -> None:
         "package",
         "reviewed",
         "exports",
+        "attachments",
         "logs",
     ):
         (path / name).mkdir(parents=True, exist_ok=True)
@@ -271,12 +352,33 @@ def ensure_task_shape(task: dict[str, Any]) -> dict[str, Any]:
     task.setdefault("deleted", False)
     task.setdefault("videos", [])
     task.setdefault("notes", "")
+    task.setdefault("task_type", "video_detection" if task.get("videos") else "general")
+    task.setdefault("publisher", task.get("assignee", ""))
+    task.setdefault("manager", task.get("assignee", ""))
+    task.setdefault("annotators", [])
+    task.setdefault("instructions", "")
+    task["assignee"] = task.get("manager", "")
     if not task.get("classes"):
         task["classes"] = [{"id": 0, "name": task.get("prompt") or "person"}]
     stages = task.setdefault("stages", {})
     for stage in DEFAULT_STAGE_NAMES:
         stages.setdefault(stage, {"status": "pending", "message": ""})
     task["classes_text"] = classes_to_text(task.get("classes", []))
+    return task
+
+
+def task_with_workflow(task: dict[str, Any], include_detail: bool = False) -> dict[str, Any]:
+    task = ensure_task_shape(task)
+    task_id = str(task["task_id"])
+    task["part_summary"] = database().part_summary(task_id)
+    if include_detail:
+        task["parts"] = database().list_parts(task_id, now=now_iso())
+        attachments = database().list_attachments(task_id)
+        for attachment in attachments:
+            attachment.pop("stored_path", None)
+        task["attachments"] = attachments
+        task["issues"] = database().list_issues(task_id)
+        task["events"] = database().list_events(task_id, limit=100)
     return task
 
 
@@ -973,21 +1075,32 @@ async def health():
 
 @app.get("/api/tasks")
 async def list_tasks(include_deleted: bool = False):
-    rows = [ensure_task_shape(task) for task in database().list_tasks(include_deleted)]
+    rows = [task_with_workflow(task) for task in database().list_tasks(include_deleted)]
     return {"tasks": rows}
 
 
 @app.post("/api/tasks")
 async def create_task(req: CreateTaskReq):
+    if req.task_type not in {"general", "video_detection"}:
+        raise HTTPException(400, "task_type must be general or video_detection")
+    if req.part_count < 0 or req.part_count > 10000:
+        raise HTTPException(400, "part_count must be between 0 and 10000")
     task_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{slugify(req.name)}_{uuid.uuid4().hex[:6]}"
     path = tasks_dir() / task_id
     path.mkdir(parents=True, exist_ok=False)
     ensure_task_dirs(path)
     classes = parse_classes_text(req.classes, req.prompt)
+    manager = req.manager.strip() or req.assignee.strip() or req.publisher.strip()
+    publisher = req.publisher.strip() or manager
     task = {
         "task_id": task_id,
         "name": req.name,
-        "assignee": req.assignee,
+        "task_type": req.task_type,
+        "publisher": publisher,
+        "manager": manager,
+        "assignee": manager,
+        "annotators": parse_people(req.annotators),
+        "instructions": req.instructions,
         "notes": req.notes,
         "prelabel_source": req.prelabel_source,
         "prompt": req.prompt,
@@ -1010,29 +1123,50 @@ async def create_task(req: CreateTaskReq):
     }
     save_task(path, task)
     append_event(path, "Task created")
-    return {"ok": True, "task": task}
+    if req.part_count:
+        database().create_parts(
+            task_id,
+            req.part_count,
+            req.part_name_prefix,
+            req.instructions,
+            now_iso(),
+        )
+        append_event(path, f"Created {req.part_count} parts")
+    return {"ok": True, "task": task_with_workflow(load_task(path), include_detail=True)}
 
 
 @app.patch("/api/tasks/{task_id}")
 async def update_task(task_id: str, req: UpdateTaskReq):
     path = task_dir(task_id)
+    require_task_manager(task_id, req.actor)
     with TASK_LOCK:
         task = ensure_task_shape(load_task(path))
         for key in ("name", "assignee", "notes", "prompt"):
             value = getattr(req, key)
             if value is not None:
                 task[key] = value
+        for key in ("task_type", "publisher", "manager", "instructions"):
+            value = getattr(req, key)
+            if value is not None:
+                task[key] = value
+        if req.annotators is not None:
+            task["annotators"] = parse_people(req.annotators)
+        if req.manager is not None:
+            task["assignee"] = req.manager
+        elif req.assignee is not None:
+            task["manager"] = req.assignee
         if req.classes is not None:
             task["classes"] = parse_classes_text(req.classes, task.get("prompt") or "person")
             task["classes_text"] = classes_to_text(task["classes"])
         save_task(path, task)
     append_event(path, "Task metadata updated")
-    return {"ok": True, "task": task}
+    return {"ok": True, "task": task_with_workflow(task, include_detail=True)}
 
 
 @app.delete("/api/tasks/{task_id}")
-async def delete_task(task_id: str):
+async def delete_task(task_id: str, actor: str):
     path = task_dir(task_id)
+    require_task_manager(task_id, actor)
     with TASK_LOCK:
         task = ensure_task_shape(load_task(path))
         task["deleted"] = True
@@ -1046,14 +1180,198 @@ async def delete_task(task_id: str):
 @app.get("/api/tasks/{task_id}")
 async def get_task(task_id: str):
     path = task_dir(task_id)
-    task = ensure_task_shape(load_task(path))
-    task["events"] = database().list_events(task_id, limit=100)
-    return task
+    return task_with_workflow(load_task(path), include_detail=True)
+
+
+@app.post("/api/tasks/{task_id}/parts")
+async def create_parts(task_id: str, req: CreatePartsReq):
+    path = task_dir(task_id)
+    require_task_manager(task_id, req.actor)
+    try:
+        parts = database().create_parts(
+            task_id,
+            req.count,
+            req.name_prefix,
+            req.instructions,
+            now_iso(),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    append_event(path, f"{req.actor} created {req.count} parts")
+    return {"ok": True, "parts": parts, "summary": database().part_summary(task_id)}
+
+
+@app.post("/api/tasks/{task_id}/parts/claim-next")
+async def claim_next_part(task_id: str, req: ActorReq):
+    path = task_dir(task_id)
+    try:
+        part = database().claim_next_part(task_id, req.actor.strip(), now_iso())
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    if part is None:
+        raise HTTPException(409, "没有可领取的 Part")
+    append_event(path, f"{req.actor} claimed {part['name']}")
+    return {"ok": True, "part": part}
+
+
+@app.post("/api/tasks/{task_id}/parts/{part_id}/start")
+async def start_part(task_id: str, part_id: int, req: ActorReq):
+    path = task_dir(task_id)
+    try:
+        part = database().start_part(task_id, part_id, req.actor.strip(), now_iso())
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    append_event(path, f"{req.actor} started {part['name']}")
+    return {"ok": True, "part": part}
+
+
+@app.post("/api/tasks/{task_id}/parts/{part_id}/submit")
+async def submit_part(task_id: str, part_id: int, req: SubmitPartReq):
+    path = task_dir(task_id)
+    try:
+        part = database().submit_part(task_id, part_id, req.actor.strip(), req.note, now_iso())
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(404, "Part 不存在") from exc
+    append_event(path, f"{req.actor} submitted {part['name']}")
+    return {"ok": True, "part": part}
+
+
+@app.post("/api/tasks/{task_id}/parts/{part_id}/release")
+async def release_part(task_id: str, part_id: int, req: ActorReq):
+    path = task_dir(task_id)
+    try:
+        part = database().release_part(task_id, part_id, req.actor.strip(), now_iso())
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(404, "Part 不存在") from exc
+    append_event(path, f"{req.actor} released {part['name']}")
+    return {"ok": True, "part": part}
+
+
+@app.post("/api/tasks/{task_id}/parts/{part_id}/review")
+async def review_part(task_id: str, part_id: int, req: ReviewPartReq):
+    path = task_dir(task_id)
+    try:
+        part = database().review_part(
+            task_id, part_id, req.actor.strip(), req.action, req.note, now_iso()
+        )
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    append_event(path, f"{req.actor} reviewed {part['name']}: {req.action}")
+    return {"ok": True, "part": part}
+
+
+@app.post("/api/tasks/{task_id}/attachments")
+async def upload_attachment(
+    task_id: str,
+    file: UploadFile = File(...),
+    actor: str = Form(...),
+    part_id: Optional[int] = Form(None),
+):
+    path = task_dir(task_id)
+    require_task_participant(task_id, actor)
+    if part_id is not None:
+        try:
+            database().get_part(task_id, part_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Part 不存在") from exc
+    filename = Path(file.filename or "attachment.bin").name
+    attachment_id = uuid.uuid4().hex
+    stored = path / "attachments" / f"{attachment_id}_{filename}"
+    digest = hashlib.sha256()
+    size = 0
+    with open(stored, "wb") as output:
+        while chunk := file.file.read(1024 * 1024):
+            output.write(chunk)
+            digest.update(chunk)
+            size += len(chunk)
+    record = database().add_attachment({
+        "attachment_id": attachment_id,
+        "task_id": task_id,
+        "part_id": part_id,
+        "filename": filename,
+        "stored_path": str(stored),
+        "media_type": file.content_type or "application/octet-stream",
+        "size_bytes": size,
+        "sha256": digest.hexdigest(),
+        "uploaded_by": actor,
+        "created_at": now_iso(),
+    })
+    record.pop("stored_path", None)
+    append_event(path, f"{actor} uploaded attachment: {filename}")
+    return {"ok": True, "attachment": record}
+
+
+@app.get("/api/tasks/{task_id}/attachments/{attachment_id}/download")
+async def download_attachment(task_id: str, attachment_id: str):
+    task_dir(task_id)
+    try:
+        attachment = database().get_attachment(task_id, attachment_id)
+    except KeyError as exc:
+        raise HTTPException(404, "附件不存在") from exc
+    stored = Path(attachment["stored_path"])
+    if not stored.is_file():
+        raise HTTPException(404, "附件文件已丢失")
+    return FileResponse(
+        str(stored),
+        filename=attachment["filename"],
+        media_type=attachment["media_type"],
+    )
+
+
+@app.post("/api/tasks/{task_id}/issues")
+async def create_issue(task_id: str, req: CreateIssueReq):
+    path = task_dir(task_id)
+    require_task_participant(task_id, req.actor)
+    if req.severity not in {"low", "normal", "high", "blocking"}:
+        raise HTTPException(400, "无效的问题严重程度")
+    if req.part_id is not None:
+        try:
+            database().get_part(task_id, req.part_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Part 不存在") from exc
+    task = load_task(path)
+    issue = database().create_issue({
+        "task_id": task_id,
+        "part_id": req.part_id,
+        "reported_by": req.actor,
+        "assigned_to": task.get("manager", ""),
+        "severity": req.severity,
+        "title": req.title.strip(),
+        "description": req.description,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    })
+    append_event(path, f"{req.actor} reported issue: {req.title}", level="warning")
+    return {"ok": True, "issue": issue}
+
+
+@app.post("/api/tasks/{task_id}/issues/{issue_id}/resolve")
+async def resolve_issue(task_id: str, issue_id: int, req: ResolveIssueReq):
+    path = task_dir(task_id)
+    try:
+        issue = database().resolve_issue(
+            task_id, issue_id, req.actor.strip(), req.resolution, now_iso()
+        )
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(404, "问题单不存在") from exc
+    append_event(path, f"{req.actor} resolved issue #{issue_id}")
+    return {"ok": True, "issue": issue}
 
 
 @app.post("/api/tasks/{task_id}/video")
-async def upload_video(task_id: str, file: UploadFile = File(...)):
+async def upload_video(task_id: str, file: UploadFile = File(...), actor: str = Form(...)):
     path = task_dir(task_id)
+    require_video_manager(task_id, actor)
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in VIDEO_EXTENSIONS:
         raise HTTPException(400, f"Unsupported video extension: {suffix}")
@@ -1090,8 +1408,13 @@ async def upload_video(task_id: str, file: UploadFile = File(...)):
 
 
 @app.post("/api/tasks/{task_id}/labels-zip")
-async def upload_labels_zip(task_id: str, file: UploadFile = File(...)):
+async def upload_labels_zip(
+    task_id: str,
+    file: UploadFile = File(...),
+    actor: str = Form(...),
+):
     path = task_dir(task_id)
+    require_video_manager(task_id, actor)
     video = find_video(path)
     if video is None:
         raise HTTPException(400, "Upload video before labels")
@@ -1134,6 +1457,7 @@ async def upload_labels_zip(task_id: str, file: UploadFile = File(...)):
 @app.post("/api/tasks/{task_id}/split-video")
 async def split_video(task_id: str, req: SplitVideoReq):
     path = task_dir(task_id)
+    require_video_manager(task_id, req.actor)
     if req.segment_length < 1:
         raise HTTPException(400, "segment_length must be >= 1")
     with TASK_LOCK:
@@ -1157,6 +1481,7 @@ async def split_video(task_id: str, req: SplitVideoReq):
 @app.post("/api/tasks/{task_id}/run-locateanything")
 async def start_locany(task_id: str, req: RunLocateAnythingReq):
     path = task_dir(task_id)
+    require_video_manager(task_id, req.actor)
     threading.Thread(target=run_locany_job, args=(task_id, req), daemon=True).start()
     set_stage(path, "locateanything", "queued", "Queued")
     return {"ok": True}
@@ -1165,6 +1490,7 @@ async def start_locany(task_id: str, req: RunLocateAnythingReq):
 @app.post("/api/tasks/{task_id}/run-segment-locateanything")
 async def start_segment_locany(task_id: str, req: RunLocateAnythingReq):
     path = task_dir(task_id)
+    require_video_manager(task_id, req.actor)
     threading.Thread(target=run_segment_locany_job, args=(task_id, req), daemon=True).start()
     set_stage(path, "locateanything", "queued", "Segment LocateAnything queued")
     return {"ok": True}
@@ -1173,6 +1499,7 @@ async def start_segment_locany(task_id: str, req: RunLocateAnythingReq):
 @app.post("/api/tasks/{task_id}/run-tracking")
 async def start_tracking(task_id: str, req: RunTrackingReq):
     path = task_dir(task_id)
+    require_video_manager(task_id, req.actor)
     threading.Thread(target=run_tracking_job, args=(task_id, req), daemon=True).start()
     set_stage(path, "tracking", "queued", "Queued")
     return {"ok": True}
@@ -1181,6 +1508,7 @@ async def start_tracking(task_id: str, req: RunTrackingReq):
 @app.post("/api/tasks/{task_id}/run-segment-tracking")
 async def start_segment_tracking(task_id: str, req: RunTrackingReq):
     path = task_dir(task_id)
+    require_video_manager(task_id, req.actor)
     threading.Thread(target=run_segment_tracking_job, args=(task_id, req), daemon=True).start()
     set_stage(path, "tracking", "queued", "Segment tracking queued")
     return {"ok": True}
@@ -1188,13 +1516,15 @@ async def start_segment_tracking(task_id: str, req: RunTrackingReq):
 
 @app.post("/api/tasks/{task_id}/package")
 async def create_package(task_id: str, req: PackageReq):
+    require_video_manager(task_id, req.actor)
     package = build_package(task_id, req.include_video)
     return {"ok": True, "package": str(package)}
 
 
 @app.get("/api/tasks/{task_id}/package/download")
-async def download_package(task_id: str):
+async def download_package(task_id: str, actor: str):
     path = task_dir(task_id)
+    require_video_manager(task_id, actor)
     packages = sorted((path / "package").glob("*_annotation_package.zip"))
     if not packages:
         package = build_package(task_id, include_video=True)
@@ -1204,8 +1534,13 @@ async def download_package(task_id: str):
 
 
 @app.post("/api/tasks/{task_id}/reviewed")
-async def upload_reviewed(task_id: str, file: UploadFile = File(...)):
+async def upload_reviewed(
+    task_id: str,
+    file: UploadFile = File(...),
+    actor: str = Form(...),
+):
     path = task_dir(task_id)
+    require_task_participant(task_id, actor)
     dst = path / "reviewed" / "tracking_results.reviewed.json"
     with open(dst, "wb") as f:
         shutil.copyfileobj(file.file, f)
@@ -1220,8 +1555,9 @@ async def upload_reviewed(task_id: str, file: UploadFile = File(...)):
 
 
 @app.post("/api/tasks/{task_id}/export-yolo")
-async def export_yolo(task_id: str):
+async def export_yolo(task_id: str, req: ActorReq):
     path = task_dir(task_id)
+    require_video_manager(task_id, req.actor)
     reviewed = path / "reviewed" / "tracking_results.reviewed.json"
     source = reviewed if reviewed.exists() else path / "tracking" / "tracking_results.json"
     if not source.exists():

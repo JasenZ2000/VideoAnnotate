@@ -1,354 +1,102 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<title>Annotation Workflow</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>标注作业平台</title>
 <style>
-* { box-sizing: border-box; }
-body { margin: 0; font-family: "Segoe UI", Arial, sans-serif; background: #f5f6f8; color: #20242a; }
-header { height: 52px; display: flex; align-items: center; padding: 0 18px; background: #20242a; color: #fff; }
-main { display: grid; grid-template-columns: 360px 1fr; gap: 14px; padding: 14px; }
-section { background: #fff; border: 1px solid #d7dbe0; border-radius: 6px; padding: 12px; }
-h2 { font-size: 15px; margin: 0 0 10px; }
-h3 { font-size: 13px; margin: 14px 0 8px; }
-label { display: block; font-size: 12px; color: #5c6470; margin: 8px 0 3px; }
-input, select, textarea { width: 100%; padding: 7px 8px; border: 1px solid #c9ced6; border-radius: 4px; font-size: 13px; }
-button { border: 1px solid #8c96a3; background: #fff; color: #20242a; border-radius: 4px; padding: 7px 10px; cursor: pointer; font-size: 13px; }
-button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
-button.danger { background: #dc2626; border-color: #dc2626; color: #fff; }
-button:disabled { opacity: .5; cursor: wait; }
-.row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
-.row > * { flex: 1; }
-.task { border: 1px solid #dde2e8; border-radius: 5px; padding: 8px; margin-bottom: 8px; cursor: pointer; }
-.task.active { border-color: #2563eb; background: #eff6ff; }
-.task-title { font-weight: 600; font-size: 13px; }
-.task-meta { color: #69717d; font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
-.stages { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
-.stage { border: 1px solid #dde2e8; border-radius: 5px; padding: 8px; min-height: 64px; }
-.stage b { display: block; font-size: 12px; margin-bottom: 4px; }
-.stage span { font-size: 12px; color: #58616d; overflow-wrap: anywhere; }
-.done { border-color: #22c55e; }
-.running, .queued { border-color: #f59e0b; }
-.failed { border-color: #ef4444; }
-.video, .segment { border: 1px solid #dde2e8; border-radius: 5px; padding: 8px; margin-top: 8px; }
-.segment { margin-left: 14px; background: #fafbfc; }
-#events { max-height: 220px; overflow: auto; background: #111827; color: #d1d5db; padding: 8px; border-radius: 5px; font-family: Consolas, monospace; font-size: 12px; }
-#status { font-size: 12px; color: #58616d; min-height: 18px; margin-top: 8px; }
+:root{--bg:#f4f6f8;--panel:#fff;--line:#d9dee5;--text:#1d2733;--muted:#66717e;--accent:#176b5b;--accent-soft:#e4f1ed;--warn:#9a6118;--danger:#a43a3a;--blue:#315e91;--radius:6px}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Segoe UI","Microsoft YaHei",sans-serif;letter-spacing:0}button,input,select,textarea{font:inherit;color:inherit}button{border:1px solid var(--line);background:#fff;border-radius:var(--radius);min-height:34px;padding:6px 12px;cursor:pointer}button:hover{border-color:#9ba7b4;background:#f7f9fa}button:disabled{opacity:.45;cursor:not-allowed}.primary{background:var(--accent);border-color:var(--accent);color:#fff}.danger{color:var(--danger)}input,select,textarea{width:100%;border:1px solid var(--line);background:#fff;border-radius:var(--radius);padding:7px 9px;min-height:34px}textarea{resize:vertical}.topbar{height:56px;background:#17232d;color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 20px}.brand{font-size:18px;font-weight:650;white-space:nowrap}.actor{display:flex;align-items:center;gap:8px}.actor input{width:180px;background:#263744;border-color:#405360;color:#fff}.actor button{color:var(--text);flex:0 0 auto}.app{height:calc(100vh - 56px);display:grid;grid-template-columns:300px minmax(0,1fr)}.sidebar{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;min-width:0}.sidebar-tools{padding:14px;border-bottom:1px solid var(--line)}.sidebar-tools .row{display:grid;grid-template-columns:1fr 90px;gap:8px;margin-top:8px}.task-list{overflow:auto;flex:1}.task-item{padding:13px 14px;border-bottom:1px solid #e7eaee;cursor:pointer}.task-item:hover,.task-item.active{background:#eef5f3}.task-title{font-weight:650;margin-bottom:5px;overflow-wrap:anywhere}.meta{font-size:12px;color:var(--muted)}.task-progress{height:4px;background:#e5e9ed;margin-top:9px}.task-progress span{display:block;height:100%;background:var(--accent)}.main{overflow:auto;min-width:0}.empty{height:100%;display:grid;place-items:center;color:var(--muted)}.task-head{background:#fff;padding:20px 26px 16px;border-bottom:1px solid var(--line)}.head-row{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.task-head h1{font-size:22px;margin:0 0 7px}.badges{display:flex;gap:7px;flex-wrap:wrap}.badge{display:inline-flex;align-items:center;min-height:24px;padding:2px 8px;border:1px solid var(--line);border-radius:12px;font-size:12px;background:#f8fafb}.badge.type{color:var(--blue);border-color:#b9cbe0;background:#eef4fa}.badge.status{color:var(--accent);border-color:#acd1c8;background:var(--accent-soft)}.head-stats{display:flex;gap:22px;text-align:right}.stat b{display:block;font-size:19px}.tabs{display:flex;gap:2px;padding:0 26px;background:#fff;border-bottom:1px solid var(--line);overflow-x:auto}.tab{border:0;border-radius:0;background:transparent;min-height:45px;padding:0 14px;border-bottom:3px solid transparent;white-space:nowrap}.tab.active{border-bottom-color:var(--accent);color:var(--accent);font-weight:650}.content{padding:0 26px 40px}.section{padding:22px 0;border-bottom:1px solid var(--line)}.section:last-child{border-bottom:0}.section h2{font-size:16px;margin:0 0 14px}.section h3{font-size:14px;margin:18px 0 9px}.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 18px}.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.field label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.summary{display:grid;grid-template-columns:repeat(5,minmax(90px,1fr));border:1px solid var(--line);background:#fff}.summary div{padding:12px;border-right:1px solid var(--line)}.summary div:last-child{border:0}.summary b{display:block;font-size:18px}.table-wrap{overflow:auto;border:1px solid var(--line);background:#fff}table{width:100%;border-collapse:collapse;min-width:820px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid #e5e9ed;vertical-align:top}th{font-size:12px;color:var(--muted);background:#f7f9fa;position:sticky;top:0}tr:last-child td{border-bottom:0}.status-text{font-weight:650}.status-pending{color:var(--muted)}.status-in_progress{color:var(--blue)}.status-submitted{color:var(--warn)}.status-rework{color:var(--danger)}.status-completed{color:var(--accent)}.compact{min-height:28px;padding:3px 8px;font-size:12px}.file-row,.issue-row,.event-row,.video-row{display:grid;gap:10px;padding:11px 0;border-bottom:1px solid var(--line);align-items:start}.file-row{grid-template-columns:minmax(160px,1fr) 120px 150px auto}.issue-row{grid-template-columns:90px minmax(180px,1fr) 120px 140px auto}.event-row{grid-template-columns:165px 75px minmax(0,1fr)}.video-row{grid-template-columns:minmax(160px,1fr) 170px 150px}.notice{padding:10px 12px;border-left:3px solid var(--warn);background:#fff8ec;color:#684a20}.video-segment{padding:8px 0;border-top:1px solid #e5e9ed}.hidden{display:none!important}.statusline{min-height:24px;margin-top:10px;color:var(--muted)}dialog{width:min(720px,calc(100vw - 32px));border:1px solid var(--line);border-radius:8px;padding:0;box-shadow:0 18px 60px #0003}dialog::backdrop{background:#17232d99}.dialog-head{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}.dialog-head h2{margin:0;font-size:18px}.dialog-body{padding:18px 20px}.dialog-foot{padding:12px 20px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;gap:8px}.close{border:0;font-size:20px;padding:0;width:32px}.role-note{font-size:12px;color:var(--muted);margin-top:5px}@media(max-width:900px){.app{grid-template-columns:1fr;height:auto}.sidebar{max-height:42vh;border-right:0;border-bottom:1px solid var(--line)}.main{min-height:58vh}.grid2,.grid3{grid-template-columns:1fr}.summary{grid-template-columns:repeat(2,1fr)}.head-row{display:block}.head-stats{text-align:left;margin-top:14px}.file-row,.issue-row,.event-row,.video-row{grid-template-columns:1fr}.content,.tabs{padding-left:14px;padding-right:14px}.task-head{padding:16px 14px}.topbar{padding:0 12px}.actor label{display:none}.actor input{width:125px}}
 </style>
 </head>
 <body>
-<header><strong>Annotation Workflow Platform</strong></header>
-<main>
-  <section>
-    <h2>Create Task</h2>
-    <label>Task name</label>
-    <input id="task-name" placeholder="20260625_road_cam_01">
-    <label>Assignee</label>
-    <input id="assignee" placeholder="employee name">
-    <label>Initial label source</label>
-    <select id="prelabel-source">
-      <option value="none">None</option>
-      <option value="yolo">Upload YOLO labels</option>
-      <option value="locateanything">Generate with LocateAnything</option>
-    </select>
-    <label>Prompt</label>
-    <input id="prompt" value="person">
-    <label>Classes</label>
-    <textarea id="classes" rows="3">0 person</textarea>
-    <label>Notes</label>
-    <textarea id="notes" rows="2"></textarea>
-    <button class="primary" onclick="createTask()" style="width:100%; margin-top:10px">Create Task</button>
-    <h2 style="margin-top:16px">Tasks</h2>
-    <div id="task-list"></div>
-  </section>
-  <section>
-    <h2>Task Detail</h2>
-    <div id="detail">Select or create a task.</div>
-  </section>
-</main>
+<header class="topbar"><div class="brand">标注作业平台</div><div class="actor"><label for="actor">当前操作人</label><input id="actor" placeholder="姓名或工号" autocomplete="off"><button onclick="saveActor()">确认</button></div></header>
+<div class="app">
+  <aside class="sidebar">
+    <div class="sidebar-tools"><button class="primary" style="width:100%" onclick="openCreate()">创建标注任务</button><div class="row"><select id="task-filter" onchange="renderTaskList()"><option value="all">全部任务</option><option value="mine">与我相关</option><option value="general">通用任务</option><option value="video_detection">视频目标检测</option></select><button onclick="loadTasks()">刷新</button></div></div>
+    <div id="task-list" class="task-list"></div>
+  </aside>
+  <main id="main" class="main"><div class="empty">请选择任务</div></main>
+</div>
+
+<dialog id="create-dialog">
+  <div class="dialog-head"><h2>创建标注任务</h2><button class="close" onclick="closeCreate()">×</button></div>
+  <div class="dialog-body">
+    <div class="grid2">
+      <div class="field"><label>任务名称</label><input id="new-name"></div>
+      <div class="field"><label>任务类型</label><select id="new-type" onchange="toggleCreateVideo()"><option value="general">通用标注任务</option><option value="video_detection">视频目标检测标注</option></select></div>
+      <div class="field"><label>发布人</label><input id="new-publisher"></div>
+      <div class="field"><label>负责人</label><input id="new-manager"></div>
+      <div class="field"><label>标注员</label><input id="new-annotators" placeholder="多人用逗号分隔"></div>
+      <div class="field"><label>初始 Part 数量</label><input id="new-parts" type="number" min="0" max="10000" value="0"></div>
+    </div>
+    <div class="field" style="margin-top:12px"><label>任务说明</label><textarea id="new-instructions" rows="5"></textarea></div>
+    <div id="new-video-fields" class="grid2 hidden" style="margin-top:12px">
+      <div class="field"><label>LocateAnything 提示词</label><input id="new-prompt" value="person"></div>
+      <div class="field"><label>类别表</label><textarea id="new-classes" rows="3">0 person</textarea></div>
+    </div>
+  </div>
+  <div class="dialog-foot"><button onclick="closeCreate()">取消</button><button class="primary" onclick="createTask()">创建</button></div>
+</dialog>
+
 <script>
-let tasks = [];
-let selected = null;
-let refreshTimer = null;
-
-async function api(method, url, body, isForm=false) {
-  const opts = { method };
-  if (body !== undefined) {
-    if (isForm) opts.body = body;
-    else {
-      opts.headers = { 'Content-Type': 'application/json' };
-      opts.body = JSON.stringify(body);
-    }
-  }
-  const r = await fetch(url, opts);
-  if (!r.ok) {
-    const err = await r.json().catch(() => ({ detail: r.statusText }));
-    throw new Error(err.detail || r.statusText);
-  }
-  const type = r.headers.get('content-type') || '';
-  return type.includes('application/json') ? r.json() : r;
-}
-
-function uniqTasks(items) {
-  const map = new Map();
-  for (const task of items || []) map.set(task.task_id, task);
-  return Array.from(map.values());
-}
-
-function setStatus(msg) {
-  const el = document.getElementById('status');
-  if (el) el.textContent = msg;
-}
-
-function hasPendingFileSelection() {
-  return ['video-file', 'labels-file', 'reviewed-file'].some(id => {
-    const el = document.getElementById(id);
-    return el && el.files && el.files.length > 0;
-  });
-}
-
-async function loadTasks(options = {}) {
-  const refreshDetail = options.refreshDetail !== false;
-  const data = await api('GET', '/api/tasks');
-  tasks = uniqTasks(data.tasks || []);
-  renderTaskList();
-  if (selected && refreshDetail && !hasPendingFileSelection()) await loadDetail(selected.task_id);
-}
-
-function renderTaskList() {
-  const el = document.getElementById('task-list');
-  el.innerHTML = '';
-  for (const task of tasks) {
-    const div = document.createElement('div');
-    div.className = 'task' + (selected && selected.task_id === task.task_id ? ' active' : '');
-    div.onclick = () => loadDetail(task.task_id);
-    const videoCount = (task.videos || []).length;
-    div.innerHTML = `<div class="task-title">${escapeHtml(task.name)}</div>
-      <div class="task-meta">${task.status || ''} | ${task.assignee || 'unassigned'} | ${videoCount} video(s)</div>
-      <div class="task-meta">${task.task_id}</div>`;
-    el.appendChild(div);
-  }
-}
-
-function escapeHtml(value) {
-  return String(value ?? '').replace(/[&<>"']/g, ch => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  }[ch]));
-}
-
-async function createTask() {
-  const payload = {
-    name: document.getElementById('task-name').value.trim(),
-    assignee: document.getElementById('assignee').value.trim(),
-    prelabel_source: document.getElementById('prelabel-source').value,
-    prompt: document.getElementById('prompt').value.trim() || 'person',
-    classes: document.getElementById('classes').value.trim() || '0 person',
-    notes: document.getElementById('notes').value.trim(),
-  };
-  if (!payload.name) return alert('Enter a task name');
-  const data = await api('POST', '/api/tasks', payload);
-  selected = data.task;
-  await loadTasks();
-  await loadDetail(selected.task_id);
-}
-
-function stageCard(name, data) {
-  const status = (data && data.status) || 'pending';
-  const message = (data && data.message) || '';
-  return `<div class="stage ${status}"><b>${name}: ${status}</b><span>${escapeHtml(message)}</span></div>`;
-}
-
-function videoHtml(video) {
-  const meta = video.metadata ? `${video.metadata.width}x${video.metadata.height}, ${video.metadata.frame_count}f` : '';
-  const split = video.split ? `${video.split.status || ''} ${video.split.segments ? '(' + video.split.segments + ' segments)' : ''}` : 'not split';
-  const segments = (video.segments || []).map(seg => `
-    <div class="segment">
-      <b>${seg.segment_id}</b>
-      <div class="task-meta">frames ${seg.start_frame}-${seg.end_frame}, ${seg.frame_count}f | labels ${seg.labels_copied || 0}</div>
-      <div class="task-meta">locateanything: ${(seg.locateanything && seg.locateanything.status) || 'pending'}</div>
-      <div class="task-meta">tracking: ${(seg.tracking && seg.tracking.status) || 'pending'}</div>
-    </div>
-  `).join('');
-  return `<div class="video">
-    <b>${escapeHtml(video.name || video.video_id)}</b>
-    <div class="task-meta">${video.video_id} | ${meta}</div>
-    <div class="task-meta">split: ${escapeHtml(split)}</div>
-    ${segments}
-  </div>`;
-}
-
-async function loadDetail(taskId) {
-  selected = await api('GET', `/api/tasks/${taskId}`);
-  renderTaskList();
-  const stages = selected.stages || {};
-  const videos = selected.videos || [];
-  document.getElementById('detail').innerHTML = `
-    <div><b>${escapeHtml(selected.name)}</b></div>
-    <div class="task-meta">${selected.task_id}</div>
-    <div class="task-meta">status: ${selected.status || ''} | source: ${selected.prelabel_source || ''}</div>
-    <div class="stages">
-      ${stageCard('Video', stages.video)}
-      ${stageCard('Prelabel', stages.prelabel)}
-      ${stageCard('LocateAnything', stages.locateanything)}
-      ${stageCard('Tracking', stages.tracking)}
-      ${stageCard('Package', stages.package)}
-      ${stageCard('Review', stages.review)}
-      ${stageCard('Export', stages.export)}
-    </div>
-    <h3>Task Notes</h3>
-    <label>Assignee</label>
-    <input id="edit-assignee" value="${escapeHtml(selected.assignee || '')}">
-    <label>Prompt</label>
-    <input id="edit-prompt" value="${escapeHtml(selected.prompt || 'person')}">
-    <label>Classes</label>
-    <textarea id="edit-classes" rows="4">${escapeHtml(selected.classes_text || '0 person')}</textarea>
-    <label>Notes</label>
-    <textarea id="edit-notes" rows="3">${escapeHtml(selected.notes || '')}</textarea>
-    <div class="row">
-      <button onclick="saveTaskMeta()">Save Notes</button>
-      <button class="danger" onclick="deleteTask()">Delete Task</button>
-    </div>
-    <h3>Videos</h3>
-    <div>${videos.length ? videos.map(videoHtml).join('') : '<div class="task-meta">No video uploaded.</div>'}</div>
-    <h3>Upload</h3>
-    <label>Upload full original video</label>
-    <input id="video-file" type="file" accept="video/*">
-    <button onclick="uploadVideo()" style="margin-top:6px">Upload Video</button>
-    <label>Upload full YOLO txt zip for current video</label>
-    <input id="labels-file" type="file" accept=".zip">
-    <button onclick="uploadLabels()" style="margin-top:6px">Upload YOLO Zip</button>
-    <h3>Split Current Video</h3>
-    <div class="row">
-      <input id="segment-length" type="number" value="300" min="1">
-      <select id="split-label-source">
-        <option value="input">Use uploaded YOLO labels</option>
-        <option value="locateanything">Use LocateAnything labels</option>
-        <option value="none">No labels</option>
-      </select>
-      <button onclick="splitCurrentVideo()">Split</button>
-    </div>
-    <h3>Pipeline</h3>
-    <div class="row">
-      <button class="primary" onclick="runLocany()">Run LocateAnything</button>
-      <button class="primary" onclick="runTracking()">Run Tracking</button>
-    </div>
-    <div class="row">
-      <button class="primary" onclick="runSegmentLocany()">Run Segment LocateAnything</button>
-      <button class="primary" onclick="runSegmentTracking()">Run Segment Tracking</button>
-    </div>
-    <div class="row">
-      <button onclick="makePackage()">Create Package</button>
-      <button onclick="downloadPackage()">Download Package</button>
-    </div>
-    <label>Upload reviewed tracking_results.json</label>
-    <input id="reviewed-file" type="file" accept=".json">
-    <div class="row">
-      <button onclick="uploadReviewed()">Upload Reviewed JSON</button>
-      <button onclick="exportYolo()">Export YOLO</button>
-    </div>
-    <div id="status"></div>
-    <h3>Events</h3>
-    <div id="events">${(selected.events || []).map(e => `[${e.time}] ${e.level}: ${escapeHtml(e.message)}`).join('<br>')}</div>
-  `;
-}
-
-async function saveTaskMeta() {
-  await api('PATCH', `/api/tasks/${selected.task_id}`, {
-    assignee: document.getElementById('edit-assignee').value.trim(),
-    prompt: document.getElementById('edit-prompt').value.trim(),
-    classes: document.getElementById('edit-classes').value.trim(),
-    notes: document.getElementById('edit-notes').value.trim(),
-  });
-  await loadDetail(selected.task_id);
-}
-
-async function deleteTask() {
-  if (!confirm(`Delete task ${selected.name}? The record will be hidden but files remain on disk.`)) return;
-  await api('DELETE', `/api/tasks/${selected.task_id}`);
-  selected = null;
-  document.getElementById('detail').textContent = 'Task deleted.';
-  await loadTasks({ refreshDetail: false });
-}
-
-async function uploadVideo() {
-  const file = document.getElementById('video-file').files[0];
-  if (!file) return alert('Choose a video first');
-  const form = new FormData();
-  form.append('file', file);
-  setStatus('Uploading video...');
-  await api('POST', `/api/tasks/${selected.task_id}/video`, form, true);
-  setStatus('Video uploaded');
-  await loadDetail(selected.task_id);
-}
-
-async function uploadLabels() {
-  const file = document.getElementById('labels-file').files[0];
-  if (!file) return alert('Choose a zip first');
-  const form = new FormData();
-  form.append('file', file);
-  setStatus('Uploading labels...');
-  await api('POST', `/api/tasks/${selected.task_id}/labels-zip`, form, true);
-  setStatus('Labels uploaded');
-  await loadDetail(selected.task_id);
-}
-
-async function splitCurrentVideo() {
-  const segmentLength = parseInt(document.getElementById('segment-length').value, 10);
-  if (!Number.isInteger(segmentLength) || segmentLength < 1) return alert('Set segment length >= 1');
-  await api('POST', `/api/tasks/${selected.task_id}/split-video`, {
-    segment_length: segmentLength,
-    label_source: document.getElementById('split-label-source').value,
-  });
-  setStatus('Split queued');
-}
-
-async function runLocany() {
-  setStatus('LocateAnything queued');
-  await api('POST', `/api/tasks/${selected.task_id}/run-locateanything`, { prompt: selected.prompt || 'person' });
-}
-
-async function runSegmentLocany() {
-  setStatus('Segment LocateAnything queued');
-  await api('POST', `/api/tasks/${selected.task_id}/run-segment-locateanything`, { prompt: selected.prompt || 'person' });
-}
-
-async function runTracking() {
-  setStatus('Tracking queued');
-  await api('POST', `/api/tasks/${selected.task_id}/run-tracking`, { label_source: 'auto', short_gap_max: 5 });
-}
-
-async function runSegmentTracking() {
-  setStatus('Segment tracking queued');
-  await api('POST', `/api/tasks/${selected.task_id}/run-segment-tracking`, { label_source: 'auto', short_gap_max: 5 });
-}
-
-async function makePackage() {
-  const r = await api('POST', `/api/tasks/${selected.task_id}/package`, { include_video: true });
-  setStatus(`Package created: ${r.package}`);
-  await loadDetail(selected.task_id);
-}
-
-function downloadPackage() {
-  window.location.href = `/api/tasks/${selected.task_id}/package/download`;
-}
-
-async function uploadReviewed() {
-  const file = document.getElementById('reviewed-file').files[0];
-  if (!file) return alert('Choose reviewed json first');
-  const form = new FormData();
-  form.append('file', file);
-  await api('POST', `/api/tasks/${selected.task_id}/reviewed`, form, true);
-  await loadDetail(selected.task_id);
-}
-
-async function exportYolo() {
-  const r = await api('POST', `/api/tasks/${selected.task_id}/export-yolo`, {});
-  setStatus(`YOLO exported: ${r.output_dir}`);
-  await loadDetail(selected.task_id);
-}
-
-loadTasks();
-refreshTimer = setInterval(() => loadTasks({ refreshDetail: false }), 5000);
+let tasks=[];let selected=null;let activeTab='overview';let refreshTimer=null;
+const statusLabels={created:'已创建',ready:'可领取',video_uploaded:'视频已上传',prelabel_ready:'预标注就绪',segmented:'已分段',needs_review:'待审核',reviewed:'已审核',deleted:'已删除',pending:'待领取',in_progress:'进行中',submitted:'待验收',rework:'返工',completed:'已完成'};
+const typeLabels={general:'通用标注',video_detection:'视频目标检测'};
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function actor(){return document.getElementById('actor').value.trim();}
+function requireActor(){const value=actor();if(!value)throw new Error('请先填写当前操作人');return value;}
+function saveActor(){localStorage.setItem('annotation_actor',actor());if(selected)renderDetail();renderTaskList();}
+async function api(method,url,body,form=false){const options={method};if(body!==undefined){if(form)options.body=body;else{options.headers={'Content-Type':'application/json'};options.body=JSON.stringify(body);}}const response=await fetch(url,options);if(!response.ok){let message=await response.text();try{message=JSON.parse(message).detail||message}catch{}throw new Error(message)}const type=response.headers.get('content-type')||'';return type.includes('json')?response.json():response;}
+function setStatus(message,error=false){const el=document.getElementById('statusline');if(el){el.textContent=message;el.style.color=error?'var(--danger)':'var(--muted)';}}
+function taskProgress(task){const s=task.part_summary||{};return s.total?Math.round((s.completed||0)*100/s.total):0;}
+async function loadTasks(selectId=null){const data=await api('GET','/api/tasks');tasks=data.tasks||[];renderTaskList();const id=selectId||(selected&&selected.task_id);if(id&&tasks.some(t=>t.task_id===id))await loadDetail(id);}
+function renderTaskList(){const filter=document.getElementById('task-filter').value;const me=actor();const rows=tasks.filter(t=>filter==='all'||filter===t.task_type||(filter==='mine'&&(t.publisher===me||t.manager===me||(t.annotators||[]).includes(me))));document.getElementById('task-list').innerHTML=rows.map(t=>{const p=taskProgress(t);return `<div class="task-item ${selected&&selected.task_id===t.task_id?'active':''}" onclick="loadDetail('${t.task_id}')"><div class="task-title">${esc(t.name)}</div><div class="meta">${esc(typeLabels[t.task_type]||t.task_type)} · 负责人 ${esc(t.manager||'未指定')}</div><div class="meta">Part ${(t.part_summary&&t.part_summary.completed)||0}/${(t.part_summary&&t.part_summary.total)||0}</div><div class="task-progress"><span style="width:${p}%"></span></div></div>`}).join('')||'<div class="empty" style="height:160px">暂无任务</div>';}
+function openCreate(){const me=actor();document.getElementById('new-publisher').value=me;document.getElementById('new-manager').value=me;document.getElementById('create-dialog').showModal();}
+function closeCreate(){document.getElementById('create-dialog').close();}
+function toggleCreateVideo(){document.getElementById('new-video-fields').classList.toggle('hidden',document.getElementById('new-type').value!=='video_detection');}
+async function createTask(){try{const payload={name:document.getElementById('new-name').value.trim(),task_type:document.getElementById('new-type').value,publisher:document.getElementById('new-publisher').value.trim(),manager:document.getElementById('new-manager').value.trim(),annotators:document.getElementById('new-annotators').value.trim(),instructions:document.getElementById('new-instructions').value.trim(),part_count:parseInt(document.getElementById('new-parts').value,10)||0,prompt:document.getElementById('new-prompt').value.trim()||'person',classes:document.getElementById('new-classes').value.trim()||'0 person'};if(!payload.name||!payload.publisher||!payload.manager)throw new Error('任务名称、发布人和负责人不能为空');const data=await api('POST','/api/tasks',payload);closeCreate();selected=data.task;await loadTasks(selected.task_id);}catch(e){alert(e.message)}}
+async function loadDetail(id){selected=await api('GET',`/api/tasks/${id}`);renderTaskList();renderDetail();}
+function isManager(){const me=actor();return selected&&(me===selected.manager||me===selected.publisher)}
+function isAnnotator(){return selected&&(selected.annotators||[]).includes(actor());}
+function renderDetail(){if(!selected)return;const s=selected.part_summary||{};const pct=s.total?Math.round((s.completed||0)*100/s.total):0;document.getElementById('main').innerHTML=`<div class="task-head"><div class="head-row"><div><h1>${esc(selected.name)}</h1><div class="badges"><span class="badge type">${esc(typeLabels[selected.task_type]||selected.task_type)}</span><span class="badge status">${esc(statusLabels[selected.status]||selected.status)}</span><span class="badge">发布人 ${esc(selected.publisher||'未指定')}</span><span class="badge">负责人 ${esc(selected.manager||'未指定')}</span></div></div><div class="head-stats"><div class="stat"><b>${s.completed||0}/${s.total||0}</b><span class="meta">Part 完成</span></div><div class="stat"><b>${pct}%</b><span class="meta">总体进度</span></div><div class="stat"><b>${(selected.issues||[]).filter(i=>i.status==='open').length}</b><span class="meta">未解决问题</span></div></div></div></div><nav class="tabs">${tabButton('overview','任务总览')}${tabButton('parts','Part 看板')}${tabButton('files','资料附件')}${tabButton('issues','问题排查')}${selected.task_type==='video_detection'?tabButton('video','视频预处理'):''}${tabButton('events','事件记录')}</nav><div id="content" class="content"></div>`;renderTab();}
+function tabButton(id,label){return `<button class="tab ${activeTab===id?'active':''}" onclick="switchTab('${id}')">${label}</button>`;}
+function switchTab(id){activeTab=id;renderDetail();}
+function renderTab(){const el=document.getElementById('content');if(activeTab==='overview')el.innerHTML=overviewHtml();if(activeTab==='parts')el.innerHTML=partsHtml();if(activeTab==='files')el.innerHTML=filesHtml();if(activeTab==='issues')el.innerHTML=issuesHtml();if(activeTab==='video')el.innerHTML=videoHtml();if(activeTab==='events')el.innerHTML=eventsHtml();}
+function overviewHtml(){return `<section class="section"><h2>任务说明</h2><div class="grid2"><div class="field"><label>发布人</label><input id="edit-publisher" value="${esc(selected.publisher)}"></div><div class="field"><label>负责人</label><input id="edit-manager" value="${esc(selected.manager)}"></div><div class="field"><label>标注员</label><input id="edit-annotators" value="${esc((selected.annotators||[]).join(', '))}"></div><div class="field"><label>任务类型</label><select id="edit-type"><option value="general" ${selected.task_type==='general'?'selected':''}>通用标注任务</option><option value="video_detection" ${selected.task_type==='video_detection'?'selected':''}>视频目标检测标注</option></select></div></div><div class="field" style="margin-top:12px"><label>说明</label><textarea id="edit-instructions" rows="7">${esc(selected.instructions||'')}</textarea></div><div class="actions"><button class="primary" onclick="saveTaskMeta()">保存任务信息</button><button class="danger" onclick="deleteTask()">删除任务</button></div></section><section class="section"><h2>参与人员</h2><div class="grid3"><div><div class="meta">发布人</div><b>${esc(selected.publisher||'未指定')}</b></div><div><div class="meta">负责人</div><b>${esc(selected.manager||'未指定')}</b></div><div><div class="meta">标注员</div><b>${esc((selected.annotators||[]).join('、')||'未指定')}</b></div></div></section>`;}
+async function saveTaskMeta(){try{if(!isManager())throw new Error('只有发布人或负责人可以修改任务');await api('PATCH',`/api/tasks/${selected.task_id}`,{actor:requireActor(),publisher:document.getElementById('edit-publisher').value.trim(),manager:document.getElementById('edit-manager').value.trim(),annotators:document.getElementById('edit-annotators').value.trim(),task_type:document.getElementById('edit-type').value,instructions:document.getElementById('edit-instructions').value.trim()});await loadTasks(selected.task_id);}catch(e){alert(e.message)}}
+async function deleteTask(){if(!isManager())return alert('只有发布人或负责人可以删除任务');if(!confirm(`删除任务“${selected.name}”？文件仍会保留。`))return;await api('DELETE',`/api/tasks/${selected.task_id}?actor=${encodeURIComponent(requireActor())}`);selected=null;document.getElementById('main').innerHTML='<div class="empty">任务已删除</div>';await loadTasks();}
+function summaryBox(label,value){return `<div><b>${value||0}</b><span class="meta">${label}</span></div>`;}
+function partsHtml(){const s=selected.part_summary||{};return `<section class="section"><div class="summary">${summaryBox('待领取',s.pending)}${summaryBox('标注中',s.in_progress)}${summaryBox('待验收',s.submitted)}${summaryBox('返工',s.rework)}${summaryBox('已完成',s.completed)}</div><div class="actions"><button class="primary" ${!isAnnotator()?'disabled':''} onclick="claimNext()">领取下一个 Part</button><button ${!isManager()?'disabled':''} onclick="addParts()">增加 Part</button></div><div id="statusline" class="statusline"></div></section><section class="section"><div class="table-wrap"><table><thead><tr><th>Part</th><th>状态</th><th>标注员</th><th>累计耗时</th><th>问题</th><th>操作</th></tr></thead><tbody>${(selected.parts||[]).map(partRow).join('')||'<tr><td colspan="6" class="meta">暂无 Part</td></tr>'}</tbody></table></div></section>`;}
+function partRow(p){const own=p.annotator===actor();let actions='';if(p.status==='in_progress'&&own)actions=`<button class="compact primary" onclick="submitPart(${p.part_id})">提交</button> <button class="compact" onclick="releasePart(${p.part_id})">释放</button>`;if(p.status==='rework'&&own)actions=`<button class="compact primary" onclick="startPart(${p.part_id})">开始返工</button>`;if(p.status==='submitted'&&isManager())actions=`<button class="compact primary" onclick="reviewPart(${p.part_id},'approve')">通过</button> <button class="compact danger" onclick="reviewPart(${p.part_id},'rework')">返工</button>`;actions+=` <button class="compact" onclick="reportIssue(${p.part_id})">报问题</button>`;return `<tr><td><b>${esc(p.name)}</b><div class="meta">${esc(p.instructions||'')}</div></td><td class="status-text status-${p.status}">${esc(statusLabels[p.status]||p.status)}</td><td>${esc(p.annotator||'—')}</td><td>${formatDuration(p.work_seconds)}</td><td>${p.open_issue_count||0}</td><td>${actions}</td></tr>`;}
+function formatDuration(sec){sec=Math.round(sec||0);const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60);return h?`${h}小时${m}分`:`${m}分钟`;}
+async function claimNext(){try{const r=await api('POST',`/api/tasks/${selected.task_id}/parts/claim-next`,{actor:requireActor()});setStatus(`已领取 ${r.part.name}`);await loadDetail(selected.task_id);}catch(e){setStatus(e.message,true)}}
+async function addParts(){const count=parseInt(prompt('新增 Part 数量','5'),10);if(!count)return;const prefix=prompt('Part 名称前缀','Part')||'Part';try{await api('POST',`/api/tasks/${selected.task_id}/parts`,{actor:requireActor(),count,name_prefix:prefix,instructions:selected.instructions||''});await loadDetail(selected.task_id);}catch(e){alert(e.message)}}
+async function startPart(id){try{await api('POST',`/api/tasks/${selected.task_id}/parts/${id}/start`,{actor:requireActor()});await loadDetail(selected.task_id);}catch(e){alert(e.message)}}
+async function submitPart(id){const note=prompt('提交说明','')??'';try{await api('POST',`/api/tasks/${selected.task_id}/parts/${id}/submit`,{actor:requireActor(),note});await loadDetail(selected.task_id);}catch(e){alert(e.message)}}
+async function releasePart(id){if(!confirm('释放后该 Part 会重新进入待领取队列。'))return;try{await api('POST',`/api/tasks/${selected.task_id}/parts/${id}/release`,{actor:requireActor()});await loadDetail(selected.task_id);}catch(e){alert(e.message)}}
+async function reviewPart(id,action){const note=prompt(action==='approve'?'验收备注':'返工要求','')??'';try{await api('POST',`/api/tasks/${selected.task_id}/parts/${id}/review`,{actor:requireActor(),action,note});await loadDetail(selected.task_id);}catch(e){alert(e.message)}}
+function filesHtml(){return `<section class="section"><h2>任务资料</h2><div class="grid3"><div class="field"><label>文件</label><input id="attachment-file" type="file"></div><div class="field"><label>关联 Part</label><select id="attachment-part"><option value="">整个任务</option>${(selected.parts||[]).map(p=>`<option value="${p.part_id}">${esc(p.name)}</option>`).join('')}</select></div><div class="actions" style="align-items:end"><button class="primary" onclick="uploadAttachment()">上传资料</button></div></div><div id="statusline" class="statusline"></div></section><section class="section">${(selected.attachments||[]).map(a=>`<div class="file-row"><div><b>${esc(a.filename)}</b><div class="meta">${esc(a.media_type)}</div></div><div>${formatBytes(a.size_bytes)}</div><div class="meta">${esc(a.uploaded_by)}<br>${esc(a.created_at)}</div><a href="/api/tasks/${selected.task_id}/attachments/${a.attachment_id}/download">下载</a></div>`).join('')||'<div class="meta">暂无资料</div>'}</section>`;}
+function formatBytes(n){if(n>1024*1024)return `${(n/1024/1024).toFixed(1)} MB`;if(n>1024)return `${(n/1024).toFixed(1)} KB`;return `${n||0} B`;}
+async function uploadAttachment(){try{const file=document.getElementById('attachment-file').files[0];if(!file)throw new Error('请选择文件');const form=new FormData();form.append('file',file);form.append('actor',requireActor());const part=document.getElementById('attachment-part').value;if(part)form.append('part_id',part);setStatus('正在上传…');await api('POST',`/api/tasks/${selected.task_id}/attachments`,form,true);await loadDetail(selected.task_id);}catch(e){setStatus(e.message,true)}}
+function issuesHtml(){return `<section class="section"><div class="actions"><button class="primary" onclick="reportIssue(null)">报告任务问题</button></div></section><section class="section">${(selected.issues||[]).map(i=>`<div class="issue-row"><span class="badge ${i.severity==='blocking'?'status':''}">${esc(i.severity)}</span><div><b>#${i.issue_id} ${esc(i.title)}</b><div class="meta">${esc(i.description)}</div>${i.resolution?`<div>${esc(i.resolution)}</div>`:''}</div><div>${i.part_id?'Part #'+i.part_id:'整个任务'}</div><div class="meta">${esc(i.reported_by)}<br>${esc(i.status)}</div>${i.status==='open'&&isManager()?`<button class="compact" onclick="resolveIssue(${i.issue_id})">解决</button>`:''}</div>`).join('')||'<div class="meta">暂无问题</div>'}</section>`;}
+async function reportIssue(partId){try{const title=prompt('问题标题');if(!title)return;const description=prompt('问题描述','')||'';const severity=prompt('严重程度：low / normal / high / blocking','normal')||'normal';await api('POST',`/api/tasks/${selected.task_id}/issues`,{actor:requireActor(),part_id:partId,title,description,severity});await loadDetail(selected.task_id);activeTab='issues';renderDetail();}catch(e){alert(e.message)}}
+async function resolveIssue(id){const resolution=prompt('处理结果');if(resolution===null)return;try{await api('POST',`/api/tasks/${selected.task_id}/issues/${id}/resolve`,{actor:requireActor(),resolution});await loadDetail(selected.task_id);}catch(e){alert(e.message)}}
+function eventsHtml(){return `<section class="section"><h2>最近事件</h2>${(selected.events||[]).slice().reverse().map(e=>`<div class="event-row"><span class="meta">${esc(e.time)}</span><span>${esc(e.level)}</span><span>${esc(e.message)}</span></div>`).join('')||'<div class="meta">暂无事件</div>'}</section>`;}
+function videoHtml(){const locked=!isManager();return `<section class="section">${locked?'<div class="notice">当前操作人不是该任务的发布人或负责人，视频预处理操作已锁定。</div>':''}<h2>视频与预标注</h2><div class="grid2"><div class="field"><label>上传完整视频</label><input id="video-file" type="file" accept="video/*"></div><div class="field"><label>上传完整 YOLO ZIP</label><input id="labels-file" type="file" accept=".zip"></div></div><div class="actions"><button ${locked?'disabled':''} onclick="uploadVideo()">上传视频</button><button ${locked?'disabled':''} onclick="uploadLabels()">上传 YOLO</button></div><div id="statusline" class="statusline"></div></section><section class="section"><h2>已上传视频</h2>${(selected.videos||[]).map(videoRow).join('')||'<div class="meta">暂无视频</div>'}</section><section class="section"><h2>负责人预处理</h2><div class="grid3"><div class="field"><label>分段帧数</label><input id="segment-length" type="number" min="1" value="300"></div><div class="field"><label>分段标注来源</label><select id="split-source"><option value="input">上传的 YOLO</option><option value="locateanything">LocateAnything</option><option value="none">无标注</option></select></div><div class="field"><label>短缺漏补全帧数</label><input id="gap-max" type="number" min="0" value="5"></div></div><div class="actions"><button ${locked?'disabled':''} onclick="splitVideo()">拆分当前视频</button><button ${locked?'disabled':''} onclick="runSegmentLocany()">分段 LocateAnything</button><button ${locked?'disabled':''} onclick="runSegmentTracking()">分段跟踪融合并补缺漏</button></div><div class="actions"><button ${locked?'disabled':''} onclick="runLocany()">整段 LocateAnything</button><button ${locked?'disabled':''} onclick="runTracking()">整段跟踪融合并补缺漏</button></div></section><section class="section"><h2>整段视频审核与导出</h2><div class="actions"><button ${locked?'disabled':''} onclick="makePackage()">生成标注包</button><button ${locked?'disabled':''} onclick="downloadPackage()">下载标注包</button></div><div class="grid2" style="margin-top:12px"><div class="field"><label>上传审核后的 tracking_results.json</label><input id="reviewed-file" type="file" accept=".json"></div><div class="actions"><button onclick="uploadReviewed()">上传审核结果</button><button ${locked?'disabled':''} onclick="exportYolo()">导出 YOLO</button></div></div></section>`;}
+function videoRow(v){const m=v.metadata||{};return `<div class="video-row"><div><b>${esc(v.name)}</b><div class="meta">${esc(v.video_id)}</div></div><div>${m.width||0}×${m.height||0}<div class="meta">${m.frame_count||0} 帧</div></div><div>${esc((v.split&&v.split.status)||'未分段')}<div class="meta">${(v.segments||[]).length} 个分段</div></div></div>${(v.segments||[]).map(s=>`<div class="video-segment"><b>${esc(s.segment_id)}</b> · ${s.start_frame}-${s.end_frame} · LocateAnything ${esc((s.locateanything&&s.locateanything.status)||'pending')} · 跟踪 ${esc((s.tracking&&s.tracking.status)||'pending')}</div>`).join('')}`;}
+async function uploadVideo(){try{const file=document.getElementById('video-file').files[0];if(!file)throw new Error('请选择视频');const form=new FormData();form.append('file',file);form.append('actor',requireActor());setStatus('正在上传视频…');await api('POST',`/api/tasks/${selected.task_id}/video`,form,true);await loadDetail(selected.task_id);}catch(e){setStatus(e.message,true)}}
+async function uploadLabels(){try{const file=document.getElementById('labels-file').files[0];if(!file)throw new Error('请选择 ZIP');const form=new FormData();form.append('file',file);form.append('actor',requireActor());await api('POST',`/api/tasks/${selected.task_id}/labels-zip`,form,true);await loadDetail(selected.task_id);}catch(e){setStatus(e.message,true)}}
+async function splitVideo(){try{await api('POST',`/api/tasks/${selected.task_id}/split-video`,{actor:requireActor(),segment_length:parseInt(document.getElementById('segment-length').value,10),label_source:document.getElementById('split-source').value});setStatus('分段任务已提交');}catch(e){setStatus(e.message,true)}}
+async function runLocany(){try{await api('POST',`/api/tasks/${selected.task_id}/run-locateanything`,{actor:requireActor(),prompt:selected.prompt||'person'});setStatus('整段 LocateAnything 已提交');}catch(e){setStatus(e.message,true)}}
+async function runSegmentLocany(){try{await api('POST',`/api/tasks/${selected.task_id}/run-segment-locateanything`,{actor:requireActor(),prompt:selected.prompt||'person'});setStatus('分段 LocateAnything 已提交');}catch(e){setStatus(e.message,true)}}
+async function runTracking(){try{await api('POST',`/api/tasks/${selected.task_id}/run-tracking`,{actor:requireActor(),label_source:'auto',short_gap_max:parseInt(document.getElementById('gap-max').value,10)||0});setStatus('整段跟踪已提交');}catch(e){setStatus(e.message,true)}}
+async function runSegmentTracking(){try{await api('POST',`/api/tasks/${selected.task_id}/run-segment-tracking`,{actor:requireActor(),label_source:'auto',short_gap_max:parseInt(document.getElementById('gap-max').value,10)||0});setStatus('分段跟踪已提交');}catch(e){setStatus(e.message,true)}}
+async function makePackage(){try{await api('POST',`/api/tasks/${selected.task_id}/package`,{actor:requireActor(),include_video:true});setStatus('标注包已生成');await loadDetail(selected.task_id);}catch(e){setStatus(e.message,true)}}
+function downloadPackage(){try{window.location.href=`/api/tasks/${selected.task_id}/package/download?actor=${encodeURIComponent(requireActor())}`}catch(e){alert(e.message)}}
+async function uploadReviewed(){try{const file=document.getElementById('reviewed-file').files[0];if(!file)throw new Error('请选择审核结果');const form=new FormData();form.append('file',file);form.append('actor',requireActor());await api('POST',`/api/tasks/${selected.task_id}/reviewed`,form,true);await loadDetail(selected.task_id);}catch(e){setStatus(e.message,true)}}
+async function exportYolo(){try{await api('POST',`/api/tasks/${selected.task_id}/export-yolo`,{actor:requireActor()});setStatus('YOLO 已导出');await loadDetail(selected.task_id);}catch(e){setStatus(e.message,true)}}
+document.getElementById('actor').value=localStorage.getItem('annotation_actor')||'';loadTasks();refreshTimer=setInterval(()=>{if(!document.hidden)loadTasks()},10000);
 </script>
 </body>
 </html>

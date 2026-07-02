@@ -14,6 +14,13 @@
 - `POST /api/tasks/{task_id}/run-segment-locateanything`
 - `POST /api/tasks/{task_id}/run-tracking`
 - `POST /api/tasks/{task_id}/run-segment-tracking`
+- `POST /api/tasks/{task_id}/parts`
+- `POST /api/tasks/{task_id}/parts/claim-next`
+- `POST /api/tasks/{task_id}/parts/{part_id}/start|submit|release|review`
+- `POST /api/tasks/{task_id}/attachments`
+- `GET /api/tasks/{task_id}/attachments/{attachment_id}/download`
+- `POST /api/tasks/{task_id}/issues`
+- `POST /api/tasks/{task_id}/issues/{issue_id}/resolve`
 - 同一任务路径下还提供标注包生成、审核结果上传和 YOLO 导出接口
 
 健康检查结果包含 SQLite 路径、数据结构版本、`quick_check` 结果、任务和事件数量，以及旧 JSON 迁移的成功与失败计数。

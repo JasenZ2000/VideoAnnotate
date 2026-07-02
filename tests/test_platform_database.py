@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -18,6 +19,11 @@ def sample_task(task_id: str = "task-1") -> dict:
         "prelabel_source": "locateanything",
         "prompt": "person",
         "status": "segmented",
+        "task_type": "video_detection",
+        "publisher": "publisher",
+        "manager": "manager",
+        "annotators": ["ann-a", "ann-b"],
+        "instructions": "任务说明",
         "deleted": False,
         "current_video_id": "video-1",
         "created_at": "2026-07-02T10:00:00+08:00",
@@ -83,6 +89,122 @@ class PlatformDatabaseTests(unittest.TestCase):
         self.assertEqual(loaded["videos"][0]["metadata"]["frame_count"], 300)
         self.assertEqual(loaded["videos"][0]["segments"][0]["tracking"]["status"], "done")
         self.assertEqual(loaded["custom_field"], {"preserved": True})
+        self.assertEqual(loaded["annotators"], ["ann-a", "ann-b"])
+        self.assertEqual(loaded["manager"], "manager")
+
+    def test_part_claim_rework_and_time_accounting(self) -> None:
+        self.db.save_task(sample_task())
+        self.db.create_parts("task-1", 2, "批次", "统一要求", "2026-07-02T10:00:00+08:00")
+
+        claimed = self.db.claim_next_part("task-1", "ann-a", "2026-07-02T10:01:00+08:00")
+        self.assertEqual(claimed["part_index"], 1)
+        submitted = self.db.submit_part(
+            "task-1", claimed["part_id"], "ann-a", "初次完成", "2026-07-02T10:11:00+08:00"
+        )
+        self.assertEqual(submitted["work_seconds"], 600)
+
+        rework = self.db.review_part(
+            "task-1", claimed["part_id"], "manager", "rework", "需要修正", "2026-07-02T10:12:00+08:00"
+        )
+        self.assertEqual(rework["status"], "rework")
+        self.db.start_part("task-1", claimed["part_id"], "ann-a", "2026-07-02T10:13:00+08:00")
+        submitted_again = self.db.submit_part(
+            "task-1", claimed["part_id"], "ann-a", "已修正", "2026-07-02T10:18:00+08:00"
+        )
+        self.assertEqual(submitted_again["work_seconds"], 900)
+        completed = self.db.review_part(
+            "task-1", claimed["part_id"], "publisher", "approve", "通过", "2026-07-02T10:20:00+08:00"
+        )
+        self.assertEqual(completed["status"], "completed")
+
+    def test_concurrent_claims_receive_different_parts(self) -> None:
+        self.db.save_task(sample_task())
+        self.db.create_parts("task-1", 2, "Part", "", "2026-07-02T10:00:00+08:00")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            claimed = list(executor.map(
+                lambda actor: self.db.claim_next_part(
+                    "task-1", actor, "2026-07-02T10:01:00+08:00"
+                ),
+                ["ann-a", "ann-b"],
+            ))
+        self.assertEqual({part["part_id"] for part in claimed}, {1, 2})
+
+    def test_non_annotator_cannot_claim_part(self) -> None:
+        self.db.save_task(sample_task())
+        self.db.create_parts("task-1", 1, "Part", "", "2026-07-02T10:00:00+08:00")
+        with self.assertRaises(PermissionError):
+            self.db.claim_next_part("task-1", "outsider", "2026-07-02T10:01:00+08:00")
+
+    def test_issue_lifecycle(self) -> None:
+        self.db.save_task(sample_task())
+        issue = self.db.create_issue({
+            "task_id": "task-1",
+            "reported_by": "ann-a",
+            "assigned_to": "manager",
+            "severity": "high",
+            "title": "说明不清楚",
+            "description": "类别边界需要确认",
+            "created_at": "2026-07-02T10:00:00+08:00",
+            "updated_at": "2026-07-02T10:00:00+08:00",
+        })
+        resolved = self.db.resolve_issue(
+            "task-1", issue["issue_id"], "manager", "已补充说明", "2026-07-02T10:10:00+08:00"
+        )
+        self.assertEqual(resolved["status"], "resolved")
+        self.assertEqual(resolved["resolution"], "已补充说明")
+
+    def test_attachment_metadata(self) -> None:
+        self.db.save_task(sample_task())
+        record = self.db.add_attachment({
+            "attachment_id": "file-1",
+            "task_id": "task-1",
+            "filename": "规范.pdf",
+            "stored_path": "D:/tasks/规范.pdf",
+            "media_type": "application/pdf",
+            "size_bytes": 1024,
+            "sha256": "a" * 64,
+            "uploaded_by": "publisher",
+            "created_at": "2026-07-02T10:00:00+08:00",
+        })
+        self.assertEqual(record["filename"], "规范.pdf")
+        self.assertEqual(self.db.list_attachments("task-1")[0]["sha256"], "a" * 64)
+
+    def test_version_one_database_is_upgraded_in_place(self) -> None:
+        path = self.root / "version-one.sqlite3"
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            """
+            CREATE TABLE tasks (
+                task_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                assignee TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                prelabel_source TEXT NOT NULL DEFAULT 'none',
+                prompt TEXT NOT NULL DEFAULT 'person',
+                status TEXT NOT NULL DEFAULT 'created',
+                deleted INTEGER NOT NULL DEFAULT 0,
+                current_video_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT,
+                extra_json TEXT NOT NULL DEFAULT '{}'
+            );
+            INSERT INTO tasks(
+                task_id, name, assignee, created_at, updated_at
+            ) VALUES ('old-task', '旧任务', '旧负责人', 't1', 't1');
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        upgraded = PlatformDatabase(path)
+        upgraded.initialize()
+        task = upgraded.load_task("old-task")
+
+        self.assertEqual(task["manager"], "旧负责人")
+        self.assertEqual(task["publisher"], "旧负责人")
+        self.assertEqual(task["task_type"], "general")
+        self.assertEqual(upgraded.health()["schema_version"], 2)
 
     def test_events_are_thread_safe_and_ordered(self) -> None:
         self.db.save_task(sample_task())
