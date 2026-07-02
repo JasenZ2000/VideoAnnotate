@@ -110,6 +110,7 @@ configs/               safe configuration examples
 requirements/          dependencies split by deployment role
 scripts/windows/       Windows launchers
 scripts/linux/         Linux launchers
+examples/              local samples and experiments (large data is ignored)
 docs/                  architecture, deployment and operations manuals
 tests/                 fast unit and project smoke tests
 ```

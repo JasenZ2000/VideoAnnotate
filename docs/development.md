@@ -20,6 +20,8 @@ python scripts/check-services.py --platform http://127.0.0.1:8088
 
 Use short synthetic videos and labels for integration testing; never commit recorded production data, task directories, credentials, model weights or generated archives.
 
+Keep local datasets and exploratory model trees under `examples/local-data/` so they do not clutter the repository root or enter Git accidentally.
+
 ## Change Boundaries
 
 - Put task orchestration in `workflow_platform/`.

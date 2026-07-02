@@ -29,8 +29,7 @@ configs/*.local.json
 *.engine
 
 # Sample workspaces and generated annotation outputs
-sampleInput*/
-annotation_test.json
+examples/local-data/
 clips/
 segments/
 tracking_results*.json
@@ -44,9 +43,6 @@ sam31_cache/
 locateanything_runs/
 locany_cache/
 platform_tasks/
-OPD_method_tests/
-vid1/
-vid2/
 
 # OS/editor noise
 .DS_Store
