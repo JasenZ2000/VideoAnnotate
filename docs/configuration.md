@@ -12,6 +12,10 @@
 
 平台按以下优先级选择配置：命令行 `--config`、环境变量 `ANNOTATION_PLATFORM_CONFIG`、根目录 `config.json`。Annotator 优先使用工作区内的 `config.json`；其项目级后备配置可通过 `ANNOTATOR_CONFIG` 覆盖。
 
+## 平台数据库
+
+平台默认把 SQLite 数据库保存为 `<tasks-dir>/platform.sqlite3`。可通过命令行 `--database` 或环境变量 `ANNOTATION_PLATFORM_DB` 指定其他位置。数据库应放在 Windows 公共机的本地可靠磁盘上，不建议直接放在不完整支持文件锁的网络共享目录中。
+
 ## 远端传输字段
 
 | 字段 | 含义 |

@@ -122,6 +122,7 @@ See `locateAnything/PROJECT_ADAPTERS.md` before updating that vendor tree.
 ## Documentation
 
 - [Architecture and boundaries](docs/architecture.md)
+- [平台现有功能与处理逻辑图](docs/platform-capabilities.md)
 - [Windows platform deployment](docs/deployment/windows-platform.md)
 - [Linux GPU service deployment](docs/deployment/gpu-services.md)
 - [Employee annotator setup](docs/deployment/windows-annotator.md)

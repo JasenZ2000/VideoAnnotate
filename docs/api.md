@@ -16,6 +16,8 @@
 - `POST /api/tasks/{task_id}/run-segment-tracking`
 - 同一任务路径下还提供标注包生成、审核结果上传和 YOLO 导出接口
 
+健康检查结果包含 SQLite 路径、数据结构版本、`quick_check` 结果、任务和事件数量，以及旧 JSON 迁移的成功与失败计数。
+
 ## LocateAnything
 
 - `GET /api/health`

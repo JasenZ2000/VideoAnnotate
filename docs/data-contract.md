@@ -3,30 +3,34 @@
 ## 平台任务目录
 
 ```text
-<tasks-dir>/<task-id>/
-  task.json
-  events.jsonl
-  videos/
-    <video-id>/
-      raw/
-      input_labels/
-      locany_labels/
-      segments/
-        seg_0000/
-          raw/
-          input_labels/
-          locany_labels/
-          tracking/
-          package/
-          reviewed/
-          exports/
-  tracking/    # 临时保留的整段视频兼容目录
-  package/     # 临时保留的整段视频兼容目录
-  reviewed/    # 临时保留的整段视频兼容目录
-  exports/     # 临时保留的整段视频兼容目录
+<tasks-dir>/
+  platform.sqlite3       # 任务、类别、阶段、视频、分段和事件元数据
+  platform.sqlite3-wal   # SQLite 运行期文件
+  platform.sqlite3-shm   # SQLite 运行期文件
+  <task-id>/
+    videos/
+      <video-id>/
+        raw/
+        input_labels/
+        locany_labels/
+        segments/
+          seg_0000/
+            raw/
+            input_labels/
+            locany_labels/
+            tracking/
+            package/
+            reviewed/
+            exports/
+    tracking/    # 临时保留的整段视频兼容目录
+    package/     # 临时保留的整段视频兼容目录
+    reviewed/    # 临时保留的整段视频兼容目录
+    exports/     # 临时保留的整段视频兼容目录
 ```
 
 各阶段产物必须分别保存，不应覆盖用户上传的源标注或已经审核的结果。
+
+数据库只保存元数据、文件路径和处理状态，不保存视频二进制或逐帧目标框。旧任务目录中的 `task.json` 与 `events.jsonl` 会被自动导入并原样保留；导出的标注包仍包含一份由数据库即时生成的 `task.json` 快照，供离线查看。
 
 ## YOLO 输入与输出
 

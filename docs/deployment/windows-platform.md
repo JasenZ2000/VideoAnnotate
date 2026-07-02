@@ -38,6 +38,7 @@ Copy-Item configs\platform.example.json configs\platform.local.json
 
 ```powershell
 $env:ANNOTATION_PLATFORM_TASKS_DIR="D:\annotation_tasks"
+$env:ANNOTATION_PLATFORM_DB="D:\annotation_tasks\platform.sqlite3"
 $env:ANNOTATION_PLATFORM_CONFIG="$PWD\configs\platform.local.json"
 .\scripts\windows\run-platform.bat
 ```
@@ -52,4 +53,4 @@ Invoke-RestMethod http://127.0.0.1:8088/api/health
 
 ## 备份
 
-备份完整任务根目录即可。当前 MVP 的每个任务都通过 `task.json`、事件记录和阶段产物自包含保存，不需要额外导出数据库。大文件上传或 ZIP 解压正在写入时不要直接复制备份；条件允许时优先使用卷快照。
+备份必须同时包含 SQLite 数据库和完整任务文件目录。最稳妥的方式是先停止平台服务，再复制整个任务根目录；在线备份应使用 SQLite 备份 API 或卷快照，不能只复制主数据库而漏掉运行中的 WAL 文件。大文件上传或 ZIP 解压正在写入时不要直接复制任务目录。

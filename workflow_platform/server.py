@@ -28,6 +28,7 @@ from annotator.state import AnnotationState
 from mot_pipeline.config import deep_update, load_config
 from mot_pipeline.pipeline import run_pipeline
 from mot_pipeline.utils.converters import export_tracking_results_to_yolo
+from workflow_platform.database import DEFAULT_STAGE_NAMES, PlatformDatabase
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -49,7 +50,11 @@ SETTINGS: dict[str, Any] = {
     "project_config": Path(
         os.environ.get("ANNOTATION_PLATFORM_CONFIG", PROJECT_ROOT / "config.json")
     ).resolve(),
+    "database_path": os.environ.get("ANNOTATION_PLATFORM_DB", ""),
 }
+_DATABASE: Optional[PlatformDatabase] = None
+_DATABASE_KEY = ""
+_DATABASE_LOCK = threading.Lock()
 
 
 class CreateTaskReq(BaseModel):
@@ -188,33 +193,48 @@ def tasks_dir() -> Path:
     return path
 
 
+def database_path() -> Path:
+    configured = str(SETTINGS.get("database_path", "")).strip()
+    return Path(configured).expanduser().resolve() if configured else tasks_dir() / "platform.sqlite3"
+
+
+def database() -> PlatformDatabase:
+    global _DATABASE, _DATABASE_KEY
+    path = database_path()
+    key = str(path)
+    if _DATABASE is not None and _DATABASE_KEY == key:
+        return _DATABASE
+    with _DATABASE_LOCK:
+        if _DATABASE is None or _DATABASE_KEY != key:
+            store = PlatformDatabase(path)
+            store.initialize()
+            SETTINGS["legacy_migration"] = store.migrate_legacy_directory(tasks_dir())
+            _DATABASE = store
+            _DATABASE_KEY = key
+    return _DATABASE
+
+
 def task_dir(task_id: str) -> Path:
     path = tasks_dir() / task_id
-    if not path.is_dir():
+    if not path.is_dir() or not database().task_exists(task_id):
         raise HTTPException(404, f"Task not found: {task_id}")
     return path
 
 
-def task_json_path(path: Path) -> Path:
-    return path / "task.json"
-
-
 def load_task(path: Path) -> dict[str, Any]:
-    with open(task_json_path(path), "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        return database().load_task(path.name)
+    except KeyError as exc:
+        raise HTTPException(404, f"Task not found: {path.name}") from exc
 
 
 def save_task(path: Path, payload: dict[str, Any]) -> None:
     payload["updated_at"] = now_iso()
-    with open(task_json_path(path), "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    database().save_task(payload)
 
 
 def append_event(path: Path, message: str, level: str = "info") -> None:
-    event = {"time": now_iso(), "level": level, "message": message}
-    with open(path / "events.jsonl", "a", encoding="utf-8") as f:
-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    database().add_event(path.name, now_iso(), level, message)
 
 
 def set_stage(path: Path, stage: str, status: str, message: str = "") -> None:
@@ -253,6 +273,9 @@ def ensure_task_shape(task: dict[str, Any]) -> dict[str, Any]:
     task.setdefault("notes", "")
     if not task.get("classes"):
         task["classes"] = [{"id": 0, "name": task.get("prompt") or "person"}]
+    stages = task.setdefault("stages", {})
+    for stage in DEFAULT_STAGE_NAMES:
+        stages.setdefault(stage, {"status": "pending", "message": ""})
     task["classes_text"] = classes_to_text(task.get("classes", []))
     return task
 
@@ -282,8 +305,7 @@ def current_video_root(path: Path, task: Optional[dict[str, Any]] = None) -> Opt
 
 
 def find_video(path: Path, video_id: Optional[str] = None) -> Optional[Path]:
-    task_path = task_json_path(path)
-    if task_path.exists():
+    if database().task_exists(path.name):
         task = load_task(path)
         video = video_record(task, video_id)
         if video:
@@ -912,9 +934,14 @@ def build_package(task_id: str, include_video: bool) -> Path:
     if not tracking_json.exists():
         raise HTTPException(400, "tracking_results.json does not exist")
     package_path = path / "package" / f"{task_id}_annotation_package.zip"
+    task_snapshot = path / "package" / "task.json"
+    task_snapshot.write_text(
+        json.dumps(ensure_task_shape(load_task(path)), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     items: list[tuple[Path, Path]] = [
         (tracking_json, Path("tracking_results.json")),
-        (path / "task.json", Path("task.json")),
+        (task_snapshot, Path("task.json")),
     ]
     overview = path / "tracking" / "tracking_overview.mp4"
     if overview.exists():
@@ -933,24 +960,20 @@ async def index():
 
 @app.get("/api/health")
 async def health():
+    db_health = database().health()
     return {
         "ok": True,
         "service": "annotation-platform",
         "tasks_dir": str(SETTINGS["tasks_dir"]),
         "config": str(SETTINGS["project_config"]),
+        "database": db_health,
+        "legacy_migration": SETTINGS.get("legacy_migration", {"tasks": 0, "events": 0, "failed": 0}),
     }
 
 
 @app.get("/api/tasks")
 async def list_tasks(include_deleted: bool = False):
-    by_id: dict[str, dict[str, Any]] = {}
-    for path in sorted(tasks_dir().iterdir(), reverse=True):
-        if path.is_dir() and task_json_path(path).exists():
-            task = ensure_task_shape(load_task(path))
-            if task.get("deleted") and not include_deleted:
-                continue
-            by_id[str(task["task_id"])] = task
-    rows = sorted(by_id.values(), key=lambda item: item.get("updated_at", ""), reverse=True)
+    rows = [ensure_task_shape(task) for task in database().list_tasks(include_deleted)]
     return {"tasks": rows}
 
 
@@ -1024,12 +1047,7 @@ async def delete_task(task_id: str):
 async def get_task(task_id: str):
     path = task_dir(task_id)
     task = ensure_task_shape(load_task(path))
-    events = []
-    event_path = path / "events.jsonl"
-    if event_path.exists():
-        with open(event_path, "r", encoding="utf-8") as f:
-            events = [json.loads(line) for line in f if line.strip()][-100:]
-    task["events"] = events
+    task["events"] = database().list_events(task_id, limit=100)
     return task
 
 
@@ -1223,11 +1241,19 @@ def main(argv: Optional[list[str]] = None) -> None:
         type=Path,
         default=Path(os.environ.get("ANNOTATION_PLATFORM_CONFIG", PROJECT_ROOT / "config.json")),
     )
+    parser.add_argument(
+        "--database",
+        type=Path,
+        default=Path(os.environ["ANNOTATION_PLATFORM_DB"]) if os.environ.get("ANNOTATION_PLATFORM_DB") else None,
+        help="SQLite database path. Defaults to <tasks-dir>/platform.sqlite3.",
+    )
     args = parser.parse_args(argv)
 
     SETTINGS["tasks_dir"] = args.tasks_dir.expanduser().resolve()
     SETTINGS["project_config"] = args.config.expanduser().resolve()
+    SETTINGS["database_path"] = str(args.database.expanduser().resolve()) if args.database else ""
     tasks_dir()
+    database()
 
     import uvicorn
 
