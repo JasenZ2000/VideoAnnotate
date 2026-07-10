@@ -1,0 +1,696 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Training Frame Sampler</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --panel-soft: #1f2937;
+      --line: #2f3947;
+      --text: #edf2f7;
+      --muted: #8b9bb2;
+      --accent: #f59e0b;
+      --accent-2: #22c55e;
+      --danger: #ef4444;
+      --shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
+      --radius: 18px;
+      --mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+      --sans: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(245, 158, 11, 0.18), transparent 28%),
+        radial-gradient(circle at top right, rgba(34, 197, 94, 0.12), transparent 22%),
+        linear-gradient(180deg, #0d1117 0%, #111827 100%);
+    }
+    .page {
+      max-width: 1360px;
+      margin: 0 auto;
+      padding: 28px 20px 48px;
+    }
+    .hero {
+      display: grid;
+      grid-template-columns: 1.3fr 0.7fr;
+      gap: 20px;
+      margin-bottom: 20px;
+    }
+    .card {
+      background: rgba(22, 27, 34, 0.92);
+      border: 1px solid rgba(255,255,255,0.08);
+      box-shadow: var(--shadow);
+      border-radius: var(--radius);
+      padding: 18px;
+      backdrop-filter: blur(8px);
+    }
+    h1, h2, h3 { margin: 0 0 12px; }
+    h1 {
+      font-size: clamp(28px, 4vw, 44px);
+      line-height: 1.02;
+      letter-spacing: -0.04em;
+    }
+    .subtitle {
+      color: var(--muted);
+      line-height: 1.6;
+      margin-bottom: 16px;
+      max-width: 760px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 20px;
+    }
+    .stack { display: grid; gap: 16px; }
+    .toolbar, .actions, .field-grid, .stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    .field-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .field, .wide-field {
+      display: grid;
+      gap: 6px;
+    }
+    .wide-field { grid-column: span 2; }
+    label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    input, button {
+      font: inherit;
+    }
+    input[type="text"], input[type="number"] {
+      width: 100%;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: #0f172a;
+      color: var(--text);
+      padding: 10px 12px;
+      min-height: 42px;
+    }
+    input[type="checkbox"] {
+      transform: scale(1.15);
+    }
+    button {
+      border: 0;
+      border-radius: 12px;
+      padding: 10px 14px;
+      background: #263242;
+      color: var(--text);
+      cursor: pointer;
+      transition: transform .15s ease, background .15s ease, opacity .15s ease;
+    }
+    button:hover { transform: translateY(-1px); background: #334155; }
+    button.primary { background: linear-gradient(135deg, #f59e0b, #ea580c); }
+    button.good { background: linear-gradient(135deg, #22c55e, #15803d); }
+    button.ghost { background: transparent; border: 1px solid var(--line); }
+    button.danger { background: linear-gradient(135deg, #ef4444, #991b1b); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
+    .status {
+      min-height: 24px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .status.error { color: #fca5a5; }
+    .status.ok { color: #86efac; }
+    .viewer-shell {
+      position: relative;
+      border-radius: 16px;
+      overflow: hidden;
+      background: #020617;
+      border: 1px solid rgba(255,255,255,0.08);
+      min-height: 420px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .viewer-shell img {
+      display: block;
+      max-width: 100%;
+      width: 100%;
+      height: auto;
+      object-fit: contain;
+      background: #020617;
+    }
+    .overlay-badge {
+      position: absolute;
+      left: 14px;
+      bottom: 14px;
+      background: rgba(2, 6, 23, 0.78);
+      border: 1px solid rgba(255,255,255,0.08);
+      padding: 10px 12px;
+      border-radius: 12px;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .range {
+      width: 100%;
+    }
+    .stats {
+      gap: 12px;
+    }
+    .stat {
+      background: #0f172a;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+      min-width: 130px;
+    }
+    .stat .k {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 6px;
+    }
+    .stat .v {
+      font-size: 18px;
+      font-weight: 600;
+    }
+    .segments {
+      display: grid;
+      gap: 10px;
+      max-height: 420px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+    .segment {
+      background: linear-gradient(180deg, rgba(31,41,55,0.95), rgba(15,23,42,0.95));
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 14px;
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+    .segment.active {
+      border-color: rgba(245, 158, 11, 0.7);
+      box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.25) inset;
+    }
+    .segment-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+    }
+    .segment-note {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .timeline {
+      position: relative;
+      height: 18px;
+      border-radius: 999px;
+      background: #0f172a;
+      border: 1px solid var(--line);
+      overflow: hidden;
+    }
+    .timeline-segment {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      background: linear-gradient(135deg, rgba(245,158,11,0.88), rgba(34,197,94,0.75));
+    }
+    .timeline-playhead {
+      position: absolute;
+      top: -2px;
+      bottom: -2px;
+      width: 2px;
+      background: #fff;
+      box-shadow: 0 0 0 2px rgba(255,255,255,0.25);
+    }
+    .mono { font-family: var(--mono); }
+    .meta {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    @media (max-width: 980px) {
+      .hero, .grid { grid-template-columns: 1fr; }
+      .field-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 680px) {
+      .page { padding-inline: 14px; }
+      .field-grid { grid-template-columns: 1fr; }
+      .wide-field { grid-column: span 1; }
+      .viewer-shell { min-height: 260px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="hero">
+      <div class="card">
+        <h1>训练帧采样器</h1>
+        <div class="subtitle">
+          用观看视频的方式决定哪段该密集采样、哪段该稀疏采样，再直接结合 <span class="mono">tracking_results.json</span> 导出 YOLO 训练数据集。
+        </div>
+        <div class="field-grid">
+          <div class="wide-field">
+            <label>工作目录</label>
+            <input id="workspace-path" type="text" placeholder="D:\path\to\workspace">
+          </div>
+          <div class="wide-field">
+            <label>可选：tracking_results.json 路径</label>
+            <input id="tracking-path" type="text" placeholder="留空则默认读取工作目录下 tracking_results.json">
+          </div>
+        </div>
+        <div class="actions" style="margin-top:12px">
+          <button class="primary" onclick="openWorkspace()">打开工作目录</button>
+          <button class="ghost" onclick="reloadState()">刷新状态</button>
+        </div>
+      </div>
+      <div class="card">
+        <h2>使用方式</h2>
+        <div class="meta">
+          1. 打开含有视频和 <span class="mono">tracking_results.json</span> 的目录。<br>
+          2. 播放视频，看到动作密集或场景变化快的段落，就新增一个更小的采样间隔。<br>
+          3. 默认间隔负责“全局稀疏”，区间间隔负责“局部加密”。<br>
+          4. 导出后会生成 <span class="mono">images/</span>、<span class="mono">labels/</span> 和采样计划文件。
+        </div>
+      </div>
+    </section>
+
+    <div class="grid">
+      <section class="stack">
+        <div class="card">
+          <div class="viewer-shell">
+            <img id="frame-img" alt="frame preview">
+            <div class="overlay-badge" id="frame-badge">Frame --</div>
+          </div>
+          <div class="toolbar" style="margin-top:14px">
+            <button onclick="stepFrame(-1)">上一帧</button>
+            <button class="primary" id="play-btn" onclick="togglePlay()">播放</button>
+            <button onclick="stepFrame(1)">下一帧</button>
+            <button onclick="setRangeStartFromCurrent()">当前帧设为开始</button>
+            <button onclick="setRangeEndFromCurrent()">当前帧设为结束</button>
+          </div>
+          <div style="margin-top:12px">
+            <input id="frame-slider" class="range" type="range" min="0" max="1" value="0" step="1">
+          </div>
+          <div class="meta" id="video-meta" style="margin-top:10px">尚未打开工作目录</div>
+        </div>
+
+        <div class="card">
+          <h2>采样规则</h2>
+          <div class="field-grid">
+            <div class="field">
+              <label>默认间隔</label>
+              <input id="default-interval" type="number" min="0" value="30">
+            </div>
+            <div class="field">
+              <label>导出文件前缀</label>
+              <input id="file-prefix" type="text" value="frame">
+            </div>
+            <div class="field">
+              <label>区间开始帧</label>
+              <input id="segment-start" type="number" min="0" value="0">
+            </div>
+            <div class="field">
+              <label>区间结束帧</label>
+              <input id="segment-end" type="number" min="0" value="0">
+            </div>
+            <div class="field">
+              <label>区间间隔</label>
+              <input id="segment-interval" type="number" min="1" value="5">
+            </div>
+            <div class="wide-field">
+              <label>区间备注</label>
+              <input id="segment-label" type="text" placeholder="例如：交互密集 / 镜头切换 / 夜间稀疏">
+            </div>
+          </div>
+          <div class="actions" style="margin-top:12px">
+            <button class="good" onclick="addSegment()">新增区间</button>
+            <button onclick="applyPreset(2)">超密集</button>
+            <button onclick="applyPreset(5)">密集</button>
+            <button onclick="applyPreset(15)">稀疏</button>
+            <button class="ghost" onclick="savePlan()">保存采样计划</button>
+          </div>
+          <div class="actions" style="margin-top:10px">
+            <label style="display:flex; align-items:center; gap:10px; color:var(--text); text-transform:none; letter-spacing:0;">
+              <input id="include-empty" type="checkbox" checked>
+              保留没有目标框的采样帧（负样本）
+            </label>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>导出</h2>
+          <div class="field-grid">
+            <div class="wide-field">
+              <label>输出目录</label>
+              <input id="output-dir" type="text" placeholder="留空则输出到工作目录/sampled_yoloset">
+            </div>
+            <div class="field">
+              <label>JPG 质量</label>
+              <input id="image-quality" type="number" min="50" max="100" value="95">
+            </div>
+          </div>
+          <div class="actions" style="margin-top:12px">
+            <button class="primary" onclick="exportDataset()">导出 YOLO 数据集</button>
+          </div>
+          <div class="meta" id="export-meta" style="margin-top:10px"></div>
+        </div>
+      </section>
+
+      <aside class="stack">
+        <div class="card">
+          <h2>采样总览</h2>
+          <div class="stats" id="stats"></div>
+          <div class="timeline" style="margin-top:14px">
+            <div id="timeline-layer"></div>
+            <div id="timeline-playhead" class="timeline-playhead" style="left:0%"></div>
+          </div>
+          <div class="meta" style="margin-top:10px" id="plan-summary"></div>
+        </div>
+
+        <div class="card">
+          <div class="segment-title">
+            <h2>区间列表</h2>
+            <button class="danger" onclick="clearSegments()">清空</button>
+          </div>
+          <div class="segments" id="segments"></div>
+        </div>
+
+        <div class="card">
+          <h3>状态</h3>
+          <div class="status" id="status"></div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script>
+    const frameImg = document.getElementById('frame-img');
+    const frameSlider = document.getElementById('frame-slider');
+    const frameBadge = document.getElementById('frame-badge');
+    const playBtn = document.getElementById('play-btn');
+    const statusEl = document.getElementById('status');
+    const segmentsEl = document.getElementById('segments');
+    const statsEl = document.getElementById('stats');
+    const timelineLayer = document.getElementById('timeline-layer');
+    const timelinePlayhead = document.getElementById('timeline-playhead');
+    const exportMeta = document.getElementById('export-meta');
+    const planSummary = document.getElementById('plan-summary');
+    const videoMeta = document.getElementById('video-meta');
+
+    let appState = null;
+    let currentFrame = 0;
+    let playing = false;
+    let timer = null;
+
+    function appUrl(path) {
+      return path.startsWith('/') ? `.${path}` : path;
+    }
+
+    async function api(method, path, body) {
+      const resp = await fetch(appUrl(path), {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.detail || `${resp.status} ${resp.statusText}`);
+      return data;
+    }
+
+    function setStatus(message, isError = false) {
+      statusEl.textContent = message || '';
+      statusEl.className = `status${message ? isError ? ' error' : ' ok' : ''}`;
+    }
+
+    function getPlanPayload() {
+      return {
+        default_interval: parseInt(document.getElementById('default-interval').value || '0', 10),
+        include_empty_frames: document.getElementById('include-empty').checked,
+        file_prefix: (document.getElementById('file-prefix').value || 'frame').trim() || 'frame',
+        output_dir: (document.getElementById('output-dir').value || '').trim() || null,
+        segments: (appState?.plan?.segments || []).map(segment => ({
+          start_frame: segment.start_frame,
+          end_frame: segment.end_frame,
+          interval: segment.interval,
+          label: segment.label || '',
+        })),
+      };
+    }
+
+    async function openWorkspace() {
+      const path = document.getElementById('workspace-path').value.trim();
+      const trackingPath = document.getElementById('tracking-path').value.trim();
+      if (!path) {
+        setStatus('请先输入工作目录。', true);
+        return;
+      }
+      try {
+        setStatus('正在打开工作目录...');
+        appState = await api('POST', '/api/open-workspace', {
+          path,
+          tracking_path: trackingPath || null,
+        });
+        hydrateControls();
+        seekToFrame(0);
+        setStatus('工作目录已打开。');
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    }
+
+    async function reloadState() {
+      try {
+        appState = await api('GET', '/api/state');
+        hydrateControls();
+        seekToFrame(Math.min(currentFrame, appState.frame_count - 1));
+        setStatus('状态已刷新。');
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    }
+
+    function hydrateControls() {
+      if (!appState) return;
+      document.getElementById('default-interval').value = appState.plan.default_interval;
+      document.getElementById('include-empty').checked = appState.plan.include_empty_frames;
+      document.getElementById('file-prefix').value = appState.plan.file_prefix || 'frame';
+      document.getElementById('output-dir').value = appState.output_dir || '';
+      frameSlider.max = Math.max(0, appState.frame_count - 1);
+      frameSlider.value = Math.min(currentFrame, appState.frame_count - 1);
+      videoMeta.innerHTML = `
+        <span class="mono">${appState.video_path}</span><br>
+        ${appState.width} x ${appState.height} · ${appState.fps.toFixed(2)} FPS · ${appState.frame_count} frames · ${appState.num_tracks} tracks
+      `;
+      renderPlan();
+    }
+
+    function stopPlay() {
+      playing = false;
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      playBtn.textContent = '播放';
+    }
+
+    function togglePlay() {
+      if (!appState) return;
+      if (playing) {
+        stopPlay();
+        return;
+      }
+      playing = true;
+      playBtn.textContent = '暂停';
+      const fps = Math.max(1, Math.min(appState.fps || 10, 25));
+      timer = setInterval(() => {
+        if (!appState) return;
+        if (currentFrame >= appState.frame_count - 1) {
+          stopPlay();
+          return;
+        }
+        seekToFrame(currentFrame + 1);
+      }, 1000 / fps);
+    }
+
+    function stepFrame(delta) {
+      if (!appState) return;
+      stopPlay();
+      seekToFrame(currentFrame + delta);
+    }
+
+    function seekToFrame(frameIdx) {
+      if (!appState) return;
+      currentFrame = Math.max(0, Math.min(appState.frame_count - 1, frameIdx));
+      frameSlider.value = currentFrame;
+      frameImg.src = appUrl(`/api/frame-image/${currentFrame}?v=${appState.version}&ts=${Date.now()}`);
+      frameBadge.textContent = `Frame ${currentFrame} / ${appState.frame_count - 1}`;
+      updatePlayhead();
+      highlightActiveSegment();
+    }
+
+    function updatePlayhead() {
+      if (!appState || appState.frame_count <= 1) return;
+      timelinePlayhead.style.left = `${(currentFrame / (appState.frame_count - 1)) * 100}%`;
+    }
+
+    function setRangeStartFromCurrent() {
+      document.getElementById('segment-start').value = currentFrame;
+    }
+
+    function setRangeEndFromCurrent() {
+      document.getElementById('segment-end').value = currentFrame;
+    }
+
+    function applyPreset(interval) {
+      document.getElementById('segment-interval').value = interval;
+    }
+
+    function addSegment() {
+      if (!appState) {
+        setStatus('请先打开工作目录。', true);
+        return;
+      }
+      const startFrame = parseInt(document.getElementById('segment-start').value || '0', 10);
+      const endFrame = parseInt(document.getElementById('segment-end').value || '0', 10);
+      const interval = parseInt(document.getElementById('segment-interval').value || '1', 10);
+      const label = document.getElementById('segment-label').value.trim();
+      const next = [...(appState.plan.segments || []), { start_frame: startFrame, end_frame: endFrame, interval, label }];
+      appState.plan.segments = next.sort((a, b) => a.start_frame - b.start_frame || a.end_frame - b.end_frame);
+      renderPlan();
+      setStatus('区间已加入，记得保存或直接导出。');
+    }
+
+    function removeSegment(index) {
+      appState.plan.segments.splice(index, 1);
+      renderPlan();
+      setStatus('区间已删除。');
+    }
+
+    function clearSegments() {
+      if (!appState) return;
+      appState.plan.segments = [];
+      renderPlan();
+      setStatus('所有区间已清空。');
+    }
+
+    async function savePlan() {
+      if (!appState) return;
+      try {
+        setStatus('正在保存采样计划...');
+        const payload = getPlanPayload();
+        appState = await api('POST', '/api/plan', payload);
+        hydrateControls();
+        setStatus('采样计划已保存。');
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    }
+
+    async function exportDataset() {
+      if (!appState) return;
+      try {
+        setStatus('正在导出 YOLO 数据集...');
+        const payload = {
+          ...getPlanPayload(),
+          image_quality: parseInt(document.getElementById('image-quality').value || '95', 10),
+        };
+        appState = await api('POST', '/api/export', payload);
+        hydrateControls();
+        const exported = appState.export;
+        exportMeta.innerHTML = `
+          输出目录：<span class="mono">${exported.output_dir}</span><br>
+          已选帧：${exported.selected_frames}，已导出图片：${exported.frames_exported}，其中含标注帧：${exported.frames_with_annotations}
+        `;
+        setStatus('导出完成。');
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    }
+
+    function highlightActiveSegment() {
+      const cards = [...segmentsEl.querySelectorAll('.segment')];
+      cards.forEach((card, index) => {
+        const segment = appState?.plan?.segments?.[index];
+        const active = !!segment && currentFrame >= segment.start_frame && currentFrame <= segment.end_frame;
+        card.classList.toggle('active', active);
+      });
+    }
+
+    function renderPlan() {
+      if (!appState) return;
+      const segments = appState.plan.segments || [];
+      segmentsEl.innerHTML = '';
+      timelineLayer.innerHTML = '';
+
+      for (const [index, segment] of segments.entries()) {
+        const card = document.createElement('div');
+        card.className = 'segment';
+        card.innerHTML = `
+          <div class="segment-title">
+            <strong>${segment.label || `区间 ${index + 1}`}</strong>
+            <button class="danger" onclick="removeSegment(${index})">删除</button>
+          </div>
+          <div class="segment-note">
+            ${segment.start_frame} - ${segment.end_frame}，每 ${segment.interval} 帧取一张
+          </div>
+        `;
+        segmentsEl.appendChild(card);
+
+        const block = document.createElement('div');
+        block.className = 'timeline-segment';
+        const total = Math.max(1, appState.frame_count - 1);
+        block.style.left = `${(segment.start_frame / total) * 100}%`;
+        block.style.width = `${((segment.end_frame - segment.start_frame + 1) / total) * 100}%`;
+        timelineLayer.appendChild(block);
+      }
+
+      const estimatedFrames = estimateSelectedFrames();
+      statsEl.innerHTML = `
+        <div class="stat"><span class="k">默认间隔</span><span class="v">${document.getElementById('default-interval').value || 0}</span></div>
+        <div class="stat"><span class="k">区间数量</span><span class="v">${segments.length}</span></div>
+        <div class="stat"><span class="k">预计导出帧</span><span class="v">${estimatedFrames}</span></div>
+      `;
+      planSummary.innerHTML = estimatedFrames > 0
+        ? `预计会导出 <strong>${estimatedFrames}</strong> 帧。默认间隔负责全局抽样，区间间隔覆盖局部密集段。`
+        : '当前规则不会导出任何帧。可以设置默认间隔，或至少添加一个区间。';
+      highlightActiveSegment();
+    }
+
+    function estimateSelectedFrames() {
+      if (!appState) return 0;
+      const frameCount = appState.frame_count;
+      const defaultInterval = parseInt(document.getElementById('default-interval').value || '0', 10);
+      const frames = new Set();
+      const segments = appState.plan.segments || [];
+
+      if (defaultInterval > 0) {
+        for (let idx = 0; idx < frameCount; idx += defaultInterval) {
+          const covered = segments.some(seg => idx >= seg.start_frame && idx <= seg.end_frame);
+          if (!covered) frames.add(idx);
+        }
+      }
+      for (const seg of segments) {
+        for (let idx = seg.start_frame; idx <= seg.end_frame; idx += seg.interval) {
+          frames.add(idx);
+        }
+        frames.add(seg.end_frame);
+      }
+      return frames.size;
+    }
+
+    frameSlider.addEventListener('input', () => {
+      if (!appState) return;
+      stopPlay();
+      seekToFrame(parseInt(frameSlider.value, 10));
+    });
+  </script>
+</body>
+</html>

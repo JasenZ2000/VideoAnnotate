@@ -1,0 +1,1287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Video Annotator</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Segoe UI', monospace; background: #1a1a1a; color: #e0e0e0; padding: 10px; }
+button { cursor: pointer; padding: 4px 10px; border: 1px solid #555; background: #333; color: #e0e0e0; border-radius: 3px; font-size: 12px; }
+button:hover { background: #444; }
+button.primary { background: #2563eb; border-color: #2563eb; color: white; }
+button.primary:hover { background: #1d4ed8; }
+button.danger { background: #dc2626; border-color: #dc2626; color: white; }
+input, select { padding: 4px 8px; border: 1px solid #555; background: #2a2a2a; color: #e0e0e0; border-radius: 3px; font-size: 12px; }
+label { font-size: 11px; color: #aaa; display: block; margin-bottom: 2px; }
+.row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.panel { background: #222; border: 1px solid #333; border-radius: 4px; padding: 10px; }
+dialog { width: min(720px, calc(100vw - 32px)); max-height: calc(100vh - 40px); margin: auto; border: 1px solid #555; border-radius: 6px; background: #202020; color: #e0e0e0; padding: 0; }
+dialog::backdrop { background: rgba(0,0,0,.72); }
+.dialog-head, .dialog-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 16px; border-bottom: 1px solid #3a3a3a; }
+.dialog-head h2 { font-size: 16px; font-weight: 600; }
+.dialog-body { padding: 16px; overflow: auto; }
+.dialog-foot { justify-content: flex-end; border-top: 1px solid #3a3a3a; border-bottom: 0; }
+.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; }
+.settings-field input, .settings-field select { width: 100%; }
+.settings-field.wide { grid-column: 1 / -1; }
+.settings-note { margin-top: 10px; color: #999; font-size: 11px; line-height: 1.5; }
+
+#main { display: flex; gap: 10px; margin-bottom: 10px; }
+#canvas-wrap { position: relative; flex: 1; background: #000; border-radius: 4px; overflow: hidden; line-height: 0; }
+#canvas-wrap img { width: 100%; display: block; user-select: none; -webkit-user-drag: none; }
+#canvas-wrap canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; cursor: crosshair; }
+#sidebar { width: 230px; display: flex; flex-direction: column; gap: 8px; }
+
+#timeline { height: 80px; overflow-y: auto; }
+.track-lane { display: flex; align-items: center; margin: 2px 0; height: 20px; }
+.track-lane .label { width: 70px; font-size: 11px; overflow: hidden; cursor: pointer; white-space: nowrap; }
+.track-lane .bar { flex: 1; height: 14px; background: #111; border-radius: 2px; position: relative; }
+.track-lane .bar .filled { position: absolute; height: 100%; border-radius: 2px; opacity: 0.5; }
+.track-lane .bar .gap { position: absolute; height: 4px; top: 5px; background: #ff4444; border-radius: 1px; }
+.track-lane .bar .area-issue { position: absolute; height: 100%; top: 0; background: rgba(245, 158, 11, 0.78); border: 1px solid #fbbf24; border-radius: 2px; box-shadow: 0 0 0 1px rgba(0,0,0,0.35) inset; }
+.track-lane .bar .playhead { position: absolute; width: 2px; height: 100%; background: #fff; opacity: 0.8; }
+#info-bar { font-size: 11px; color: #aaa; margin-bottom: 6px; min-height: 16px; }
+</style>
+</head>
+<body>
+
+<!-- Workspace Bar -->
+<div class="row">
+  <label style="display:inline">Workspace:</label>
+  <input id="workspace-path" type="text" style="width:350px" placeholder="path/to/workspace_directory">
+  <button class="primary" onclick="openWorkspace()">Open</button>
+  <button onclick="window.open('config', '_blank')">Config</button>
+  <label style="display:inline; margin-left:10px">Split every</label>
+  <input id="split-length" type="number" style="width:55px" value="300" min="1">
+  <label style="display:inline">f</label>
+  <button onclick="splitWorkspace()">Split</button>
+</div>
+<div class="row">
+  <button onclick="runPipeline()">Run Pipeline</button>
+  <button onclick="renderVideos()">Render Clips</button>
+  <button onclick="saveProject()">Save</button>
+  <button onclick="loadProject()">Load</button>
+  <button class="primary" onclick="exportResults()">Export JSON</button>
+  <button onclick="appendTrackingResults()">Append Tracking JSON</button>
+  <button class="primary" onclick="exportYolo()">Export YOLO</button>
+  <label style="display:inline">every</label>
+  <input id="yolo-interval" type="number" style="width:40px" value="1" min="1">
+  <label style="display:inline">f</label>
+  <span style="width:10px"></span>
+  <button class="primary" onclick="exportMergedYolo()">Export Merged YOLO</button>
+</div>
+
+<!-- Segment Selector -->
+<div id="segment-bar" class="row" style="display:none; flex-wrap:wrap;">
+  <label style="display:inline; margin-right:6px">Segments:</label>
+  <div id="segment-list" style="display:flex; gap:4px; flex-wrap:wrap;"></div>
+  <button class="primary" onclick="runAllSegments()" style="margin-left:10px">Run All Pipelines</button>
+</div>
+
+<!-- Main Area -->
+<div id="main">
+  <div id="canvas-wrap">
+    <img id="frame-img" src="" alt="">
+    <canvas id="overlay"></canvas>
+  </div>
+  <div id="sidebar">
+    <div class="panel">
+      <label>Tracks</label>
+      <div id="track-list" style="max-height:120px; overflow-y:auto;"></div>
+      <div class="row" style="margin-top:6px">
+        <button onclick="addTrack()">+ Add</button>
+        <button class="danger" onclick="deleteTrack()">- Del</button>
+        <button onclick="mergeTracks()">Merge</button>
+      </div>
+      <div class="row" style="margin-top:4px">
+        <label style="display:inline; margin:0">Class:</label>
+        <input id="class-input" type="number" style="width:45px" value="0" min="0">
+        <button onclick="setClassId()">Set</button>
+      </div>
+    </div>
+    <div class="panel">
+      <label>View Mode</label>
+      <div class="row">
+        <button id="view-all-btn" class="primary" onclick="setViewMode('all')">All</button>
+        <button id="view-single-btn" onclick="setViewMode('single')">Single</button>
+      </div>
+    </div>
+    <div class="panel">
+      <label>Annotation (active track)</label>
+      <button class="primary" onclick="saveAnnotation()" style="width:100%; margin-bottom:4px">Save Box (S)</button>
+      <button onclick="deleteAnnotation()" style="width:100%; margin-bottom:4px">Delete (X)</button>
+      <button onclick="copyPrevAnnotation()" style="width:100%; margin-bottom:4px">Copy Prev (C)</button>
+      <button id="sam31-btn" class="primary" onclick="startSam31BoxTrack()" style="width:100%; margin-bottom:4px">SAM31 Track Box</button>
+      <div class="row" style="margin-top:4px">
+        <label style="display:inline; margin:0">Max f:</label>
+        <input id="sam31-max-frames" type="number" style="width:64px" value="0" min="0">
+        <label style="display:inline; margin:0">GPU:</label>
+        <input id="sam31-cuda-device" type="number" style="width:44px" min="0" placeholder="#">
+      </div>
+      <div class="row" style="margin-top:4px">
+        <button class="danger" onclick="deleteAllBefore()" style="flex:1">Del Before</button>
+        <button class="danger" onclick="deleteAllAfter()" style="flex:1">Del After</button>
+      </div>
+    </div>
+    <div class="panel">
+      <label>LocateAnything YOLO</label>
+      <input id="locany-prompt" type="text" style="width:100%; margin-bottom:4px" value="person" placeholder="prompt">
+      <button id="locany-btn" class="primary" onclick="startLocateAnythingYolo()" style="width:100%; margin-bottom:4px">Remote Infer YOLO</button>
+      <div class="row" style="margin-top:4px">
+        <label style="display:inline; margin:0">Max f:</label>
+        <input id="locany-max-frames" type="number" style="width:64px" value="0" min="0">
+        <label style="display:inline; margin:0">GPU:</label>
+        <input id="locany-cuda-device" type="number" style="width:44px" min="0" placeholder="#">
+      </div>
+      <button onclick="openLocateAnythingSettings()" style="width:100%; margin-bottom:4px">Connection Settings</button>
+      <div id="locany-connection-summary" style="font-size:10px; color:#888; overflow-wrap:anywhere">Not configured</div>
+    </div>
+    <div class="panel">
+      <label>Interpolation</label>
+      <div class="row">
+        <span style="font-size:11px">A:</span>
+        <input id="interp-a" type="number" style="width:55px" value="0">
+        <button onclick="markA()">Set (Q)</button>
+      </div>
+      <div class="row">
+        <span style="font-size:11px">B:</span>
+        <input id="interp-b" type="number" style="width:55px" value="0">
+        <button onclick="markB()">Set (E)</button>
+      </div>
+      <button class="danger" onclick="deleteBetweenAB()" style="width:100%; margin-bottom:4px">Delete A-B</button>
+      <button onclick="fixBboxSpikes()" style="width:100%; margin-bottom:4px">Fix Spikes</button>
+      <div class="row" style="margin-bottom:4px">
+        <label style="display:inline; margin:0; font-size:11px">Gap &lt;:</label>
+        <input id="bulk-interp-gap" type="number" style="width:55px" value="5" min="0">
+        <button onclick="interpolateShortGaps()" style="flex:1">Auto Fill Gaps</button>
+      </div>
+      <button class="primary" onclick="doInterpolate()" style="width:100%">Interpolate A→B (R)</button>
+    </div>
+    <div id="status" style="font-size:11px; color:#888; padding:4px;"></div>
+  </div>
+</div>
+
+<dialog id="locany-settings-dialog">
+  <div class="dialog-head"><h2>LocateAnything Connection</h2><button onclick="closeLocateAnythingSettings()" title="Close">×</button></div>
+  <div class="dialog-body">
+    <div class="settings-grid">
+      <div class="settings-field wide"><label>Server URL</label><input id="locany-server-url" placeholder="http://gpu-server:9010"></div>
+      <div class="settings-field"><label>Video transfer</label><select id="locany-video-transfer"><option value="sftp">SFTP upload</option><option value="path">Shared path mapping</option></select></div>
+      <div class="settings-field"><label>SFTP host</label><input id="locany-sftp-host" placeholder="gpu-server"></div>
+      <div class="settings-field"><label>SFTP port</label><input id="locany-sftp-port" type="number" min="1" max="65535" value="22"></div>
+      <div class="settings-field"><label>SFTP username</label><input id="locany-sftp-username" autocomplete="username"></div>
+      <div class="settings-field"><label>SFTP password (this page only)</label><input id="locany-sftp-password" type="password" autocomplete="current-password"></div>
+      <div class="settings-field wide"><label>Remote upload/cache directory</label><input id="locany-sftp-remote-dir" placeholder="/data/annotation-transfer/locateanything/videos"></div>
+      <div class="settings-field wide"><label>SSH private key path (optional)</label><input id="locany-sftp-key-path" placeholder="C:\\Users\\name\\.ssh\\id_ed25519"></div>
+      <div class="settings-field"><label>Local path prefix</label><input id="locany-local-path-prefix" placeholder="D:\\shared\\videos"></div>
+      <div class="settings-field"><label>Remote path prefix</label><input id="locany-remote-path-prefix" placeholder="/data/shared/videos"></div>
+      <div class="settings-field wide"><label><input id="locany-sftp-reuse" type="checkbox" checked style="width:auto; margin-right:6px">Reuse a remote file with matching name and size</label></div>
+    </div>
+    <div id="locany-password-status" class="settings-note"></div>
+    <div id="locany-settings-status" class="settings-note"></div>
+    <div class="settings-note">Non-secret settings are remembered in this browser. The password is kept only in this page and is never written to workspace config or annotation results. The remote directory must be allowed by the GPU service's LOCANY_ALLOWED_ROOTS.</div>
+  </div>
+  <div class="dialog-foot"><button onclick="testLocateAnythingConnection()">Test Connection</button><button onclick="resetLocateAnythingSettings()">Use Workspace Defaults</button><button onclick="closeLocateAnythingSettings()">Cancel</button><button class="primary" onclick="saveLocateAnythingSettings()">Apply</button></div>
+</dialog>
+
+<!-- Navigation -->
+<div class="row">
+  <button onclick="prevFrame()">◀</button>
+  <input id="frame-slider" type="range" min="0" max="1" value="0" step="1" style="flex:1">
+  <button onclick="nextFrame()">▶</button>
+  <span id="frame-num" style="font-size:12px; width:90px; text-align:center">0/0</span>
+  <button onclick="jumpPrevAnn()">◀◀</button>
+  <button onclick="jumpNextAnn()">▶▶</button>
+  <button onclick="jumpStart()">|◀</button>
+  <button onclick="jumpEnd()">▶|</button>
+  <span style="width:10px"></span>
+  <button id="play-btn" class="primary" onclick="togglePlay()">▶ Play</button>
+  <select id="speed-select">
+    <option value="0.25">0.25x</option>
+    <option value="0.5">0.5x</option>
+    <option value="1" selected>1x</option>
+    <option value="2">2x</option>
+    <option value="4">4x</option>
+  </select>
+</div>
+
+<div id="info-bar"></div>
+<div id="timeline" class="panel"></div>
+
+<script>
+// =========================================================================
+const frameImg = document.getElementById('frame-img');
+const canvas = document.getElementById('overlay');
+const ctx = canvas.getContext('2d');
+const slider = document.getElementById('frame-slider');
+
+let state = { fps: 30, width: 640, height: 480, frame_count: 0, tracks: [], workspace: null };
+let activeTrackId = 1;
+let viewMode = 'all';
+let currentFrame = 0;
+let isPlaying = false;
+let playTimer = null;
+let drawing = false, drawStart = null, drawEnd = null;
+let currentBoxes = [];
+const frameCache = new Map(); // frame_idx -> blob URL
+const annotationCache = new Map(); // frame_idx -> annotations
+let BUFFER_AHEAD = 30;
+let BATCH_SIZE = 15;
+let FRAME_CACHE_LIMIT = 80;
+let ANNOTATION_BUFFER_AHEAD = 60;
+let ANNOTATION_BATCH_SIZE = 60;
+let ANNOTATION_CACHE_LIMIT = 300;
+let videoVersion = 0;
+let clientGeneration = 0;
+let annotationGeneration = 0;
+let batchFetching = false;
+let batchFetchedUpTo = -1;
+let annotationBatchFetching = false;
+let annotationFetchedUpTo = -1;
+let sam31JobTimer = null;
+let locanyJobTimer = null;
+let locanySettingsLoaded = false;
+let locanyServerDefaults = {};
+const LOCANY_SETTINGS_KEY = 'video_annotator_locany_connection';
+let overlayRaf = null;
+const mediaAborters = new Set();
+const MEDIA_FETCH_TIMEOUT_MS = 8000;
+let playbackWaitTicks = 0;
+
+// =========================================================================
+// API
+// =========================================================================
+function appUrl(url) {
+  return url.startsWith('/') ? `.${url}` : url;
+}
+
+async function api(method, url, body, extraOpts = {}) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' }, ...extraOpts };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const r = await fetch(appUrl(url), opts);
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(err.detail || 'API error');
+  }
+  return r.json();
+}
+
+function createMediaController(timeoutMs = 0) {
+  const controller = new AbortController();
+  if (timeoutMs > 0) {
+    controller.timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  }
+  mediaAborters.add(controller);
+  return controller;
+}
+
+function releaseMediaController(controller) {
+  if (controller.timeoutId) clearTimeout(controller.timeoutId);
+  mediaAborters.delete(controller);
+}
+
+function resetMediaState({ clearImage = true } = {}) {
+  clientGeneration++;
+  stopPlay();
+  for (const controller of mediaAborters) controller.abort();
+  mediaAborters.clear();
+  frameCache.forEach(url => URL.revokeObjectURL(url));
+  frameCache.clear();
+  clearAnnotationCache();
+  batchFetching = false;
+  batchFetchedUpTo = -1;
+  annotationBatchFetching = false;
+  annotationFetchedUpTo = -1;
+  playbackWaitTicks = 0;
+  currentBoxes = [];
+  if (clearImage) frameImg.removeAttribute('src');
+  renderOverlay();
+}
+
+// =========================================================================
+// Frame loading — batch fetch for sequential access
+// =========================================================================
+function frameUrl(idx) { return appUrl(`/api/frame-image/${idx}?v=${videoVersion}`); }
+
+async function fetchBatch(startIdx) {
+  if (batchFetching) return;
+  if (startIdx >= state.frame_count) return;
+  const requestGeneration = clientGeneration;
+  const requestVersion = videoVersion;
+  const count = Math.min(BATCH_SIZE, state.frame_count - startIdx);
+  const controller = createMediaController(MEDIA_FETCH_TIMEOUT_MS);
+  batchFetching = true;
+  try {
+    const resp = await fetch(appUrl(`/api/frame-batch/${startIdx}/${count}?v=${requestVersion}`), {
+      signal: controller.signal,
+    });
+    if (!resp.ok) return;
+    const buffer = await resp.arrayBuffer();
+    if (requestGeneration !== clientGeneration || requestVersion !== videoVersion) return;
+    const view = new DataView(buffer);
+    let offset = 0;
+    let idx = startIdx;
+    while (offset < buffer.byteLength) {
+      const len = view.getUint32(offset); offset += 4;
+      const jpeg = buffer.slice(offset, offset + len); offset += len;
+      const blob = new Blob([jpeg], { type: 'image/jpeg' });
+      const url = URL.createObjectURL(blob);
+      // Revoke old blob URL if replacing
+      if (frameCache.has(idx)) URL.revokeObjectURL(frameCache.get(idx));
+      frameCache.set(idx, url);
+      idx++;
+    }
+    batchFetchedUpTo = Math.max(batchFetchedUpTo, idx - 1);
+  } catch (e) {
+    if (e.name !== 'AbortError') console.warn(e);
+  } finally {
+    releaseMediaController(controller);
+    if (requestGeneration === clientGeneration) batchFetching = false;
+  }
+}
+
+function firstMissingFrame(fromIdx, lookAhead) {
+  const end = Math.min(state.frame_count - 1, fromIdx + lookAhead);
+  for (let idx = Math.max(0, fromIdx); idx <= end; idx++) {
+    if (!frameCache.has(idx)) return idx;
+  }
+  return null;
+}
+
+function ensureBuffer(fromIdx) {
+  const missing = firstMissingFrame(fromIdx, Math.max(BUFFER_AHEAD, BATCH_SIZE));
+  if (missing !== null && !batchFetching) {
+    fetchBatch(missing);
+  } else {
+    const buffered = batchFetchedUpTo - fromIdx;
+    if (buffered < BUFFER_AHEAD / 2 && !batchFetching) {
+      fetchBatch(Math.max(fromIdx, batchFetchedUpTo + 1));
+    }
+  }
+  // Evict old frames to cap memory
+  if (frameCache.size > FRAME_CACHE_LIMIT) {
+    const keepBehind = Math.max(5, Math.floor(BUFFER_AHEAD / 3));
+    const keepAhead = Math.max(BUFFER_AHEAD, BATCH_SIZE);
+    for (const [k, url] of frameCache) {
+      if (k < fromIdx - keepBehind || k > fromIdx + keepAhead) {
+        URL.revokeObjectURL(url);
+        frameCache.delete(k);
+      }
+    }
+  }
+}
+
+async function fetchAnnotationBatch(startIdx) {
+  if (annotationBatchFetching) return;
+  if (startIdx >= state.frame_count) return;
+  const count = Math.min(ANNOTATION_BATCH_SIZE, state.frame_count - startIdx);
+  const requestGeneration = clientGeneration;
+  const requestAnnotationGeneration = annotationGeneration;
+  const requestVersion = videoVersion;
+  const controller = createMediaController(MEDIA_FETCH_TIMEOUT_MS);
+  annotationBatchFetching = true;
+  try {
+    const data = await api('GET', `/api/annotations-batch/${startIdx}/${count}?v=${requestVersion}`, undefined, {
+      signal: controller.signal,
+    });
+    if (
+      requestGeneration === clientGeneration &&
+      requestAnnotationGeneration === annotationGeneration &&
+      requestVersion === videoVersion
+    ) {
+      for (const frame of data.frames || []) {
+        annotationCache.set(frame.frame_idx, frame.annotations || []);
+        annotationFetchedUpTo = Math.max(annotationFetchedUpTo, frame.frame_idx);
+      }
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') console.warn(e);
+  } finally {
+    releaseMediaController(controller);
+    if (requestGeneration === clientGeneration) annotationBatchFetching = false;
+  }
+}
+
+function firstMissingAnnotationFrame(fromIdx, lookAhead) {
+  const end = Math.min(state.frame_count - 1, fromIdx + lookAhead);
+  for (let idx = Math.max(0, fromIdx); idx <= end; idx++) {
+    if (!annotationCache.has(idx)) return idx;
+  }
+  return null;
+}
+
+function ensureAnnotationBuffer(fromIdx) {
+  const missing = firstMissingAnnotationFrame(fromIdx, Math.max(ANNOTATION_BUFFER_AHEAD, ANNOTATION_BATCH_SIZE));
+  if (missing !== null && !annotationBatchFetching) {
+    fetchAnnotationBatch(missing);
+  } else {
+    const buffered = annotationFetchedUpTo - fromIdx;
+    if (buffered < ANNOTATION_BUFFER_AHEAD / 2 && !annotationBatchFetching) {
+      fetchAnnotationBatch(Math.max(fromIdx, annotationFetchedUpTo + 1));
+    }
+  }
+  if (annotationCache.size > ANNOTATION_CACHE_LIMIT) {
+    const keepBehind = Math.max(5, Math.floor(ANNOTATION_BUFFER_AHEAD / 3));
+    const keepAhead = Math.max(ANNOTATION_BUFFER_AHEAD, ANNOTATION_BATCH_SIZE);
+    for (const k of annotationCache.keys()) {
+      if (k < fromIdx - keepBehind || k > fromIdx + keepAhead) {
+        annotationCache.delete(k);
+      }
+    }
+  }
+}
+
+function clearAnnotationCache() {
+  annotationGeneration++;
+  annotationCache.clear();
+  annotationFetchedUpTo = -1;
+}
+
+function showFrame(idx) {
+  const cached = frameCache.get(idx);
+  if (cached) {
+    frameImg.src = cached;
+  } else {
+    frameImg.src = frameUrl(idx);
+  }
+  ensureBuffer(idx);
+}
+
+// =========================================================================
+// Core
+// =========================================================================
+function seekToFrame(idx) {
+  playbackWaitTicks = 0;
+  idx = Math.max(0, Math.min(state.frame_count - 1, idx));
+  currentFrame = idx;
+  slider.value = idx;
+  document.getElementById('frame-num').textContent = `${idx}/${state.frame_count - 1}`;
+  showFrame(idx);
+  fetchAnnotations(idx);
+  updateInfo();
+  renderTimeline();
+}
+
+async function fetchAnnotations(frameIdx) {
+  if (annotationCache.has(frameIdx)) {
+    currentBoxes = annotationCache.get(frameIdx);
+    renderOverlay();
+    ensureAnnotationBuffer(frameIdx);
+    return;
+  }
+  ensureAnnotationBuffer(frameIdx);
+  if (isPlaying) return;
+  currentBoxes = [];
+  renderOverlay();
+  const requestGeneration = clientGeneration;
+  const requestAnnotationGeneration = annotationGeneration;
+  const requestVersion = videoVersion;
+  const controller = createMediaController(MEDIA_FETCH_TIMEOUT_MS);
+  try {
+    const data = await api('GET', `/api/frame/${frameIdx}?v=${requestVersion}`, undefined, {
+      signal: controller.signal,
+    });
+    if (
+      requestGeneration !== clientGeneration ||
+      requestAnnotationGeneration !== annotationGeneration ||
+      requestVersion !== videoVersion
+    ) return;
+    annotationCache.set(frameIdx, data.annotations || []);
+    if (frameIdx === currentFrame) {
+      currentBoxes = data.annotations || [];
+      renderOverlay();
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') console.warn(e);
+  } finally {
+    releaseMediaController(controller);
+  }
+}
+
+// =========================================================================
+// Playback — adaptive, only advances when frame is ready
+// =========================================================================
+function togglePlay() { isPlaying ? stopPlay() : startPlay(); }
+function startPlay() {
+  isPlaying = true;
+  playbackWaitTicks = 0;
+  document.getElementById('play-btn').textContent = '⏸ Stop';
+  const speed = parseFloat(document.getElementById('speed-select').value);
+  const interval = 1000.0 / (state.fps * speed);
+  const playGeneration = clientGeneration;
+  // Pre-fetch a batch ahead before starting
+  ensureBuffer(currentFrame + 1);
+  ensureAnnotationBuffer(currentFrame + 1);
+  Promise.all([fetchBatch(currentFrame + 1), fetchAnnotationBatch(currentFrame + 1)]).then(() => {
+    if (!isPlaying || playGeneration !== clientGeneration) return;
+    if (playTimer) clearInterval(playTimer);
+    playTimer = setInterval(playTick, interval);
+  });
+}
+function playTick() {
+  if (currentFrame >= state.frame_count - 1) { stopPlay(); return; }
+  const nextFrame = currentFrame + 1;
+  // Adaptive: skip frame display if not buffered (don't stutter, just wait)
+  if (!frameCache.has(nextFrame) || !annotationCache.has(nextFrame)) {
+    playbackWaitTicks++;
+    ensureBuffer(nextFrame);
+    ensureAnnotationBuffer(nextFrame);
+    if (playbackWaitTicks === 10) {
+      setStatus(`Buffering frame ${nextFrame}...`);
+    }
+    return; // skip this tick, try next interval
+  }
+  playbackWaitTicks = 0;
+  currentFrame = nextFrame;
+  slider.value = currentFrame;
+  document.getElementById('frame-num').textContent = `${currentFrame}/${state.frame_count - 1}`;
+  showFrame(currentFrame);
+  fetchAnnotations(currentFrame);
+  ensureBuffer(currentFrame);
+  ensureAnnotationBuffer(currentFrame);
+}
+function stopPlay() {
+  isPlaying = false;
+  playbackWaitTicks = 0;
+  document.getElementById('play-btn').textContent = '▶ Play';
+  if (playTimer) { clearInterval(playTimer); playTimer = null; }
+  updateInfo(); renderTimeline();
+}
+
+// =========================================================================
+// Navigation
+// =========================================================================
+function prevFrame() { if (isPlaying) stopPlay(); seekToFrame(currentFrame - 1); }
+function nextFrame() { if (isPlaying) stopPlay(); seekToFrame(currentFrame + 1); }
+function jumpPrevAnn() {
+  const t = state.tracks.find(t => t.track_id === activeTrackId);
+  if (!t) return;
+  const prev = t.annotated_indices.filter(i => i < currentFrame);
+  if (prev.length) seekToFrame(prev[prev.length - 1]);
+}
+function jumpNextAnn() {
+  const t = state.tracks.find(t => t.track_id === activeTrackId);
+  if (!t) return;
+  const next = t.annotated_indices.filter(i => i > currentFrame);
+  if (next.length) seekToFrame(next[0]);
+}
+function jumpStart() {
+  const t = state.tracks.find(t => t.track_id === activeTrackId);
+  if (t && t.start_frame != null) seekToFrame(t.start_frame);
+}
+function jumpEnd() {
+  const t = state.tracks.find(t => t.track_id === activeTrackId);
+  if (t && t.end_frame != null) seekToFrame(t.end_frame);
+}
+slider.addEventListener('input', () => { if (isPlaying) stopPlay(); seekToFrame(parseInt(slider.value)); });
+
+// =========================================================================
+// Canvas overlay
+// =========================================================================
+function resizeCanvas() { canvas.width = frameImg.clientWidth; canvas.height = frameImg.clientHeight; renderOverlay(); }
+function renderOverlay() {
+  if (overlayRaf !== null) return;
+  overlayRaf = requestAnimationFrame(() => {
+    overlayRaf = null;
+    paintOverlay();
+  });
+}
+function paintOverlay() {
+  if (!canvas.width || !state.width) return;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const scaleX = canvas.width / state.width, scaleY = canvas.height / state.height;
+  const boxes = viewMode === 'all' ? currentBoxes : currentBoxes.filter(b => b.track_id === activeTrackId);
+  for (const box of boxes) {
+    const [x1, y1, x2, y2] = box.bbox;
+    const sx = x1*scaleX, sy = y1*scaleY, sw = (x2-x1)*scaleX, sh = (y2-y1)*scaleY;
+    const color = trackColor(box.track_id);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = box.track_id === activeTrackId ? 2.5 : 1.5;
+    ctx.strokeRect(sx, sy, sw, sh);
+    const lbl = `ID ${box.track_id}`;
+    ctx.font = '11px monospace';
+    const tw = ctx.measureText(lbl).width;
+    ctx.fillStyle = color; ctx.fillRect(sx, sy-14, tw+6, 14);
+    ctx.fillStyle = '#000'; ctx.fillText(lbl, sx+3, sy-3);
+  }
+  if (drawing && drawStart && drawEnd) {
+    const sx = Math.min(drawStart.x, drawEnd.x), sy = Math.min(drawStart.y, drawEnd.y);
+    const sw = Math.abs(drawEnd.x-drawStart.x), sh = Math.abs(drawEnd.y-drawStart.y);
+    ctx.strokeStyle = '#00ff00'; ctx.lineWidth = 2; ctx.setLineDash([5,3]);
+    ctx.strokeRect(sx, sy, sw, sh); ctx.setLineDash([]);
+  }
+}
+function trackColor(id) { return `rgb(${(37*id+80)%256},${(97*id+140)%256},${(17*id+220)%256})`; }
+
+// =========================================================================
+// Drawing
+// =========================================================================
+canvas.addEventListener('mousedown', e => {
+  if (isPlaying) return;
+  const r = canvas.getBoundingClientRect();
+  drawStart = { x: e.clientX-r.left, y: e.clientY-r.top }; drawEnd = {...drawStart}; drawing = true;
+});
+canvas.addEventListener('mousemove', e => {
+  if (!drawing) return;
+  const r = canvas.getBoundingClientRect();
+  drawEnd = { x: e.clientX-r.left, y: e.clientY-r.top }; renderOverlay();
+});
+canvas.addEventListener('mouseup', e => {
+  if (!drawing) return; drawing = false;
+  const r = canvas.getBoundingClientRect();
+  drawEnd = { x: e.clientX-r.left, y: e.clientY-r.top };
+  const scaleX = state.width/canvas.width, scaleY = state.height/canvas.height;
+  const x1 = Math.min(drawStart.x,drawEnd.x)*scaleX, y1 = Math.min(drawStart.y,drawEnd.y)*scaleY;
+  const x2 = Math.max(drawStart.x,drawEnd.x)*scaleX, y2 = Math.max(drawStart.y,drawEnd.y)*scaleY;
+  if (Math.abs(x2-x1) < 5 || Math.abs(y2-y1) < 5) { drawStart=null; drawEnd=null; renderOverlay(); return; }
+  const bbox = [x1,y1,x2,y2];
+  const idx = currentBoxes.findIndex(b => b.track_id === activeTrackId);
+  if (idx >= 0) currentBoxes[idx].bbox = bbox; else currentBoxes.push({ track_id: activeTrackId, bbox });
+  drawStart=null; drawEnd=null; renderOverlay();
+});
+
+// =========================================================================
+// Annotation actions
+// =========================================================================
+async function saveAnnotation() {
+  const box = currentBoxes.find(b => b.track_id === activeTrackId);
+  if (!box) { setStatus('Draw a box first'); return; }
+  try {
+    await api('POST', '/api/annotation', { track_id: activeTrackId, frame_idx: currentFrame, bbox: box.bbox });
+    clearAnnotationCache();
+    await refreshState(); setStatus(`Saved frame ${currentFrame}`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+async function deleteAnnotation() {
+  try {
+    await api('POST', '/api/delete-annotation', { track_id: activeTrackId, frame_idx: currentFrame });
+    clearAnnotationCache();
+    await refreshState(); fetchAnnotations(currentFrame); setStatus(`Deleted frame ${currentFrame}`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+async function deleteAllBefore() {
+  if (!confirm(`Delete all Track ${activeTrackId} annotations BEFORE frame ${currentFrame}?`)) return;
+  try {
+    const r = await api('POST', '/api/delete-before', { track_id: activeTrackId, frame_idx: currentFrame });
+    clearAnnotationCache();
+    await refreshState(); fetchAnnotations(currentFrame); setStatus(`Deleted ${r.deleted} frames before ${currentFrame}`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+async function deleteAllAfter() {
+  if (!confirm(`Delete all Track ${activeTrackId} annotations AFTER frame ${currentFrame}?`)) return;
+  try {
+    const r = await api('POST', '/api/delete-after', { track_id: activeTrackId, frame_idx: currentFrame });
+    clearAnnotationCache();
+    await refreshState(); fetchAnnotations(currentFrame); setStatus(`Deleted ${r.deleted} frames after ${currentFrame}`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+async function copyPrevAnnotation() {
+  const t = state.tracks.find(t => t.track_id === activeTrackId);
+  if (!t) return;
+  const prev = t.annotated_indices.filter(i => i < currentFrame);
+  if (!prev.length) { setStatus('No previous annotation'); return; }
+  const data = await api('GET', `/api/frame/${prev[prev.length-1]}?v=${videoVersion}`);
+  const prevBox = data.annotations.find(a => a.track_id === activeTrackId);
+  if (!prevBox) return;
+  const idx = currentBoxes.findIndex(b => b.track_id === activeTrackId);
+  if (idx >= 0) currentBoxes[idx].bbox = prevBox.bbox; else currentBoxes.push({ track_id: activeTrackId, bbox: prevBox.bbox });
+  renderOverlay(); setStatus(`Copied from frame ${prev[prev.length-1]}`);
+}
+
+async function startSam31BoxTrack() {
+  const box = currentBoxes.find(b => b.track_id === activeTrackId);
+  if (!box) { setStatus('Draw or load a box for the active track first'); return; }
+  const maxFrames = parseInt(document.getElementById('sam31-max-frames').value) || 0;
+  const cudaRaw = document.getElementById('sam31-cuda-device').value.trim();
+  const cudaDevice = cudaRaw === '' ? null : parseInt(cudaRaw);
+  if (cudaRaw !== '' && (!Number.isInteger(cudaDevice) || cudaDevice < 0)) {
+    setStatus('CUDA device must be a non-negative integer');
+    return;
+  }
+  const btn = document.getElementById('sam31-btn');
+  if (!confirm(`Run SAM31 from frame ${currentFrame} for Track ${activeTrackId}? Frames from here onward on this track will be replaced by SAM31 output.`)) return;
+  try {
+    btn.disabled = true;
+    setStatus('Starting SAM31 job...');
+    const r = await api('POST', '/api/sam31/box-track', {
+      track_id: activeTrackId,
+      frame_idx: currentFrame,
+      bbox: box.bbox,
+      max_frames: maxFrames,
+      replace_after: true,
+      cuda_device: cudaDevice,
+    });
+    pollSam31Job(r.job_id);
+  } catch (e) {
+    btn.disabled = false;
+    setStatus('Error: '+e.message);
+  }
+}
+
+function pollSam31Job(jobId) {
+  if (sam31JobTimer) clearInterval(sam31JobTimer);
+  sam31JobTimer = setInterval(async () => {
+    try {
+      const job = await api('GET', `/api/sam31/job/${jobId}`);
+      setStatus(`SAM31 ${job.status}: ${job.message || ''}`);
+      if (job.status === 'done') {
+        clearInterval(sam31JobTimer); sam31JobTimer = null;
+        document.getElementById('sam31-btn').disabled = false;
+        clearAnnotationCache();
+        await refreshState(); fetchAnnotations(currentFrame);
+        setStatus(job.message || 'SAM31 done');
+      } else if (job.status === 'failed') {
+        clearInterval(sam31JobTimer); sam31JobTimer = null;
+        document.getElementById('sam31-btn').disabled = false;
+        const detail = job.stderr ? ` | ${job.stderr.slice(-300)}` : '';
+        setStatus(`SAM31 failed: ${job.message}${detail}`);
+      }
+    } catch (e) {
+      clearInterval(sam31JobTimer); sam31JobTimer = null;
+      document.getElementById('sam31-btn').disabled = false;
+      setStatus('Error: '+e.message);
+    }
+  }, 2000);
+}
+
+async function startLocateAnythingYolo() {
+  const prompt = document.getElementById('locany-prompt').value.trim();
+  if (!prompt) { setStatus('Enter a LocateAnything prompt first'); return; }
+  const maxFrames = parseInt(document.getElementById('locany-max-frames').value) || 0;
+  const cudaRaw = document.getElementById('locany-cuda-device').value.trim();
+  const cudaDevice = cudaRaw === '' ? null : parseInt(cudaRaw);
+  if (cudaRaw !== '' && (!Number.isInteger(cudaDevice) || cudaDevice < 0)) {
+    setStatus('CUDA device must be a non-negative integer');
+    return;
+  }
+  let connection;
+  try {
+    connection = locanyConnectionPayload(true);
+    validateLocateAnythingSettings(connection);
+  } catch (e) {
+    setStatus('Error: ' + e.message);
+    return;
+  }
+  const btn = document.getElementById('locany-btn');
+  if (!confirm(`Run remote LocateAnything YOLO inference for prompt "${prompt}"? Results will be saved in a separate locateanything_runs folder.`)) return;
+  try {
+    btn.disabled = true;
+    setStatus('Starting LocateAnything job...');
+    const r = await api('POST', '/api/locateanything/yolo', {
+      ...connection,
+      prompt,
+      task: 'ground_multi',
+      max_frames: maxFrames,
+      start_frame: 0,
+      frame_step: 1,
+      cuda_device: cudaDevice,
+    });
+    pollLocateAnythingJob(r.job_id);
+  } catch (e) {
+    btn.disabled = false;
+    setStatus('Error: '+e.message);
+  }
+}
+
+function setLocateAnythingSettings(settings) {
+  const values = {
+    'locany-server-url': settings.server_url || '',
+    'locany-video-transfer': settings.video_transfer || 'sftp',
+    'locany-sftp-host': settings.sftp_host || '',
+    'locany-sftp-port': settings.sftp_port || 22,
+    'locany-sftp-username': settings.sftp_username || '',
+    'locany-sftp-remote-dir': settings.sftp_remote_dir || '',
+    'locany-sftp-key-path': settings.sftp_key_path || '',
+    'locany-local-path-prefix': settings.local_path_prefix || '',
+    'locany-remote-path-prefix': settings.remote_path_prefix || '',
+  };
+  for (const [id, value] of Object.entries(values)) document.getElementById(id).value = value;
+  document.getElementById('locany-sftp-reuse').checked = settings.sftp_reuse_existing !== false;
+  document.getElementById('locany-password-status').textContent = settings.sftp_password_configured
+    ? `Password environment variable ${settings.sftp_password_env || ''} is configured. A password entered here overrides it for this page.`
+    : `No password environment variable is available${settings.sftp_password_env ? ` (${settings.sftp_password_env})` : ''}. Enter a password or private key when SFTP authentication requires one.`;
+  updateLocateAnythingSummary();
+}
+
+function locanyConnectionPayload(includePassword = false) {
+  const port = parseInt(document.getElementById('locany-sftp-port').value, 10);
+  const payload = {
+    server_url: document.getElementById('locany-server-url').value.trim(),
+    video_transfer: document.getElementById('locany-video-transfer').value,
+    sftp_host: document.getElementById('locany-sftp-host').value.trim(),
+    sftp_port: Number.isInteger(port) ? port : 22,
+    sftp_username: document.getElementById('locany-sftp-username').value.trim(),
+    sftp_remote_dir: document.getElementById('locany-sftp-remote-dir').value.trim(),
+    sftp_key_path: document.getElementById('locany-sftp-key-path').value.trim(),
+    local_path_prefix: document.getElementById('locany-local-path-prefix').value.trim(),
+    remote_path_prefix: document.getElementById('locany-remote-path-prefix').value.trim(),
+    sftp_reuse_existing: document.getElementById('locany-sftp-reuse').checked,
+  };
+  if (includePassword) {
+    const password = document.getElementById('locany-sftp-password').value;
+    if (password) payload.sftp_password = password;
+  }
+  return payload;
+}
+
+function validateLocateAnythingSettings(settings) {
+  let url;
+  try { url = new URL(settings.server_url); } catch { throw new Error('Enter a valid LocateAnything server URL'); }
+  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('LocateAnything server URL must use HTTP or HTTPS');
+  if (settings.sftp_port < 1 || settings.sftp_port > 65535) throw new Error('SFTP port must be between 1 and 65535');
+  if (settings.video_transfer === 'sftp') {
+    if (!settings.sftp_host || !settings.sftp_username || !settings.sftp_remote_dir) throw new Error('SFTP host, username, and remote directory are required');
+  } else if (!settings.local_path_prefix || !settings.remote_path_prefix) {
+    throw new Error('Local and remote path prefixes are required for shared path mapping');
+  }
+}
+
+function updateLocateAnythingSummary() {
+  const settings = locanyConnectionPayload(false);
+  const target = settings.video_transfer === 'sftp'
+    ? `${settings.sftp_username || '?'}@${settings.sftp_host || '?'}:${settings.sftp_remote_dir || '?'}`
+    : `${settings.local_path_prefix || '?'} → ${settings.remote_path_prefix || '?'}`;
+  document.getElementById('locany-connection-summary').textContent = `${settings.server_url || 'No server URL'} | ${target}`;
+}
+
+async function loadLocateAnythingSettings(useDefaults = false) {
+  locanyServerDefaults = await api('GET', '/api/locateanything/settings');
+  let saved = {};
+  if (!useDefaults) {
+    try { saved = JSON.parse(localStorage.getItem(LOCANY_SETTINGS_KEY) || '{}'); } catch { saved = {}; }
+  }
+  setLocateAnythingSettings({ ...locanyServerDefaults, ...saved });
+  locanySettingsLoaded = true;
+}
+
+async function openLocateAnythingSettings() {
+  try {
+    if (!locanySettingsLoaded) await loadLocateAnythingSettings();
+    document.getElementById('locany-settings-dialog').showModal();
+  } catch (e) { setStatus('Error: ' + e.message); }
+}
+
+function closeLocateAnythingSettings() {
+  document.getElementById('locany-settings-dialog').close();
+}
+
+function saveLocateAnythingSettings() {
+  try {
+    const settings = locanyConnectionPayload(false);
+    validateLocateAnythingSettings(settings);
+    localStorage.setItem(LOCANY_SETTINGS_KEY, JSON.stringify(settings));
+    updateLocateAnythingSummary();
+    closeLocateAnythingSettings();
+    setStatus('LocateAnything connection settings applied');
+  } catch (e) { setStatus('Error: ' + e.message); }
+}
+
+async function resetLocateAnythingSettings() {
+  localStorage.removeItem(LOCANY_SETTINGS_KEY);
+  document.getElementById('locany-sftp-password').value = '';
+  await loadLocateAnythingSettings(true);
+  setStatus('LocateAnything workspace defaults restored');
+}
+
+async function testLocateAnythingConnection() {
+  const status = document.getElementById('locany-settings-status');
+  try {
+    const settings = locanyConnectionPayload(true);
+    validateLocateAnythingSettings(settings);
+    status.textContent = 'Testing API and transfer connection...';
+    const result = await api('POST', '/api/locateanything/test-connection', {
+      ...settings,
+      prompt: document.getElementById('locany-prompt').value.trim() || 'person',
+    });
+    const cacheDir = result.api?.cache_dir ? ` | server cache: ${result.api.cache_dir}` : '';
+    const sftp = result.sftp ? ` | SFTP OK${result.sftp.remote_dir_exists ? '' : ' (remote directory will be created on upload)'}` : '';
+    status.textContent = `Connection OK${cacheDir}${sftp}`;
+  } catch (e) {
+    status.textContent = 'Connection failed: ' + e.message;
+  }
+}
+
+function pollLocateAnythingJob(jobId) {
+  if (locanyJobTimer) clearInterval(locanyJobTimer);
+  locanyJobTimer = setInterval(async () => {
+    try {
+      const job = await api('GET', `/api/locateanything/job/${jobId}`);
+      setStatus(`LocateAnything ${job.status}: ${job.message || ''}`);
+      if (job.status === 'done') {
+        clearInterval(locanyJobTimer); locanyJobTimer = null;
+        document.getElementById('locany-btn').disabled = false;
+        setStatus(job.message || `LocateAnything done: ${job.output_dir || ''}`);
+      } else if (job.status === 'failed') {
+        clearInterval(locanyJobTimer); locanyJobTimer = null;
+        document.getElementById('locany-btn').disabled = false;
+        setStatus(`LocateAnything failed: ${job.message || ''}`);
+      }
+    } catch (e) {
+      clearInterval(locanyJobTimer); locanyJobTimer = null;
+      document.getElementById('locany-btn').disabled = false;
+      setStatus('Error: '+e.message);
+    }
+  }, 3000);
+}
+
+// =========================================================================
+// Interpolation
+// =========================================================================
+function markA() { document.getElementById('interp-a').value = currentFrame; }
+function markB() { document.getElementById('interp-b').value = currentFrame; }
+async function doInterpolate() {
+  const a = parseInt(document.getElementById('interp-a').value);
+  const b = parseInt(document.getElementById('interp-b').value);
+  try {
+    const r = await api('POST', '/api/interpolate', { track_id: activeTrackId, frame_a: a, frame_b: b });
+    clearAnnotationCache();
+    await refreshState(); fetchAnnotations(currentFrame); setStatus(`Interpolated ${r.interpolated_count} frames (${a}→${b})`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+
+async function deleteBetweenAB() {
+  const a = parseInt(document.getElementById('interp-a').value);
+  const b = parseInt(document.getElementById('interp-b').value);
+  if (!Number.isInteger(a) || !Number.isInteger(b)) { setStatus('Set A and B first'); return; }
+  const start = Math.min(a, b), end = Math.max(a, b);
+  if (!confirm(`Delete all Track ${activeTrackId} annotations from frame ${start} to ${end}?`)) return;
+  try {
+    const r = await api('POST', '/api/delete-between', { track_id: activeTrackId, frame_a: a, frame_b: b });
+    clearAnnotationCache();
+    await refreshState(); fetchAnnotations(currentFrame);
+    setStatus(`Deleted ${r.deleted} frames (${start}-${end})`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+
+async function fixBboxSpikes() {
+  if (!confirm(`Interpolate short bbox spikes on Track ${activeTrackId}?`)) return;
+  try {
+    const r = await api('POST', '/api/fix-bbox-spikes', { track_id: activeTrackId });
+    clearAnnotationCache();
+    await refreshState(); fetchAnnotations(currentFrame);
+    const intervals = (r.intervals || []).map(x => `${x.start}-${x.end}`).join(', ');
+    setStatus(`Fixed ${r.fixed_frames} spike frames${intervals ? ': ' + intervals : ''}`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+
+async function interpolateShortGaps() {
+  const maxGap = parseInt(document.getElementById('bulk-interp-gap').value, 10);
+  if (!Number.isInteger(maxGap) || maxGap < 0) {
+    setStatus('Set a non-negative max gap');
+    return;
+  }
+  if (!confirm(`Interpolate all track gaps under ${maxGap} missing frame${maxGap === 1 ? '' : 's'}?`)) return;
+  try {
+    const r = await api('POST', '/api/interpolate-short-gaps', { max_gap: maxGap });
+    clearAnnotationCache();
+    await refreshState(); fetchAnnotations(currentFrame);
+    renderTimeline();
+    const gapText = (r.gaps || []).length ? ` across ${r.gaps.length} gaps` : '';
+    setStatus(`Interpolated ${r.filled_frames} frames on ${r.filled_tracks} tracks${gapText}`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+
+// =========================================================================
+// Track management
+// =========================================================================
+async function addTrack() {
+  const r = await api('POST', '/api/track', { class_id: 0 });
+  activeTrackId = r.track_id; await refreshState(); renderOverlay();
+}
+async function deleteTrack() {
+  if (!confirm(`Delete Track ${activeTrackId}?`)) return;
+  await api('DELETE', `/api/track/${activeTrackId}`);
+  clearAnnotationCache();
+  await refreshState(); fetchAnnotations(currentFrame);
+}
+async function mergeTracks() {
+  const otherIds = state.tracks.filter(t => t.track_id !== activeTrackId).map(t => t.track_id);
+  if (!otherIds.length) { setStatus('No other tracks to merge'); return; }
+  const input = prompt(`Merge which track INTO Track ${activeTrackId}?\nAvailable: ${otherIds.join(', ')}`);
+  if (!input) return;
+  const otherId = parseInt(input);
+  if (!otherIds.includes(otherId)) { setStatus('Invalid track ID'); return; }
+  if (!confirm(`Merge Track ${otherId} into Track ${activeTrackId}? Track ${otherId} will be deleted.`)) return;
+  try {
+    const r = await api('POST', '/api/merge-tracks', { track_id_a: activeTrackId, track_id_b: otherId });
+    clearAnnotationCache();
+    await refreshState(); fetchAnnotations(currentFrame);
+    setStatus(`Merged Track ${otherId} → Track ${activeTrackId} (${r.num_frames} frames total)`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+function setActiveTrack(tid) {
+  activeTrackId = tid;
+  const t = state.tracks.find(t => t.track_id === tid);
+  if (t) document.getElementById('class-input').value = t.class_id;
+  renderTrackList(); renderOverlay(); updateInfo();
+}
+async function setClassId() {
+  const classId = parseInt(document.getElementById('class-input').value) || 0;
+  try {
+    await api('POST', '/api/set-class', { track_id: activeTrackId, class_id: classId });
+    clearAnnotationCache();
+    await refreshState();
+    setStatus(`Track ${activeTrackId} → class ${classId}`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+function setViewMode(mode) {
+  viewMode = mode;
+  document.getElementById('view-all-btn').className = mode === 'all' ? 'primary' : '';
+  document.getElementById('view-single-btn').className = mode === 'single' ? 'primary' : '';
+  renderOverlay();
+}
+
+// =========================================================================
+// Workspace & State
+// =========================================================================
+async function openWorkspace() {
+  const path = document.getElementById('workspace-path').value.trim();
+  if (!path) return;
+  try {
+    resetMediaState();
+    const r = await api('POST', '/api/open-workspace', { path });
+    videoVersion = r.version ?? (videoVersion + 1);
+    await refreshState();
+    seekToFrame(0);
+    const info = [`Workspace: ${r.video}`, `${r.width}x${r.height}`, `${r.frame_count}f`, `${r.fps.toFixed(1)}fps`];
+    if (r.has_results) info.push(`${r.num_tracks} tracks loaded`);
+    if (r.label_dir) info.push(`labels: ${r.label_dir}`);
+    setStatus(info.join(' | '));
+    await loadSegments();
+    await loadLocateAnythingSettings();
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+
+async function splitWorkspace() {
+  const segLen = parseInt(document.getElementById('split-length').value) || 300;
+  setStatus(`Splitting into ${segLen}-frame segments...`);
+  try {
+    const r = await api('POST', '/api/split-workspace', { segment_length: segLen });
+    setStatus(`Split into ${r.num_segments} segments`);
+    await loadSegments();
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+
+async function loadSegments() {
+  try {
+    const r = await api('GET', '/api/segments');
+    const bar = document.getElementById('segment-bar');
+    const list = document.getElementById('segment-list');
+    if (r.segments.length === 0) { bar.style.display = 'none'; return; }
+    bar.style.display = 'flex';
+    list.innerHTML = '';
+    for (const seg of r.segments) {
+      const btn = document.createElement('button');
+      btn.textContent = `${seg.name} (${seg.frame_count}f)${seg.has_results ? ' ✓' : ''}`;
+      btn.style.fontSize = '11px';
+      if (seg.has_results) btn.style.borderColor = '#4ade80';
+      btn.onclick = () => openSegment(seg.path);
+      list.appendChild(btn);
+    }
+  } catch (e) {}
+}
+
+async function openSegment(segPath) {
+  try {
+    resetMediaState();
+    const r = await api('POST', '/api/open-workspace', { path: segPath });
+    videoVersion = r.version ?? (videoVersion + 1);
+    await refreshState();
+    seekToFrame(0);
+    setStatus(`Segment: ${r.video} | ${r.frame_count}f | ${r.num_tracks} tracks`);
+    await loadLocateAnythingSettings();
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+
+async function exportMergedYolo() {
+  const interval = parseInt(document.getElementById('yolo-interval').value) || 1;
+  setStatus('Exporting merged YOLO dataset from all segments...');
+  try {
+    const r = await api('POST', '/api/export-merged-yolo', { interval });
+    setStatus(`Merged YOLO: ${r.frames_saved} frames (interval=${r.interval}) → ${r.output_dir}`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+
+async function runAllSegments() {
+  setStatus('Running pipeline on all segments...');
+  try {
+    const r = await api('POST', '/api/run-pipeline-all-segments');
+    const summary = r.results.map(s => `${s.name}: ${s.ok ? s.num_tracks + ' tracks' : 'FAILED'}`).join(', ');
+    setStatus(`Done: ${summary}`);
+    await loadSegments();
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+async function refreshState() {
+  state = await api('GET', '/api/state');
+  if (state.version != null) videoVersion = state.version;
+  applyAnnotatorConfig(state.annotator || {});
+  slider.max = Math.max(1, state.frame_count - 1);
+  if (!state.tracks.find(t => t.track_id === activeTrackId))
+    activeTrackId = state.tracks[0]?.track_id || 1;
+  renderTrackList(); renderTimeline(); updateInfo();
+}
+function applyAnnotatorConfig(cfg) {
+  BUFFER_AHEAD = Math.max(1, parseInt(cfg.frame_buffer_ahead) || BUFFER_AHEAD);
+  BATCH_SIZE = Math.max(1, parseInt(cfg.frame_batch_size) || BATCH_SIZE);
+  FRAME_CACHE_LIMIT = Math.max(BUFFER_AHEAD + BATCH_SIZE, parseInt(cfg.frame_cache_limit) || FRAME_CACHE_LIMIT);
+  ANNOTATION_BUFFER_AHEAD = Math.max(1, parseInt(cfg.annotation_buffer_ahead) || ANNOTATION_BUFFER_AHEAD);
+  ANNOTATION_BATCH_SIZE = Math.max(1, parseInt(cfg.annotation_batch_size) || ANNOTATION_BATCH_SIZE);
+  ANNOTATION_CACHE_LIMIT = Math.max(
+    ANNOTATION_BUFFER_AHEAD + ANNOTATION_BATCH_SIZE,
+    parseInt(cfg.annotation_cache_limit) || ANNOTATION_CACHE_LIMIT
+  );
+}
+async function runPipeline() {
+  setStatus('Running pipeline...');
+  try {
+    const r = await api('POST', '/api/run-pipeline');
+    resetMediaState({ clearImage: false });
+    await refreshState(); seekToFrame(0);
+    setStatus(`Pipeline done: ${r.num_tracks} tracks`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+async function renderVideos() {
+  setStatus('Rendering clips + overview...');
+  try {
+    const r = await api('POST', '/api/render');
+    setStatus(`Rendered ${r.num_tracks} tracks → clips + overview`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+async function saveProject() {
+  try { await api('POST', '/api/save'); setStatus('Project saved'); }
+  catch (e) { setStatus('Error: '+e.message); }
+}
+async function loadProject() {
+  try { await api('POST', '/api/load'); resetMediaState({ clearImage: false }); await refreshState(); seekToFrame(0); setStatus('Project loaded'); }
+  catch (e) { setStatus('Error: '+e.message); }
+}
+async function exportResults() {
+  try {
+    const r = await api('POST', '/api/export');
+    const extra = r.area_anomaly_path ? ` | issues → ${r.area_anomaly_path}` : '';
+    setStatus(`Exported ${r.num_tracks} tracks → ${r.path}${extra}`);
+  }
+  catch (e) { setStatus('Error: '+e.message); }
+}
+async function appendTrackingResults() {
+  const sourcePath = prompt('Path to tracking_results.json to append:');
+  if (!sourcePath) return;
+  const rawClassId = prompt('Optional class ID override (leave blank to keep source classes):', '');
+  const classId = rawClassId === null || rawClassId.trim() === '' ? null : Number(rawClassId);
+  if (classId !== null && (!Number.isInteger(classId) || classId < 0)) {
+    setStatus('Class ID must be a non-negative integer');
+    return;
+  }
+  try {
+    const result = await api('POST', '/api/append-tracking-results', {
+      source_path: sourcePath,
+      class_id_override: classId,
+    });
+    await refreshState();
+    setStatus(`Appended tracking results; ${result.num_tracks} total tracks`);
+  } catch (e) {
+    setStatus('Error: '+e.message);
+  }
+}
+async function exportYolo() {
+  const interval = parseInt(document.getElementById('yolo-interval').value) || 1;
+  setStatus(`Exporting YOLO dataset (every ${interval} frames)...`);
+  try {
+    const r = await api('POST', '/api/export-yolo', { interval });
+    setStatus(`YOLO dataset: ${r.frames_saved} frames saved (interval=${r.interval}) → ${r.output_dir}`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
+
+// =========================================================================
+// UI rendering
+// =========================================================================
+function renderTrackList() {
+  const el = document.getElementById('track-list'); el.innerHTML = '';
+  for (const t of state.tracks) {
+    const div = document.createElement('div');
+    div.style.cssText = 'padding:3px 6px; cursor:pointer; border-radius:3px; margin:2px 0; font-size:11px;';
+    div.style.borderLeft = `3px solid ${trackColor(t.track_id)}`;
+    if (t.track_id === activeTrackId) div.style.background = '#333';
+    const range = t.start_frame != null ? `${t.start_frame}-${t.end_frame}` : 'empty';
+    const issueCount = t.area_anomaly_count || 0;
+    const issueText = issueCount ? ` !${issueCount}` : '';
+    div.textContent = `T${t.track_id} c${t.class_id} [${range}] (${t.num_frames}f)${issueText}`;
+    div.onclick = () => setActiveTrack(t.track_id);
+    el.appendChild(div);
+  }
+  // Sync class input with active track
+  const active = state.tracks.find(t => t.track_id === activeTrackId);
+  if (active) document.getElementById('class-input').value = active.class_id;
+}
+function renderTimeline() {
+  const el = document.getElementById('timeline');
+  if (!state.frame_count) { el.innerHTML = ''; return; }
+  const maxF = Math.max(1, state.frame_count - 1);
+  let html = '';
+  for (const t of state.tracks) {
+    const color = trackColor(t.track_id);
+    const marker = t.track_id === activeTrackId ? ' ◄' : '';
+    let bar = '';
+    if (t.start_frame != null) {
+      const l = (t.start_frame/maxF*100).toFixed(1), w = Math.max(0.5,(t.end_frame-t.start_frame)/maxF*100).toFixed(1);
+      bar += `<div class="filled" style="left:${l}%;width:${w}%;background:${color}"></div>`;
+      const idx = t.annotated_indices;
+      for (let i=1; i<idx.length; i++) {
+        if (idx[i]-idx[i-1] > 1) {
+          const gl=(idx[i-1]/maxF*100).toFixed(1), gw=((idx[i]-idx[i-1])/maxF*100).toFixed(1);
+          bar += `<div class="gap" style="left:${gl}%;width:${gw}%"></div>`;
+        }
+      }
+      for (const seg of (t.area_anomaly_segments || [])) {
+        const start = Math.max(0, Math.min(maxF, parseInt(seg.start)));
+        const end = Math.max(start, Math.min(maxF, parseInt(seg.end)));
+        const l = (start/maxF*100).toFixed(1);
+        const w = Math.max(0.5, ((end - start + 1)/maxF*100)).toFixed(1);
+        const reasons = (seg.reasons || []).join('+') || 'area';
+        const ratio = Number(seg.max_area_ratio || 0).toFixed(2);
+        const jumpRatio = Number(seg.max_frame_change_ratio || 1).toFixed(2);
+        const jumpAbs = Number(seg.max_frame_change_abs || 0).toFixed(0);
+        bar += `<div class="area-issue" title="Area issue ${start}-${end} ${reasons} maxRatio=${ratio} jumpRatio=${jumpRatio} jumpAbs=${jumpAbs}" style="left:${l}%;width:${w}%"></div>`;
+      }
+    }
+    bar += `<div class="playhead" style="left:${(currentFrame/maxF*100).toFixed(1)}%"></div>`;
+    html += `<div class="track-lane"><div class="label" style="color:${color}" onclick="setActiveTrack(${t.track_id})">T${t.track_id}${marker}</div><div class="bar">${bar}</div></div>`;
+  }
+  el.innerHTML = html;
+}
+function updateInfo() {
+  const t = state.tracks.find(t => t.track_id === activeTrackId);
+  const has = t ? t.annotated_indices.includes(currentFrame) : false;
+  const ti = t && t.start_frame != null ? `T${activeTrackId}: ${t.start_frame}→${t.end_frame} (${t.num_frames}f)` : `T${activeTrackId}: empty`;
+  document.getElementById('info-bar').textContent = `Frame ${currentFrame}/${state.frame_count-1} [${has?'✓':'—'}] | ${ti}`;
+}
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+
+// =========================================================================
+// Keyboard
+// =========================================================================
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  switch(e.key) {
+    case 'ArrowLeft': case 'a': prevFrame(); e.preventDefault(); break;
+    case 'ArrowRight': case 'd': nextFrame(); e.preventDefault(); break;
+    case ' ': togglePlay(); e.preventDefault(); break;
+    case 's': saveAnnotation(); e.preventDefault(); break;
+    case 'x': deleteAnnotation(); e.preventDefault(); break;
+    case 'c': copyPrevAnnotation(); e.preventDefault(); break;
+    case 'q': markA(); e.preventDefault(); break;
+    case 'e': markB(); e.preventDefault(); break;
+    case 'r': doInterpolate(); e.preventDefault(); break;
+  }
+});
+
+// =========================================================================
+// Init
+// =========================================================================
+const resizeObs = new ResizeObserver(() => resizeCanvas());
+resizeObs.observe(frameImg);
+frameImg.addEventListener('load', resizeCanvas);
+loadLocateAnythingSettings().catch(e => setStatus('LocateAnything settings: ' + e.message));
+</script>
+</body>
+</html>

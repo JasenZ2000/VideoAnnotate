@@ -1,6 +1,6 @@
 # 配置说明
 
-配置文件是一个 JSON 覆盖层，会合并到 `mot_pipeline.config.DEFAULT_CONFIG`。没有显式填写的字段继续使用代码中的默认值。
+配置文件是一个 JSON 覆盖层，会合并到 `utils.mot_pipeline.config.DEFAULT_CONFIG`。没有显式填写的字段继续使用代码中的默认值。
 
 ## 配置文件与环境变量
 

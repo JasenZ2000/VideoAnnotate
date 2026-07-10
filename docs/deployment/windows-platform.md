@@ -40,8 +40,16 @@ Copy-Item configs\platform.example.json configs\platform.local.json
 $env:ANNOTATION_PLATFORM_TASKS_DIR="D:\annotation_tasks"
 $env:ANNOTATION_PLATFORM_DB="D:\annotation_tasks\platform.sqlite3"
 $env:ANNOTATION_PLATFORM_CONFIG="$PWD\configs\platform.local.json"
-.\scripts\windows\run-platform.bat
+.\scripts\windows\run-platform.ps1
 ```
+
+平台已经在运行时，可关闭占用同一端口的旧平台进程并在当前窗口重启：
+
+```powershell
+.\scripts\windows\run-platform.ps1 -Restart
+```
+
+脚本只会自动停止监听目标端口的 `python` 或 `pythonw` 进程；如果端口由其他程序占用，会拒绝终止并报告进程信息。平台在当前窗口前台运行，按 `Ctrl+C` 停止。
 
 健康检查：
 

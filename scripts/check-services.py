@@ -28,15 +28,13 @@ def check(name: str, base_url: str, timeout: float) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check video annotation service health endpoints.")
     parser.add_argument("--platform", help="Workflow platform base URL")
-    parser.add_argument("--sam31", help="SAM3.1 service base URL")
-    parser.add_argument("--locateanything", help="LocateAnything service base URL")
+    parser.add_argument("--gpu-service", help="Unified GPU service base URL")
     parser.add_argument("--timeout", type=float, default=10.0)
     args = parser.parse_args()
 
     targets = [
         ("platform", args.platform),
-        ("sam31", args.sam31),
-        ("locateanything", args.locateanything),
+        ("gpu-service", args.gpu_service),
     ]
     selected = [(name, url) for name, url in targets if url]
     if not selected:

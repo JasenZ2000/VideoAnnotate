@@ -7,7 +7,7 @@
   },
   "sam31": {
     "runner": "remote",
-    "server_url": "http://gpu-server:9001",
+    "server_url": "http://gpu-server:9010",
     "video_transfer": "sftp",
     "request_timeout": 30,
     "poll_interval": 2,
@@ -22,5 +22,24 @@
     "dtype": "fp16",
     "min_mask_area": 64,
     "use_rect_mask": false
+  },
+  "locateanything": {
+    "server_url": "http://gpu-server:9010",
+    "video_transfer": "sftp",
+    "request_timeout": 30,
+    "download_timeout": 300,
+    "poll_interval": 5,
+    "sftp_host": "gpu-server",
+    "sftp_port": 22,
+    "sftp_username": "employee-name",
+    "sftp_password_env": "LOCANY_SFTP_PASSWORD",
+    "sftp_key_path": "",
+    "sftp_remote_dir": "/data/annotation-transfer/locateanything/videos",
+    "sftp_reuse_existing": true,
+    "device": "cuda",
+    "dtype": "bf16",
+    "task": "ground_multi",
+    "resize_long_edge": 1024,
+    "max_new_tokens": 512
   }
 }

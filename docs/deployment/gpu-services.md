@@ -1,70 +1,70 @@
-# Linux GPU 服务部署
+# Linux 统一 GPU 服务部署
 
-## 通用要求
+## 运行模型
 
-SAM3.1 和 LocateAnything 必须运行在独立的 Python 环境中。安装模型依赖前，应先安装与主机驱动和 CUDA 运行时匹配的 PyTorch。服务端口只能绑定到可信内部网络。
+只启动一个 HTTP 进程：`gpu_services.server`，默认监听 `9010`。它通过两个命名空间暴露能力：
 
-把 `configs/gpu-services.env.example` 复制为服务器本地环境文件，或通过进程管理器导出其中变量。真实模型路径、主机名和凭据不得提交到 Git。
+- `/api/sam31/...`：目标框提示的视频跟踪；
+- `/api/locateanything/...`：视频逐帧预标注和 YOLO ZIP 导出。
 
-## SAM3.1
+HTTP 服务不要求把两套模型运行时合并到一个 Python 环境。它运行在能加载 LocateAnything 的环境中；SAM3.1 作业由 `SAM31_PYTHON` 指向原有的 ComfyUI 环境后，以子进程方式运行。
 
-SAM3.1 依赖服务器上已有的 ComfyUI 和模型权重：
+## 先决条件
+
+- 服务进程环境：Python 3.10+、CUDA 匹配的 PyTorch、LocateAnything 的 Python 依赖；
+- 外部 LocateAnything 目录，其中必须存在 `locateanything_worker.py`；
+- 已可用的 ComfyUI 与 SAM3.1 checkpoint；
+- GPU 服务只能绑定在可信内部网络，且两个模型的可读视频目录必须各自受到限制。
+
+仓库不再包含或安装 LocateAnything 上游源码。将其部署在服务器独立目录后，通过 `LOCATEANYTHING_ROOT` 引用即可。
+
+## 配置与启动
+
+从 [环境变量模板](../../configs/gpu-services.env.example) 复制本机配置，不要提交真实路径、账号或模型权重路径。
 
 ```bash
-conda activate sam31-comfy
 cd /srv/video-annotation-workflow
-pip install -r requirements/gpu-sam31.txt
+source /path/to/locateanything-env/bin/activate
+pip install -r requirements/gpu-services.txt
 
-export SAM31_COMFY_ROOT=/opt/ComfyUI
-export SAM31_CHECKPOINT=/models/sam3.1_multiplex_fp16.safetensors
-export SAM31_CACHE_DIR=/data/annotation-cache/sam31
-export SAM31_ALLOWED_ROOTS=/data/annotation-transfer/sam31/videos
-export SAM31_DEVICE=cuda:0
-./scripts/linux/run-sam31-server.sh
-```
+export GPU_SERVICE_HOST=0.0.0.0
+export GPU_SERVICE_PORT=9010
 
-验证服务：
-
-```bash
-curl http://127.0.0.1:9001/api/health
-```
-
-## LocateAnything
-
-必须使用 Python 3.10 以上版本。Python 3.9 无法解析 Hugging Face 远端处理器代码使用的联合类型注解。
-
-```bash
-conda activate locateanything
-cd /srv/video-annotation-workflow
-# 先安装与 CUDA 匹配的 PyTorch
-pip install -r requirements/gpu-locateanything.txt
-
+export LOCATEANYTHING_ROOT=/opt/LocateAnything
 export LOCANY_MODEL=nvidia/LocateAnything-3B
 export LOCANY_CACHE_DIR=/data/annotation-cache/locateanything
 export LOCANY_ALLOWED_ROOTS=/data/annotation-transfer/locateanything/videos
 export LOCANY_DEVICE=cuda:1
 export LOCANY_DTYPE=bf16
-./scripts/linux/run-locateanything-server.sh
+
+export SAM31_COMFY_ROOT=/opt/ComfyUI
+export SAM31_CHECKPOINT=/models/sam3.1_multiplex_fp16.safetensors
+export SAM31_PYTHON=/opt/venvs/sam31-comfy/bin/python
+export SAM31_RUNNER=/srv/video-annotation-workflow/gpu_services/sam31_track.py
+export SAM31_CACHE_DIR=/data/annotation-cache/sam31
+export SAM31_ALLOWED_ROOTS=/data/annotation-transfer/sam31/videos
+export SAM31_DEVICE=cuda:0
+export SAM31_DTYPE=fp16
+
+./gpu_services/run_gpu_service.sh
 ```
 
-验证服务：
+`LOCANY_CACHE_DIR` 和 `SAM31_CACHE_DIR` 是服务自己的结果缓存目录。标注器和平台的 SFTP 上传目录不是缓存目录，且必须分别落在对应的 `*_ALLOWED_ROOTS` 内。
+
+每次请求可以选择 `cuda:N`。LocateAnything 会按 `device + dtype` 缓存模型实例，所以启用多张卡会在每张卡上各加载一份模型；其推理任务仍在单个服务进程内串行执行。
+
+## 验证
 
 ```bash
-curl http://127.0.0.1:9011/api/health
+curl http://127.0.0.1:9010/api/health
+curl http://127.0.0.1:9010/api/sam31/health
+curl http://127.0.0.1:9010/api/locateanything/health
 ```
 
-服务会围绕单个模型工作进程串行执行推理任务。降低输入帧分辨率并提前拆分视频，是控制显存和任务周转时间的主要手段。模型加载阶段设置的 `max_memory` 无法限制 `generate()` 过程中 KV 缓存或注意力计算产生的临时显存峰值。
+根健康检查会同时报告两个运行时的配置。LocateAnything 健康结果中的 `worker_available` 应为 `true`；它为 `false` 时，优先检查 `LOCATEANYTHING_ROOT` 是否指向包含 `locateanything_worker.py` 的目录。
 
-## 进程守护
+## 进程守护与更新
 
-正式部署应使用 systemd、Supervisor 或其他进程管理器。工作目录应设置为仓库根目录，加载对应服务的环境变量，并在异常退出时自动重启。缓存清理由独立任务执行，不要在服务进程内部清理；失败任务日志应保留足够时间以便排查。
+正式部署建议使用 systemd、Supervisor 或其他进程管理器，工作目录设为仓库根目录并以受限账号运行。缓存清理由独立任务执行，不要在服务进程内部删除运行中的任务目录。
 
-## 更新流程
-
-1. 停止目标服务。
-2. 拉取经过审核的 Git 版本。
-3. 只更新该服务对应的 Python 环境。
-4. 启动服务并检查 `/api/health`。
-5. 用一个已知结果的短视频测试成功后，再恢复团队访问。
-
-修改 `locateanything_video_server.py` 后必须重启 LocateAnything 服务，其中也包括类别映射逻辑的修改。
+升级时停止这一项统一服务，更新仓库和外部 LocateAnything 运行时，检查 `/api/health`，再分别提交一段已知视频的 LocateAnything 与 SAM3.1 作业。任何 `gpu_services/` 适配层变更都需要重启统一服务。

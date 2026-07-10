@@ -5,10 +5,10 @@
 系统按照交互延迟和硬件职责拆分为三类节点：
 
 - **Windows 公共机**负责保存任务状态和共享文件，向团队提供作业流程平台，并执行视频分段、跟踪、打包和导出等 CPU 任务。
-- **Linux GPU 服务器**运行两个独立服务。LocateAnything 根据文本提示生成 YOLO 预标注；SAM3.1 根据人工给定的目标框，在视频片段中延伸目标轨迹。
-- 每台**员工 Windows 电脑**都在本地运行 Annotator。视频帧浏览和标注编辑在本机完成，只有明确触发的 GPU 任务才会发送到 SAM3.1 服务。
+- **Linux GPU 服务器**运行一个统一 HTTP 服务。LocateAnything 根据文本提示生成 YOLO 预标注；SAM3.1 根据人工给定的目标框，在视频片段中延伸目标轨迹。
+- 每台**员工 Windows 电脑**都在本地运行一个工作台服务，其中挂载 Annotator 和帧采样器。视频帧浏览、标注编辑与采样计划在本机完成，只有明确触发的 GPU 任务才会发送到统一 GPU 服务。
 
-各服务都是独立的 Python 进程，并应使用彼此隔离的运行环境。LocateAnything 和 SAM3.1 对 CUDA 及依赖版本的要求不同，不应安装在同一个环境中。
+统一服务按 `/api/locateanything` 与 `/api/sam31` 分隔接口。LocateAnything 在服务进程环境中运行；SAM3.1 通过 `SAM31_PYTHON` 调起原有 ComfyUI 环境的子进程，因此两套 CUDA 依赖不需要安装在同一个环境中。
 
 ## 组件职责边界
 
@@ -30,22 +30,22 @@
 
 ### 本地标注器
 
-`annotator/server.py` 与 `annotator/static/` 组成一个本地 Web 应用，负责交互式轨迹编辑、插值、质量检查、本地保存与导出，以及远端 SAM3.1 调用。Annotator 不应被当作中央任务数据库使用。
+`local_workbench/server.py` 将 `utils/annotator/` 和 `utils/frame_sampler/` 挂载到一个本地 Web 服务。Annotator 负责交互式轨迹编辑、插值、质量检查、本地保存与导出，以及远端 SAM3.1 调用；帧采样器负责按稠密/稀疏计划导出训练帧。工作台不应被当作中央任务数据库使用。
 
 ### MOT 流水线
 
-`mot_pipeline/` 存放可复用的领域逻辑。它读取逐帧 YOLO 检测框，分别执行正向和反向跟踪，融合轨迹片段，平滑轨迹，并输出 `tracking_results.json`、YOLO 标注和可视化结果。
+`utils/mot_pipeline/` 存放本地工作台和平台共用的领域逻辑。它读取逐帧 YOLO 检测框，分别执行正向和反向跟踪，融合轨迹片段，平滑轨迹，并输出 `tracking_results.json`、YOLO 标注和可视化结果。
 
 ### GPU 服务
 
-两个 GPU API 都采用异步任务模式：
+统一 GPU API 的两类任务都采用异步模式：
 
-1. 客户端通过 `POST /api/jobs` 提交任务。
+1. 客户端通过 `POST /api/sam31/jobs` 或 `POST /api/locateanything/jobs` 提交任务。
 2. 服务立即返回 `job_id`。
-3. 客户端轮询 `GET /api/jobs/{job_id}`。
+3. 客户端在对应命名空间轮询 `GET /api/{service}/jobs/{job_id}`。
 4. 状态变为 `done` 后，客户端下载结果。
 
-这种方式可以避免长时间推理导致 HTTP 读取超时。当前任务状态保存在服务进程内存中，结果文件则写入各服务的缓存目录。
+这种方式可以避免长时间推理导致 HTTP 读取超时。当前任务状态保存在服务进程内存中，结果文件分别写入 SAM3.1 和 LocateAnything 的缓存目录。
 
 ## 视频传输方式
 

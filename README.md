@@ -9,24 +9,24 @@
 ```mermaid
 flowchart LR
     P["Windows public machine<br/>Workflow Platform"]
-    L["Linux GPU server<br/>LocateAnything API"]
-    S["Linux GPU server<br/>SAM3.1 API"]
-    A["Employee Windows PC<br/>Local Annotator"]
+    G["Linux GPU server<br/>Unified GPU API"]
+    A["Employee Windows PC<br/>Local Workbench"]
     D["Task storage<br/>videos / segments / labels / results"]
 
     P --> D
-    P -->|"async prelabel jobs"| L
+    P -->|"async prelabel jobs"| G
     A -->|"download / review / upload"| P
-    A -->|"interactive bbox tracking"| S
+    A -->|"interactive bbox tracking"| G
 ```
 
 | Component | Runs on | Responsibility |
 | --- | --- | --- |
 | `workflow_platform` | Windows public machine | Task registration, upload, assignment, segmentation, remote LocateAnything jobs, tracking and result distribution |
-| `annotator` | Employee Windows PC | Low-latency manual inspection and cleanup; calls remote SAM3.1 when needed |
-| `mot_pipeline` | Platform or annotator | YOLO parsing, bidirectional tracking, trajectory fusion, smoothing and format conversion |
-| `locateAnything` | Linux GPU server | Prompt/multi-class video detection and YOLO prelabel generation |
-| `sam31` | Linux GPU server | Bbox-prompt video tracking and `tracking_results.json` generation |
+| `local_workbench` | Employee Windows PC | One local service exposing manual annotation and frame sampling |
+| `annotator` | Local workbench | Low-latency manual inspection, cleanup and remote GPU calls |
+| `frame_sampler` | Local workbench | Variable-density training-frame sampling before YOLO export |
+| `utils/mot_pipeline` | Local workbench and platform | YOLO parsing, bidirectional tracking, trajectory fusion, smoothing and format conversion |
+| `gpu_services` | Linux GPU server | Single API exposing LocateAnything video prelabeling and SAM3.1 bbox tracking |
 
 ## Annotation Flow
 
@@ -58,54 +58,62 @@ pip install -r requirements\platform.txt
 Copy-Item configs\platform.example.json configs\platform.local.json
 $env:ANNOTATION_PLATFORM_CONFIG="$PWD\configs\platform.local.json"
 $env:ANNOTATION_PLATFORM_TASKS_DIR="D:\annotation_tasks"
-.\scripts\windows\run-platform.bat
+.\scripts\windows\run-platform.ps1
 ```
 
 Open `http://<public-machine>:8088`.
 
-### Employee annotator
+Restart an already running platform instance on the configured port:
+
+```powershell
+.\scripts\windows\run-platform.ps1 -Restart
+```
+
+### Employee local workbench
 
 ```powershell
 py -3.11 -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements\annotator.txt
-.\scripts\windows\run-annotator.bat
+.\scripts\windows\run-local-workbench.bat
 ```
 
-Open `http://127.0.0.1:7860`. SAM3.1 credentials remain on the employee machine and are supplied through workspace config/environment variables.
+Open `http://127.0.0.1:7860/annotator/` for annotation, or `http://127.0.0.1:7860/sampler/` for frame sampling. The sampler reads a workspace video plus `tracking_results.json`, lets you define dense/sparse ranges, and exports `images/` + `labels/` YOLO data. SAM3.1 credentials remain on the employee machine and are supplied through workspace config/environment variables.
+
+To build a Windows executable, install `requirements\windows-build.txt` and run `scripts\windows\build-local-workbench.ps1`. The generated `VideoAnnotationWorkbench.exe` contains both UIs and their static assets.
 
 ### Linux GPU services
 
 ```bash
-# Run each service in its own prepared Python environment.
-source /path/to/sam31-env/bin/activate
+# Start one HTTP service from the LocateAnything-capable environment.
+source /path/to/locateanything-env/bin/activate
+pip install -r requirements/gpu-services.txt
+export LOCATEANYTHING_ROOT=/opt/LocateAnything
 export SAM31_COMFY_ROOT=/opt/ComfyUI
 export SAM31_CHECKPOINT=/models/sam3.1_multiplex_fp16.safetensors
-./scripts/linux/run-sam31-server.sh
-
-source /path/to/locateanything-env/bin/activate
-./scripts/linux/run-locateanything-server.sh
+export SAM31_PYTHON=/path/to/sam31-comfy-env/bin/python
+./gpu_services/run_gpu_service.sh
 ```
 
-LocateAnything requires Python 3.10+ and a PyTorch build matching the server CUDA runtime. SAM3.1 should run inside the existing ComfyUI environment. Do not install or upgrade GPU PyTorch from the root requirements file.
+LocateAnything remains an external runtime: `LOCATEANYTHING_ROOT` must contain `locateanything_worker.py`, and its Python environment needs Python 3.10+ plus CUDA-matched PyTorch. SAM3.1 keeps its existing ComfyUI environment through `SAM31_PYTHON`; the unified service launches its runner as a child process. Do not install or upgrade GPU PyTorch from the root requirements file.
 
 Verify all deployed endpoints:
 
 ```bash
 python scripts/check-services.py \
   --platform http://windows-host:8088 \
-  --sam31 http://gpu-host:9001 \
-  --locateanything http://gpu-host:9011
+  --gpu-service http://gpu-host:9010
 ```
 
 ## Repository Layout
 
 ```text
-annotator/             employee-side annotation UI and API
+local_workbench/       single-process local service that mounts both UIs
+utils/annotator/       implementation of the annotation UI and API
+utils/frame_sampler/   implementation of the variable-density frame sampler
 workflow_platform/     shared task platform UI and API
-mot_pipeline/          tracking, fusion and converters
-sam31/                 SAM3.1 remote job service and runner
-locateAnything/        vendored LocateAnything code plus project adapters
+utils/mot_pipeline/    shared tracking, fusion and converters
+gpu_services/          unified SAM3.1 / LocateAnything HTTP service
 configs/               safe configuration examples
 requirements/          dependencies split by deployment role
 scripts/windows/       Windows launchers
@@ -115,9 +123,7 @@ docs/                  architecture, deployment and operations manuals
 tests/                 fast unit and project smoke tests
 ```
 
-`locateAnything/` contains upstream research code and model-license material together with this project's adapters (`locateanything_worker.py`, `locateanything_video_server.py`, `batch_yolo_infer.py`). Treat upstream internals as vendor code; platform-specific changes should stay in the adapter files when possible.
-
-See `locateAnything/PROJECT_ADAPTERS.md` before updating that vendor tree.
+This repository does not vendor LocateAnything. Install or clone the upstream runtime separately, then set `LOCATEANYTHING_ROOT` to the directory containing `locateanything_worker.py`.
 
 ## Documentation
 
@@ -125,7 +131,7 @@ See `locateAnything/PROJECT_ADAPTERS.md` before updating that vendor tree.
 - [平台现有功能与处理逻辑图](docs/platform-capabilities.md)
 - [Windows platform deployment](docs/deployment/windows-platform.md)
 - [Linux GPU service deployment](docs/deployment/gpu-services.md)
-- [Employee annotator setup](docs/deployment/windows-annotator.md)
+- [Windows local workbench setup](docs/deployment/windows-local-workbench.md)
 - [Task operating procedure](docs/operations/task-workflow.md)
 - [HTTP API summary](docs/api.md)
 - [Configuration reference](docs/configuration.md)
@@ -139,7 +145,7 @@ See `locateAnything/PROJECT_ADAPTERS.md` before updating that vendor tree.
 ```bash
 pip install -r requirements/dev.txt
 python -m pytest
-python -m compileall annotator workflow_platform mot_pipeline sam31
+python -m compileall utils local_workbench workflow_platform gpu_services
 ```
 
 Generated videos, task data, model weights, credentials and local `*.local.json` files are intentionally ignored by Git. This repository currently has no public redistribution license; check internal policy and the separate LocateAnything model license before distributing binaries or model assets.

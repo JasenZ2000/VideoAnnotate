@@ -169,6 +169,41 @@ class PlatformDatabaseTests(unittest.TestCase):
         self.assertEqual(record["filename"], "规范.pdf")
         self.assertEqual(self.db.list_attachments("task-1")[0]["sha256"], "a" * 64)
 
+    def test_user_and_session_lifecycle(self) -> None:
+        created = self.db.create_user(
+            "admin",
+            "hashed-password",
+            "admin",
+            "Administrator",
+            "2026-07-07T10:00:00+08:00",
+            True,
+        )
+        self.assertEqual(created["role"], "admin")
+        self.assertEqual(self.db.user_count(), 1)
+        self.assertEqual(self.db.active_admin_count(), 1)
+
+        self.db.create_session(
+            "session-1",
+            "admin",
+            "token-hash",
+            "2026-07-08T10:00:00+08:00",
+            "2026-07-07T10:00:00+08:00",
+        )
+        session_user = self.db.get_session_user("token-hash", "2026-07-07T12:00:00+08:00")
+        self.assertEqual(session_user["username"], "admin")
+
+        self.db.update_user(
+            "admin",
+            role="user",
+            display_name="Admin User",
+            is_active=False,
+            now="2026-07-07T12:05:00+08:00",
+        )
+        updated = self.db.get_user("admin")
+        self.assertEqual(updated["role"], "user")
+        self.assertFalse(updated["is_active"])
+        self.assertIsNone(self.db.get_session_user("token-hash", "2026-07-07T12:06:00+08:00"))
+
     def test_version_one_database_is_upgraded_in_place(self) -> None:
         path = self.root / "version-one.sqlite3"
         connection = sqlite3.connect(path)
@@ -204,7 +239,7 @@ class PlatformDatabaseTests(unittest.TestCase):
         self.assertEqual(task["manager"], "旧负责人")
         self.assertEqual(task["publisher"], "旧负责人")
         self.assertEqual(task["task_type"], "general")
-        self.assertEqual(upgraded.health()["schema_version"], 2)
+        self.assertEqual(upgraded.health()["schema_version"], 3)
 
     def test_events_are_thread_safe_and_ordered(self) -> None:
         self.db.save_task(sample_task())

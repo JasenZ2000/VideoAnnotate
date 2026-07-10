@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_STAGE_NAMES = (
     "video",
     "prelabel",
@@ -94,6 +94,29 @@ class PlatformDatabase:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'user',
+                    display_name TEXT NOT NULL DEFAULT '',
+                    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_login_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_user_sessions_username
+                    ON user_sessions(username, expires_at);
 
                 CREATE TABLE IF NOT EXISTS tasks (
                     task_id TEXT PRIMARY KEY,
@@ -312,6 +335,172 @@ class PlatformDatabase:
                 (task_id,),
             ).fetchone()
         return row is not None
+
+    def user_count(self, active_only: bool = False) -> int:
+        query = "SELECT COUNT(*) AS count FROM users"
+        if active_only:
+            query += " WHERE is_active = 1"
+        with self.connection() as connection:
+            row = connection.execute(query).fetchone()
+        return int(row["count"])
+
+    def active_admin_count(self) -> int:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM users WHERE role = 'admin' AND is_active = 1"
+            ).fetchone()
+        return int(row["count"])
+
+    def create_user(
+        self,
+        username: str,
+        password_hash: str,
+        role: str,
+        display_name: str,
+        now: str,
+        is_active: bool = True,
+    ) -> dict[str, Any]:
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO users(
+                    username, password_hash, role, display_name, is_active, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    username,
+                    password_hash,
+                    role,
+                    display_name,
+                    1 if is_active else 0,
+                    now,
+                    now,
+                ),
+            )
+        return self.get_user(username)
+
+    def get_user(self, username: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT username, role, display_name, is_active, created_at, updated_at, last_login_at
+                FROM users WHERE username = ?
+                """,
+                (username,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(username)
+        return dict(row)
+
+    def get_user_with_password(self, username: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        if row is None:
+            raise KeyError(username)
+        return dict(row)
+
+    def list_users(self) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT username, role, display_name, is_active, created_at, updated_at, last_login_at
+                FROM users
+                ORDER BY role DESC, username
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_user(
+        self,
+        username: str,
+        *,
+        password_hash: Optional[str] = None,
+        role: Optional[str] = None,
+        display_name: Optional[str] = None,
+        is_active: Optional[bool] = None,
+        now: str,
+    ) -> dict[str, Any]:
+        assignments: list[str] = ["updated_at = ?"]
+        params: list[Any] = [now]
+        if password_hash is not None:
+            assignments.append("password_hash = ?")
+            params.append(password_hash)
+        if role is not None:
+            assignments.append("role = ?")
+            params.append(role)
+        if display_name is not None:
+            assignments.append("display_name = ?")
+            params.append(display_name)
+        if is_active is not None:
+            assignments.append("is_active = ?")
+            params.append(1 if is_active else 0)
+        params.append(username)
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                f"UPDATE users SET {', '.join(assignments)} WHERE username = ?",
+                tuple(params),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(username)
+        return self.get_user(username)
+
+    def touch_user_login(self, username: str, now: str) -> None:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE users SET last_login_at = ?, updated_at = ? WHERE username = ?",
+                (now, now, username),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(username)
+
+    def create_session(
+        self,
+        session_id: str,
+        username: str,
+        token_hash: str,
+        expires_at: str,
+        now: str,
+    ) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO user_sessions(
+                    session_id, username, token_hash, expires_at, created_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, username, token_hash, expires_at, now, now),
+            )
+
+    def get_session_user(self, token_hash: str, now: str) -> Optional[dict[str, Any]]:
+        with self.transaction() as connection:
+            connection.execute("DELETE FROM user_sessions WHERE expires_at <= ?", (now,))
+            row = connection.execute(
+                """
+                SELECT u.username, u.role, u.display_name, u.is_active, u.created_at, u.updated_at, u.last_login_at,
+                       s.session_id
+                FROM user_sessions s
+                JOIN users u ON u.username = s.username
+                WHERE s.token_hash = ? AND s.expires_at > ? AND u.is_active = 1
+                """,
+                (token_hash, now),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "UPDATE user_sessions SET last_seen_at = ? WHERE session_id = ?",
+                (now, row["session_id"]),
+            )
+        payload = dict(row)
+        payload.pop("session_id", None)
+        return payload
+
+    def delete_session(self, token_hash: str) -> None:
+        with self.transaction() as connection:
+            connection.execute("DELETE FROM user_sessions WHERE token_hash = ?", (token_hash,))
+
+    def delete_sessions_for_user(self, username: str) -> None:
+        with self.transaction() as connection:
+            connection.execute("DELETE FROM user_sessions WHERE username = ?", (username,))
 
     def save_task(self, task: dict[str, Any]) -> None:
         task_id = str(task["task_id"])
@@ -1044,6 +1233,7 @@ class PlatformDatabase:
             "quick_check": check,
             "task_count": int(task_count),
             "event_count": int(event_count),
+            "user_count": self.user_count(),
         }
 
     def migrate_legacy_directory(self, tasks_root: Path) -> dict[str, int]:

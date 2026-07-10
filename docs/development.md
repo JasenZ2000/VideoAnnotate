@@ -14,7 +14,7 @@ GPU 模型依赖被有意拆分到独立环境中。绝大多数平台、Annotat
 
 ```bash
 python -m pytest
-python -m compileall annotator workflow_platform mot_pipeline sam31
+python -m compileall utils local_workbench workflow_platform gpu_services
 python scripts/check-services.py --platform http://127.0.0.1:8088
 ```
 
@@ -25,10 +25,11 @@ python scripts/check-services.py --platform http://127.0.0.1:8088
 ## 代码职责边界
 
 - 任务编排逻辑放在 `workflow_platform/`。
-- 交互式标注编辑逻辑放在 `annotator/`。
-- 可复用的跟踪与格式转换逻辑放在 `mot_pipeline/`。
-- GPU HTTP 接口分别放在 `sam31/server.py` 和 `locateAnything/locateanything_video_server.py`。
-- 修改 LocateAnything 时应优先调整适配层，尽量不要改动引入的上游模型内部代码。
+- 交互式标注与采样实现放在 `utils/annotator/` 和 `utils/frame_sampler/`。
+- 本地工作台的单进程装配逻辑放在 `local_workbench/`。
+- 本地工作台和平台共用的跟踪与格式转换逻辑放在 `utils/mot_pipeline/`。
+- GPU HTTP 接口集中在 `gpu_services/`，以 `/api/sam31` 和 `/api/locateanything` 分隔。
+- LocateAnything 是外部运行时；项目内适配层通过 `LOCATEANYTHING_ROOT` 加载其 `locateanything_worker.py`。
 
 远端 API 发生变化时，必须在同一个版本中同步修改客户端、示例配置、API 文档和健康检查或集成测试。
 
@@ -36,7 +37,7 @@ python scripts/check-services.py --platform http://127.0.0.1:8088
 
 1. 执行单元测试和编译检查。
 2. 在 Windows 上测试平台的任务创建、上传和分段流程。
-3. 在 Linux 上分别用一个短视频测试 LocateAnything 分段任务和 SAM3.1 目标框任务。
+3. 在 Linux 上通过同一个 GPU 服务分别用一个短视频测试 LocateAnything 分段任务和 SAM3.1 目标框任务。
 4. 检查导出 YOLO 中的类别 ID。
 5. 确认暂存区不包含 `*.local.json`、凭据、视频或模型权重。
-6. 为可部署提交打标签，并记录两个 GPU 服务各自使用的环境版本。
+6. 为可部署提交打标签，并记录统一服务、LocateAnything 运行时与 SAM3.1 ComfyUI 运行时的版本。

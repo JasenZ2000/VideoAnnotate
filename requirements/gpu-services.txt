@@ -1,0 +1,8 @@
+# Shared HTTP/API dependencies for the single GPU service process.
+# Install CUDA-matched PyTorch and the external model runtimes separately.
+fastapi>=0.100
+uvicorn[standard]>=0.20
+opencv-python-headless>=4.8
+numpy>=1.24
+pydantic>=2.7
+pillow>=10.0

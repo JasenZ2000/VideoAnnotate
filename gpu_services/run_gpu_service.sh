@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Optional: source the environment that can import the external LocateAnything runtime.
+# Example: export GPU_SERVICE_ENV_ACTIVATE=/opt/venvs/locateanything/bin/activate
+if [[ -n "${GPU_SERVICE_ENV_ACTIVATE:-}" ]]; then
+  source "$GPU_SERVICE_ENV_ACTIVATE"
+fi
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+# One HTTP process serves both /api/sam31 and /api/locateanything.
+export GPU_SERVICE_HOST="${GPU_SERVICE_HOST:-0.0.0.0}"
+export GPU_SERVICE_PORT="${GPU_SERVICE_PORT:-9010}"
+
+# LocateAnything runs in this process. This external directory must contain
+# locateanything_worker.py and its model dependencies must exist in this Python environment.
+export LOCATEANYTHING_ROOT="${LOCATEANYTHING_ROOT:-/opt/LocateAnything}"
+export LOCANY_MODEL="${LOCANY_MODEL:-nvidia/LocateAnything-3B}"
+export LOCANY_CACHE_DIR="${LOCANY_CACHE_DIR:-/data/annotation-cache/locateanything}"
+export LOCANY_ALLOWED_ROOTS="${LOCANY_ALLOWED_ROOTS:-/data/annotation-transfer/locateanything/videos}"
+export LOCANY_DEVICE="${LOCANY_DEVICE:-cuda:0}"
+export LOCANY_DTYPE="${LOCANY_DTYPE:-bf16}"
+
+# SAM3.1 remains in its existing ComfyUI environment. The unified service starts
+# its runner through SAM31_PYTHON, so this does not have to be the current Python.
+export SAM31_COMFY_ROOT="${SAM31_COMFY_ROOT:-/opt/ComfyUI}"
+export SAM31_CHECKPOINT="${SAM31_CHECKPOINT:-/models/sam3.1_multiplex_fp16.safetensors}"
+export SAM31_PYTHON="${SAM31_PYTHON:-python3}"
+export SAM31_RUNNER="${SAM31_RUNNER:-$ROOT_DIR/gpu_services/sam31_track.py}"
+export SAM31_CACHE_DIR="${SAM31_CACHE_DIR:-/data/annotation-cache/sam31}"
+export SAM31_ALLOWED_ROOTS="${SAM31_ALLOWED_ROOTS:-/data/annotation-transfer/sam31/videos}"
+export SAM31_DEVICE="${SAM31_DEVICE:-cuda:0}"
+export SAM31_DTYPE="${SAM31_DTYPE:-fp16}"
+
+if [[ ! -f "$LOCATEANYTHING_ROOT/locateanything_worker.py" ]]; then
+  echo "[ERROR] LOCATEANYTHING_ROOT must contain locateanything_worker.py: $LOCATEANYTHING_ROOT" >&2
+  exit 2
+fi
+if [[ ! -f "$SAM31_RUNNER" ]]; then
+  echo "[ERROR] SAM31_RUNNER does not exist: $SAM31_RUNNER" >&2
+  exit 2
+fi
+
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+echo "Starting unified GPU service at http://${GPU_SERVICE_HOST}:${GPU_SERVICE_PORT}"
+echo "LocateAnything root: $LOCATEANYTHING_ROOT"
+echo "SAM3.1 runner Python: $SAM31_PYTHON"
+echo "SAM3.1 runner: $SAM31_RUNNER"
+exec "$PYTHON_BIN" -m gpu_services.server --host "$GPU_SERVICE_HOST" --port "$GPU_SERVICE_PORT" "$@"

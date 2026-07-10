@@ -4,7 +4,7 @@ import json
 import unittest
 from pathlib import Path
 
-from mot_pipeline.config import DEFAULT_CONFIG, load_config
+from utils.mot_pipeline.config import DEFAULT_CONFIG, load_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +24,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["tracking"]["method"], "sparse_track")
         self.assertIn("overview_filename", config["clips"])
         self.assertEqual(config["annotator"], DEFAULT_CONFIG["annotator"])
+        self.assertEqual(config["locateanything"]["sftp_password_env"], "LOCANY_SFTP_PASSWORD")
 
     def test_example_configs_are_valid_json(self) -> None:
         for path in (PROJECT_ROOT / "configs").glob("*.json"):

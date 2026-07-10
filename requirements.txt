@@ -1,2 +1,2 @@
-# Compatibility entry point for the Windows platform and local annotator.
+# Compatibility entry point for the Windows platform and local workbench.
 -r requirements/base.txt

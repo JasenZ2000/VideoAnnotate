@@ -1,2 +1,0 @@
-# Python 3.10+ is required. Install the CUDA-matched PyTorch build first.
--e ./locateAnything

@@ -1,0 +1,2 @@
+-r annotator.txt
+pyinstaller>=6.0

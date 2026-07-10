@@ -2,7 +2,7 @@
 
 ## 本地等待远端 GPU 任务时超时
 
-HTTP 超时只应作用于提交、轮询和下载等单次请求。先确认客户端已经获得 `job_id`，并且正在轮询 `/api/jobs/{id}`。不要把一次推理实现成持续数小时的单个 HTTP 请求。只有结果 ZIP 下载确实超时时，才需要增加 `download_timeout`。
+HTTP 超时只应作用于提交、轮询和下载等单次请求。先确认客户端已经获得 `job_id`，并且正在轮询 `/api/sam31/jobs/{id}` 或 `/api/locateanything/jobs/{id}`。不要把一次推理实现成持续数小时的单个 HTTP 请求。只有结果 ZIP 下载确实超时时，才需要增加 `download_timeout`。
 
 ## LocateAnything 在 `generate()` 阶段显存不足
 

@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Annotator Config</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; font-family: "Segoe UI", Arial, sans-serif; background: #181818; color: #e5e5e5; }
+button { cursor: pointer; padding: 6px 10px; border: 1px solid #555; background: #303030; color: #e5e5e5; border-radius: 4px; font-size: 12px; }
+button:hover { background: #3d3d3d; }
+button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+button.danger { background: #b91c1c; border-color: #b91c1c; color: #fff; }
+input, select { padding: 6px 8px; border: 1px solid #555; background: #252525; color: #e5e5e5; border-radius: 4px; font-size: 12px; }
+input[type="checkbox"] { width: 16px; height: 16px; }
+label { color: #a8a8a8; font-size: 11px; }
+.topbar { display: flex; align-items: center; gap: 8px; padding: 10px; border-bottom: 1px solid #333; background: #202020; }
+.topbar input { width: min(760px, 55vw); }
+.layout { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 52px); }
+.sidebar { border-right: 1px solid #333; padding: 10px; overflow: auto; }
+.content { padding: 12px; overflow: auto; }
+.target { width: 100%; text-align: left; margin-bottom: 6px; border-left: 4px solid transparent; }
+.target.active { background: #343434; border-left-color: #60a5fa; }
+.target small { display: block; color: #999; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.section { border-top: 1px solid #333; padding: 12px 0; }
+.section:first-child { border-top: 0; }
+.section h2 { margin: 0 0 8px; font-size: 15px; font-weight: 600; color: #f3f3f3; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px 14px; }
+.field { display: grid; grid-template-columns: 1fr; gap: 4px; min-width: 0; }
+.field input { width: 100%; }
+.field .path { font-size: 11px; color: #8b8b8b; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.actions { display: flex; align-items: center; gap: 8px; padding: 10px 0 14px; position: sticky; top: 0; background: #181818; border-bottom: 1px solid #333; z-index: 1; }
+#status { color: #9ca3af; font-size: 12px; margin-left: auto; }
+.muted { color: #9ca3af; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <button onclick="location.href='/'">Annotator</button>
+  <label>Workspace</label>
+  <input id="workspace-path" placeholder="path/to/workspace">
+  <button class="primary" onclick="loadConfig()">Load</button>
+  <button onclick="useCurrentWorkspace()">Use Open Workspace</button>
+</div>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="muted" style="margin-bottom:8px">Targets</div>
+    <div id="target-list"></div>
+  </aside>
+  <main class="content">
+    <div class="actions">
+      <button class="primary" onclick="saveCurrent()">Save Target</button>
+      <button onclick="applyCurrentToAllSegments()">Apply Current To All Segments</button>
+      <button onclick="reloadCurrent()">Reload</button>
+      <span id="status"></span>
+    </div>
+    <div id="title" class="muted">Load a workspace to edit config.</div>
+    <div id="form"></div>
+  </main>
+</div>
+<script>
+let payload = null;
+let selected = null;
+let currentConfig = null;
+
+const primitiveType = value => {
+  if (typeof value === 'boolean') return 'boolean';
+  if (typeof value === 'number') return 'number';
+  return 'string';
+};
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function setStatus(message) {
+  document.getElementById('status').textContent = message;
+}
+
+function appUrl(url) {
+  return url.startsWith('/') ? `.${url}` : url;
+}
+
+async function api(method, url, body) {
+  const r = await fetch(appUrl(url), {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(err.detail || r.statusText);
+  }
+  return r.json();
+}
+
+async function useCurrentWorkspace() {
+  const state = await api('GET', '/api/state');
+  if (state.workspace) {
+    document.getElementById('workspace-path').value = state.workspace;
+    await loadConfig();
+  } else {
+    setStatus('No workspace is open in annotator.');
+  }
+}
+
+async function loadConfig() {
+  const path = document.getElementById('workspace-path').value.trim();
+  setStatus('Loading...');
+  try {
+    payload = await api('POST', '/api/config/inspect', { path: path || null });
+    document.getElementById('workspace-path').value = payload.workspace;
+    selected = selected || 'root';
+    if (selected !== 'root' && !payload.segments.some(s => s.name === selected)) selected = 'root';
+    renderTargets();
+    selectTarget(selected);
+    setStatus('Loaded');
+  } catch (e) {
+    setStatus('Error: ' + e.message);
+  }
+}
+
+function targetEntries() {
+  if (!payload) return [];
+  return [
+    { id: 'root', label: 'Workspace config', detail: payload.root.config_path, config: payload.root.effective },
+    ...payload.segments.map(s => ({ id: s.name, label: s.name, detail: s.config_path, config: s.effective })),
+  ];
+}
+
+function renderTargets() {
+  const list = document.getElementById('target-list');
+  list.innerHTML = '';
+  for (const entry of targetEntries()) {
+    const btn = document.createElement('button');
+    btn.className = 'target' + (entry.id === selected ? ' active' : '');
+    btn.innerHTML = `${entry.label}<small>${entry.detail}</small>`;
+    btn.onclick = () => selectTarget(entry.id);
+    list.appendChild(btn);
+  }
+}
+
+function selectTarget(id) {
+  selected = id;
+  const entry = targetEntries().find(x => x.id === id);
+  if (!entry) return;
+  currentConfig = clone(entry.config);
+  renderTargets();
+  document.getElementById('title').textContent = `${entry.label}  |  ${entry.detail}`;
+  renderForm();
+}
+
+function renderForm() {
+  const form = document.getElementById('form');
+  form.innerHTML = '';
+  if (!currentConfig) return;
+  for (const [sectionName, sectionValue] of Object.entries(currentConfig)) {
+    const section = document.createElement('section');
+    section.className = 'section';
+    const h2 = document.createElement('h2');
+    h2.textContent = sectionName;
+    section.appendChild(h2);
+    const grid = document.createElement('div');
+    grid.className = 'grid';
+    renderFields(grid, [sectionName], sectionValue);
+    section.appendChild(grid);
+    form.appendChild(section);
+  }
+}
+
+function renderFields(container, path, value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    for (const [key, child] of Object.entries(value)) {
+      renderFields(container, [...path, key], child);
+    }
+    return;
+  }
+  const field = document.createElement('div');
+  field.className = 'field';
+  const label = document.createElement('label');
+  label.textContent = path[path.length - 1];
+  const pathLabel = document.createElement('div');
+  pathLabel.className = 'path';
+  pathLabel.textContent = path.join('.');
+  const input = document.createElement('input');
+  const type = primitiveType(value);
+  if (type === 'boolean') {
+    input.type = 'checkbox';
+    input.checked = Boolean(value);
+    input.onchange = () => setByPath(path, input.checked);
+  } else if (type === 'number') {
+    input.type = 'number';
+    input.step = Number.isInteger(value) ? '1' : '0.01';
+    input.value = value;
+    input.oninput = () => setByPath(path, input.value === '' ? 0 : Number(input.value));
+  } else {
+    input.type = 'text';
+    input.value = value == null ? '' : String(value);
+    input.oninput = () => setByPath(path, input.value);
+  }
+  field.appendChild(label);
+  field.appendChild(input);
+  field.appendChild(pathLabel);
+  container.appendChild(field);
+}
+
+function setByPath(path, value) {
+  let cursor = currentConfig;
+  for (let i = 0; i < path.length - 1; i++) cursor = cursor[path[i]];
+  cursor[path[path.length - 1]] = value;
+}
+
+async function saveCurrent() {
+  if (!payload || !selected || !currentConfig) return;
+  setStatus('Saving...');
+  try {
+    const r = await api('POST', '/api/config/save', {
+      path: payload.workspace,
+      target: selected,
+      config: currentConfig,
+    });
+    setStatus(`Saved ${r.count} file(s)`);
+    await loadConfig();
+  } catch (e) {
+    setStatus('Error: ' + e.message);
+  }
+}
+
+async function applyCurrentToAllSegments() {
+  if (!payload || !currentConfig) return;
+  if (!confirm('Apply the current config to every segment config.json?')) return;
+  setStatus('Saving all segments...');
+  try {
+    const r = await api('POST', '/api/config/save', {
+      path: payload.workspace,
+      target: 'all_segments',
+      config: currentConfig,
+    });
+    setStatus(`Saved ${r.count} segment config file(s)`);
+    await loadConfig();
+  } catch (e) {
+    setStatus('Error: ' + e.message);
+  }
+}
+
+async function reloadCurrent() {
+  await loadConfig();
+}
+
+useCurrentWorkspace().catch(() => {});
+</script>
+</body>
+</html>

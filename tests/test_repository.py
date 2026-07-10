@@ -22,9 +22,12 @@ class RepositoryTests(unittest.TestCase):
     def test_deployment_scripts_exist(self) -> None:
         expected = [
             "scripts/windows/run-platform.bat",
-            "scripts/windows/run-annotator.bat",
-            "scripts/linux/run-sam31-server.sh",
-            "scripts/linux/run-locateanything-server.sh",
+            "scripts/windows/run-platform.ps1",
+            "scripts/windows/run-local-workbench.bat",
+            "scripts/windows/build-local-workbench.ps1",
+            "scripts/windows/stop-local-workbench.bat",
+            "scripts/linux/run-gpu-service.sh",
+            "gpu_services/run_gpu_service.sh",
             "scripts/check-services.py",
         ]
         for relative in expected:
