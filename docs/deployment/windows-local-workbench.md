@@ -26,7 +26,14 @@ pip install -r requirements\windows-build.txt
 .\scripts\windows\build-local-workbench.ps1
 ```
 
-生成文件为 `dist\VideoAnnotationWorkbench.exe`。该文件会启动同一个本地服务；默认保留控制台便于查看启动和错误日志。传入 `-Windowed` 可生成无控制台版本。
+生成文件为 `dist\VideoAnnotationWorkbench.exe`，同时会生成 `dist\local_workbench.env`。双击 exe 前可编辑配置文件设置监听地址和端口：
+
+```dotenv
+LOCAL_WORKBENCH_HOST=127.0.0.1
+LOCAL_WORKBENCH_PORT=17860
+```
+
+配置文件必须与 exe 放在同一目录。端口已被占用时，控制台会提示修改该文件。该文件会启动同一个本地服务；默认保留控制台便于查看启动和错误日志。传入 `-Windowed` 可生成无控制台版本。
 
 ## 工作区配置
 

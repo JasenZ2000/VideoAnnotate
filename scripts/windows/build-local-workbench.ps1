@@ -36,4 +36,14 @@ if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller exited with code $LASTEXITCODE. Install it first with: pip install -r requirements\windows-build.txt"
 }
 
+$configPath = Join-Path $OutputDir "local_workbench.env"
+if (-not (Test-Path $configPath)) {
+    @(
+        "# Edit this file before double-clicking the executable."
+        "LOCAL_WORKBENCH_HOST=127.0.0.1"
+        "LOCAL_WORKBENCH_PORT=7860"
+    ) | Set-Content -Path $configPath -Encoding UTF8
+}
+
 Write-Host "Built: $(Join-Path $OutputDir "$Name.exe")"
+Write-Host "Config: $configPath"

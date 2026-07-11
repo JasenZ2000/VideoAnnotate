@@ -82,6 +82,8 @@ Open `http://127.0.0.1:7860/annotator/` for annotation, or `http://127.0.0.1:786
 
 To build a Windows executable, install `requirements\windows-build.txt` and run `scripts\windows\build-local-workbench.ps1`. The generated `VideoAnnotationWorkbench.exe` contains both UIs and their static assets.
 
+On Windows, start the workflow platform with `workflow_platform\run.ps1`. Its default port is `8088`; either edit `$DefaultPort` near the top of that file or override it at launch with `-Port 8090`.
+
 ### Linux GPU services
 
 ```bash
