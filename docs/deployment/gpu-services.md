@@ -5,7 +5,9 @@
 只启动一个 HTTP 进程：`gpu_services.server`，默认监听 `9010`。它通过两个命名空间暴露能力：
 
 - `/api/sam31/...`：目标框提示的视频跟踪；
-- `/api/locateanything/...`：视频逐帧预标注和 YOLO ZIP 导出。
+- `/api/locateanything/...`：视频逐帧预标注，同时导出 YOLO TXT 与 Pascal VOC XML。
+
+LocateAnything 结果 ZIP 中，YOLO 标注位于 `labels/`，Pascal VOC 标注位于 `annotations/`。两个目录按相同的视频名前缀和帧号逐帧对应。
 
 HTTP 服务不要求把两套模型运行时合并到一个 Python 环境。它运行在能加载 LocateAnything 的环境中；SAM3.1 作业由 `SAM31_PYTHON` 指向原有的 ComfyUI 环境后，以子进程方式运行。
 

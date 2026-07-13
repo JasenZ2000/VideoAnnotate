@@ -231,7 +231,7 @@ def _run_batch(job_id: str, req: BatchReq) -> None:
             while True:
                 remote = _json_request("GET", f"{base}/api/locateanything/jobs/{remote_job_id}")
                 item["message"] = remote.get("message", "")
-                job["message"] = f"[{index}/{len(videos)}] {video.name}: {item['message']}"
+                job["message"] = f"[{index}/{len(videos)}] {video_name}: {item['message']}"
                 if remote.get("status") not in {"queued", "running"}:
                     break
                 time.sleep(2)

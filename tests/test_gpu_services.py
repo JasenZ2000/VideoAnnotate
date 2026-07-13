@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -46,6 +47,30 @@ class GpuServicesTests(unittest.TestCase):
             (root / "locateanything_worker.py").write_text("# external worker\n", encoding="utf-8")
             self.assertEqual(locateanything._external_root(), root.resolve())
         locateanything.SETTINGS["external_root"] = original
+
+    def test_locateanything_writes_pascal_voc_xml(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "annotations" / "sample_1.xml"
+            locateanything._write_voc_xml(
+                output,
+                "sample_1.jpg",
+                1920,
+                1080,
+                [{"label": "person", "bbox_xyxy": [214.4, 375.2, 533.1, 893.0]}],
+            )
+            root = ET.parse(output).getroot()
+            self.assertEqual(root.findtext("filename"), "sample_1.jpg")
+            self.assertEqual(root.findtext("size/width"), "1920")
+            self.assertEqual(root.findtext("object/name"), "person")
+            self.assertEqual(root.findtext("object/bndbox/xmin"), "214")
+            self.assertEqual(root.findtext("object/bndbox/ymax"), "893")
+
+    def test_locateanything_writes_empty_pascal_voc_xml(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "annotations" / "sample_2.xml"
+            locateanything._write_voc_xml(output, "sample_2.jpg", 640, 480, [])
+            root = ET.parse(output).getroot()
+            self.assertEqual(root.findall("object"), [])
 
 
 if __name__ == "__main__":

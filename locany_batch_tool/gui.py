@@ -64,7 +64,7 @@ class MainWindow(QMainWindow):
         title = QLabel("LocateAnything 批量预标注")
         title.setFont(QFont("Microsoft YaHei", 18, QFont.Weight.Bold))
         root.addWidget(title)
-        subtitle = QLabel("选择视频，测试连接，然后批量生成 YOLO 标注。")
+        subtitle = QLabel("选择视频，测试连接，然后批量生成 YOLO TXT 与 Pascal VOC XML 标注。")
         subtitle.setStyleSheet("color:#667085")
         root.addWidget(subtitle)
 
@@ -140,7 +140,7 @@ class MainWindow(QMainWindow):
 
     def _mode_changed(self) -> None:
         sftp=self.mode.currentData()=="sftp";self.sftp_frame.setVisible(sftp);self.reuse.setVisible(sftp)
-        self.output_label.setText("本地 ZIP 结果目录" if sftp else "GPU 服务器输出目录")
+        self.output_label.setText("本地标注 ZIP 目录" if sftp else "GPU 服务器输出目录")
         self.file_button.setVisible(sftp);self.input_dir_button.setVisible(sftp);self.output_button.setVisible(sftp)
         if sftp:
             self.input_path.setPlaceholderText("选择本机视频，或包含多个视频的本机目录")
@@ -207,7 +207,7 @@ class MainWindow(QMainWindow):
     def _show_progress(self,job:dict) -> None:
         total=int(job.get("total",0));done=int(job.get("completed",0));self.progress.setRange(0,max(1,total));self.progress.setValue(done);self.status.setText(str(job.get("message","")))
         lines=[]
-        for item in job.get("items",[]):lines.append(f"[{item.get('status','')}] {Path(item.get('video','')).name}\n  {item.get('message','')}{chr(10)+'  → '+item['output'] if item.get('output') else ''}")
+        for item in job.get("items",[]):lines.append(f"[{item.get('status','')}] {str(item.get('video','')).replace(chr(92),'/').rsplit('/',1)[-1]}\n  {item.get('message','')}{chr(10)+'  → '+item['output'] if item.get('output') else ''}")
         self.log.setPlainText("\n".join(lines))
 
     def _connection_ok(self,result:dict) -> None:

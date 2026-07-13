@@ -21,7 +21,7 @@ pip install -r requirements\locany-tool-windows.txt
 
 ## SFTP 模式
 
-填写本地视频或目录、本地 ZIP 输出目录、GPU Services URL 和 SFTP 设置。工具会依次上传视频、提交 LocateAnything 作业，并把每个视频的 YOLO ZIP 下载为 `<视频名>_yolo.zip`。
+填写本地视频或目录、本地 ZIP 输出目录、GPU Services URL 和 SFTP 设置。工具会依次上传视频、提交 LocateAnything 作业，并把每个视频的标注 ZIP 下载为 `<视频名>_yolo.zip`。ZIP 内的 YOLO TXT 位于 `labels/`，Pascal VOC XML 位于 `annotations/`。
 
 密码只随当前页面请求发送，不会写入浏览器存储。也可在项目根目录的 `.env.local` 中设置 `LOCANY_SFTP_PASSWORD`；该文件已被 Git 忽略。
 
@@ -43,7 +43,7 @@ export LOCANY_ALLOWED_ROOTS=/data/videos
 export LOCANY_OUTPUT_ALLOWED_ROOTS=/data/labels
 ```
 
-服务端会拒绝允许根目录之外的视频和输出位置。每个视频的标签、元数据、原始回答和 ZIP 会写入输出目录下以视频名命名的子目录。
+服务端会拒绝允许根目录之外的视频和输出位置。每个视频的 `labels/`、`annotations/`、元数据、原始回答和 ZIP 会写入输出目录下以视频名命名的子目录。
 
 ## 类别映射
 

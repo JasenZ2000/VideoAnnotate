@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Optional
 
@@ -281,6 +282,44 @@ def _write_text_atomic(path: Path, text: str) -> None:
     temporary.replace(path)
 
 
+def _write_voc_xml(
+    path: Path,
+    image_filename: str,
+    width: int,
+    height: int,
+    boxes: list[dict[str, Any]],
+) -> None:
+    annotation = ET.Element("annotation")
+    ET.SubElement(annotation, "folder").text = "images"
+    ET.SubElement(annotation, "filename").text = image_filename
+    size = ET.SubElement(annotation, "size")
+    ET.SubElement(size, "width").text = str(width)
+    ET.SubElement(size, "height").text = str(height)
+    ET.SubElement(size, "depth").text = "3"
+    ET.SubElement(annotation, "segmented").text = "0"
+    for item in boxes:
+        x1, y1, x2, y2 = [float(value) for value in item["bbox_xyxy"]]
+        x1, x2 = max(0.0, min(float(width), x1)), max(0.0, min(float(width), x2))
+        y1, y2 = max(0.0, min(float(height), y1)), max(0.0, min(float(height), y2))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        obj = ET.SubElement(annotation, "object")
+        ET.SubElement(obj, "name").text = str(item.get("label") or "object")
+        ET.SubElement(obj, "pose").text = "Unspecified"
+        ET.SubElement(obj, "truncated").text = str(int(x1 <= 0 or y1 <= 0 or x2 >= width or y2 >= height))
+        ET.SubElement(obj, "difficult").text = "0"
+        bbox = ET.SubElement(obj, "bndbox")
+        ET.SubElement(bbox, "xmin").text = str(max(0, int(round(x1))))
+        ET.SubElement(bbox, "ymin").text = str(max(0, int(round(y1))))
+        ET.SubElement(bbox, "xmax").text = str(min(width, int(round(x2))))
+        ET.SubElement(bbox, "ymax").text = str(min(height, int(round(y2))))
+    ET.indent(annotation, space="  ")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    ET.ElementTree(annotation).write(temporary, encoding="utf-8", xml_declaration=True)
+    temporary.replace(path)
+
+
 def _write_zip(source_dir: Path, zip_path: Path) -> None:
     if zip_path.exists():
         zip_path.unlink()
@@ -300,7 +339,9 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
     job["message"] = "Loading LocateAnything model"
     out_dir = Path(SETTINGS["cache_dir"]) / job_id
     labels_dir = out_dir / "labels"
+    annotations_dir = out_dir / "annotations"
     labels_dir.mkdir(parents=True, exist_ok=True)
+    annotations_dir.mkdir(parents=True, exist_ok=True)
     raw_path = out_dir / "raw_answers.jsonl"
     metadata_path = out_dir / "metadata.json"
     zip_path = out_dir / "locateanything_yolo.zip"
@@ -342,8 +383,11 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
                 break
             frame_id = frame_idx + int(req.frame_offset)
             txt_path = labels_dir / f"{prefix}_{frame_id}.txt"
+            image_filename = f"{prefix}_{frame_id}.jpg"
+            xml_path = annotations_dir / f"{prefix}_{frame_id}.xml"
             if (frame_idx - start_frame) % frame_step != 0:
                 _write_text_atomic(txt_path, "")
+                _write_voc_xml(xml_path, image_filename, width, height, [])
                 continue
             try:
                 original = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
@@ -361,11 +405,17 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
                     line = _box_to_yolo_line(box, width, height, mapped_class_id, req.score)
                     if line is not None:
                         lines.append(line)
-                        boxes.append({"label": item.get("label", ""), "class_id": mapped_class_id, "bbox_xyxy": box})
+                        boxes.append({
+                            "label": item.get("label") or req.prompt or "object",
+                            "class_id": mapped_class_id,
+                            "bbox_xyxy": box,
+                        })
                 _write_text_atomic(txt_path, "\n".join(lines) + ("\n" if lines else ""))
+                _write_voc_xml(xml_path, image_filename, width, height, boxes)
                 with open(raw_path, "a", encoding="utf-8") as handle:
                     handle.write(json.dumps({
-                        "frame_idx": frame_idx, "frame_id": frame_id, "txt": txt_path.name,
+                        "frame_idx": frame_idx, "frame_id": frame_id,
+                        "txt": txt_path.name, "xml": xml_path.name,
                         "answer": answer, "num_boxes": len(lines), "boxes": boxes,
                         "inference_image_size": [inference_image.width, inference_image.height],
                         "inference_resize_ratio": resize_ratio,
@@ -374,8 +424,12 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
             except Exception as exc:
                 failed += 1
                 _write_text_atomic(txt_path, "")
+                _write_voc_xml(xml_path, image_filename, width, height, [])
                 with open(raw_path, "a", encoding="utf-8") as handle:
-                    handle.write(json.dumps({"frame_idx": frame_idx, "frame_id": frame_id, "txt": txt_path.name, "error": str(exc)}, ensure_ascii=False) + "\n")
+                    handle.write(json.dumps({
+                        "frame_idx": frame_idx, "frame_id": frame_id,
+                        "txt": txt_path.name, "xml": xml_path.name, "error": str(exc),
+                    }, ensure_ascii=False) + "\n")
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             if processed and processed % 10 == 0:
@@ -387,7 +441,7 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
         direct_output_dir = None
         if req.output_dir:
             direct_output_dir = _resolve_output_dir(req.output_dir)
-            for source in (labels_dir, raw_path, metadata_path, zip_path):
+            for source in (labels_dir, annotations_dir, raw_path, metadata_path, zip_path):
                 destination = direct_output_dir / source.name
                 if source.is_dir():
                     if destination.exists():
@@ -398,7 +452,8 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
         job.update({
             "status": "done", "message": f"Done: processed {processed} frames, failed {failed}",
             "processed_frames": processed, "failed_frames": failed, "result_zip_path": str(zip_path),
-            "labels_dir": str(labels_dir), "metadata_path": str(metadata_path),
+            "labels_dir": str(labels_dir), "annotations_dir": str(annotations_dir),
+            "metadata_path": str(metadata_path),
             "direct_output_dir": str(direct_output_dir) if direct_output_dir else "",
         })
     except Exception as exc:

@@ -6,7 +6,15 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from gpu_services import locateanything
-from locany_batch_tool.server import _check_direct_capabilities, _remote_videos, _videos, app
+from locany_batch_tool.server import (
+    JOBS,
+    BatchReq,
+    _check_direct_capabilities,
+    _remote_videos,
+    _run_batch,
+    _videos,
+    app,
+)
 
 
 class LocateAnythingBatchToolTests(TestCase):
@@ -50,6 +58,31 @@ class LocateAnythingBatchToolTests(TestCase):
         with patch("locany_batch_tool.server._json_request", return_value=openapi):
             with self.assertRaisesRegex(RuntimeError, "LOCANY_OUTPUT_ALLOWED_ROOTS"):
                 _check_direct_capabilities("http://gpu-server:10114", {})
+
+    def test_direct_batch_accepts_remote_video_strings(self) -> None:
+        remote_video = "/data2/videos/sample.mp4"
+        request = BatchReq(
+            server_url="http://gpu-server:10114",
+            mode="direct",
+            input_path="/data2/videos",
+            output_path="/data2/labels",
+        )
+        job_id = "direct-test"
+        JOBS[job_id] = {"id": job_id, "status": "queued", "message": "Queued"}
+
+        def fake_request(method, url, payload=None, timeout=30):
+            if method == "POST":
+                self.assertEqual(payload["video_path"], remote_video)
+                return {"job_id": "remote-job"}
+            return {"status": "done", "message": "Done", "direct_output_dir": "/data2/labels/sample"}
+
+        with patch("locany_batch_tool.server._remote_videos", return_value=[remote_video]), patch(
+            "locany_batch_tool.server._json_request", side_effect=fake_request
+        ):
+            _run_batch(job_id, request)
+
+        self.assertEqual(JOBS[job_id]["status"], "done")
+        self.assertEqual(JOBS[job_id]["items"][0]["output"], "/data2/labels/sample")
 
     def test_direct_output_must_be_inside_allowed_root(self) -> None:
         original = list(locateanything.SETTINGS.get("output_allowed_roots", []))
