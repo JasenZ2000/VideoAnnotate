@@ -44,6 +44,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--locany-device", default=os.environ.get("LOCANY_DEVICE", "cuda"))
     parser.add_argument("--locany-dtype", choices=("bf16", "fp16", "fp32"), default=os.environ.get("LOCANY_DTYPE", "bf16"))
     parser.add_argument("--locany-allowed-root", action="append", type=Path)
+    parser.add_argument("--locany-output-allowed-root", action="append", type=Path)
     args = parser.parse_args(argv)
 
     sam31.configure(
@@ -63,6 +64,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         device=args.locany_device,
         dtype=args.locany_dtype,
         allowed_roots=args.locany_allowed_root,
+        output_allowed_roots=args.locany_output_allowed_root,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LocateAnything 批量预标注</title>
+  <style>
+    :root{font-family:system-ui,"Microsoft YaHei",sans-serif;color:#18202a;background:#f3f6f9}*{box-sizing:border-box}
+    body{margin:0}.page{max-width:1080px;margin:28px auto;padding:0 18px}.card{background:#fff;border:1px solid #dce3ea;border-radius:12px;padding:20px;margin:14px 0;box-shadow:0 4px 14px #1e293b0d}
+    h1{margin:0 0 5px}h2{font-size:18px;margin:0 0 14px}.sub{color:#607080}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px}.wide{grid-column:1/-1}
+    label{display:block;font-size:13px;color:#526170;margin-bottom:5px}input,select,textarea{width:100%;padding:9px 10px;border:1px solid #c8d1db;border-radius:7px;background:#fff}textarea{min-height:76px;resize:vertical}
+    .row{display:flex;gap:10px;align-items:center;margin-top:15px}.row input[type=checkbox]{width:auto}.row label{margin:0}button{border:0;border-radius:7px;padding:10px 17px;background:#1769e0;color:white;cursor:pointer}button.secondary{background:#526170}button:disabled{opacity:.5;cursor:wait}
+    pre{white-space:pre-wrap;overflow:auto;background:#111827;color:#d9e6f2;padding:13px;border-radius:8px;min-height:64px}.hidden{display:none}.item{padding:9px 0;border-bottom:1px solid #edf1f5}.ok{color:#16794b}.bad{color:#b42318}
+    @media(max-width:700px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}}
+  </style>
+</head>
+<body><main class="page">
+  <h1>LocateAnything 批量预标注</h1><div class="sub">独立完成连接测试、批量推理和 YOLO 标注输出</div>
+  <section class="card"><h2>1. 连接与传输</h2><div class="grid">
+    <div class="wide"><label>GPU Services URL</label><input id="server_url" value="http://192.168.21.226:10114"></div>
+    <div><label>模式</label><select id="mode" onchange="toggleMode()"><option value="sftp">SFTP 上传并下载 ZIP</option><option value="direct">共享文件系统直连</option></select></div>
+    <div><label>CUDA 设备号</label><input id="cuda_device" type="number" min="0" value="0"></div>
+  </div><div id="sftp" class="grid" style="margin-top:13px">
+    <div><label>SFTP Host</label><input id="sftp_host" value="192.168.21.226"></div><div><label>端口</label><input id="sftp_port" type="number" value="22"></div>
+    <div><label>用户名</label><input id="sftp_username" value="hx"></div><div><label>密码（仅本次运行）</label><input id="sftp_password" type="password"></div>
+    <div><label>SSH 私钥（可选）</label><input id="sftp_key_path"></div><div><label>远端缓存目录</label><input id="sftp_remote_dir" value="/data2/DET_Group/ZZS/locateAnything/eagle/Embodied/fast_tmp"></div>
+  </div><div class="row"><button class="secondary" onclick="testConnection()">测试 GPU 与 SFTP</button><span id="testStatus"></span></div></section>
+  <section class="card"><h2>2. 输入与输出</h2><div class="grid">
+    <div class="wide"><label>视频文件或视频目录</label><input id="input_path" placeholder="D:\videos 或 /data/videos"></div>
+    <div class="wide"><label id="outputLabel">本地 ZIP 输出目录</label><input id="output_path" placeholder="D:\labels"></div>
+    <div><label>Prompt</label><input id="prompt" value="person"></div><div><label>任务类型</label><select id="task"><option value="ground_multi">ground_multi</option><option value="detect">detect</option><option value="ground_single">ground_single</option></select></div>
+    <div class="wide"><label>类别映射（每行：编号 类别名）</label><textarea id="classes">0 person</textarea></div>
+    <div><label>帧间隔</label><input id="frame_step" type="number" min="1" value="1"></div><div><label>最多处理帧数（0=全部）</label><input id="max_frames" type="number" min="0" value="0"></div>
+  </div><div class="row"><input id="recursive" type="checkbox"><label for="recursive">递归查找子目录</label><input id="reuse_uploads" type="checkbox" checked><label for="reuse_uploads">复用同大小远端视频</label></div>
+  <div class="row"><button id="run" onclick="startBatch()">开始批量预标注</button></div></section>
+  <section class="card"><h2>3. 进度</h2><pre id="status">等待任务</pre><div id="items"></div></section>
+</main><script>
+const $=id=>document.getElementById(id);let timer=null;
+function toggleMode(){const direct=$('mode').value==='direct';$('sftp').classList.toggle('hidden',direct);$('outputLabel').textContent=direct?'GPU 服务器输出目录':'本地 ZIP 输出目录';$('testStatus').textContent='';}
+function connection(){return{server_url:$('server_url').value.trim(),mode:$('mode').value,sftp_host:$('sftp_host').value.trim(),sftp_port:+$('sftp_port').value||22,sftp_username:$('sftp_username').value.trim(),sftp_password:$('sftp_password').value,sftp_key_path:$('sftp_key_path').value.trim(),sftp_remote_dir:$('sftp_remote_dir').value.trim()}}
+function saveForm(){const data={...connection(),input_path:$('input_path').value,output_path:$('output_path').value,cuda_device:$('cuda_device').value,prompt:$('prompt').value,classes:$('classes').value,task:$('task').value,frame_step:$('frame_step').value,max_frames:$('max_frames').value,recursive:$('recursive').checked,reuse_uploads:$('reuse_uploads').checked};delete data.sftp_password;localStorage.setItem('locanyBatchSettings',JSON.stringify(data))}
+function loadForm(){try{const data=JSON.parse(localStorage.getItem('locanyBatchSettings')||'{}');for(const[k,v]of Object.entries(data)){const el=$(k);if(!el)continue;if(el.type==='checkbox')el.checked=!!v;else el.value=v}}catch{}}
+function mapping(){const class_map={},categories=[];for(const raw of $('classes').value.split(/\r?\n/)){const line=raw.trim();if(!line)continue;const m=line.match(/^(\d+)\s+(.+)$/);if(!m)throw new Error(`类别映射格式错误: ${line}`);class_map[m[2].trim()]=+m[1];categories.push(m[2].trim())}if(!categories.length)throw new Error('至少填写一个类别');return{class_map,categories}}
+async function request(url,opts={}){const res=await fetch(url,{headers:{'Content-Type':'application/json'},...opts});const data=await res.json();if(!res.ok)throw new Error(data.detail||JSON.stringify(data));return data}
+async function testConnection(){saveForm();const el=$('testStatus');el.textContent='测试中…';el.className='';try{const data=await request('/api/test',{method:'POST',body:JSON.stringify(connection())});el.textContent=`成功：GPU ${data.gpu.device}/${data.gpu.dtype}${data.sftp?'，SFTP 目录可访问':''}`;el.className='ok'}catch(e){el.textContent=e.message;el.className='bad'}}
+async function startBatch(){try{saveForm();const payload={...connection(),...mapping(),input_path:$('input_path').value.trim(),output_path:$('output_path').value.trim(),cuda_device:+$('cuda_device').value||0,dtype:'bf16',prompt:$('prompt').value.trim()||'person',task:$('task').value,recursive:$('recursive').checked,reuse_uploads:$('reuse_uploads').checked,frame_step:+$('frame_step').value||1,max_frames:+$('max_frames').value||0};if(!payload.input_path||!payload.output_path)throw new Error('请填写输入和输出路径');$('run').disabled=true;const data=await request('/api/jobs',{method:'POST',body:JSON.stringify(payload)});poll(data.job_id)}catch(e){$('status').textContent=e.message;$('run').disabled=false}}
+async function poll(id){clearTimeout(timer);try{const job=await request(`/api/jobs/${id}`);$('status').textContent=`${job.status}  ${job.completed}/${job.total}\n${job.message}`;$('items').innerHTML=(job.items||[]).map(x=>`<div class="item ${x.status==='done'?'ok':''}">${x.video}<br>${x.status} ${x.message||''}${x.output?`<br>→ ${x.output}`:''}</div>`).join('');if(['queued','running'].includes(job.status))timer=setTimeout(()=>poll(id),1500);else $('run').disabled=false}catch(e){$('status').textContent=e.message;$('run').disabled=false}}
+loadForm();toggleMode();
+</script></body></html>

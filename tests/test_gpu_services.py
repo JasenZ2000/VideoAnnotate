@@ -19,6 +19,7 @@ class GpuServicesTests(unittest.TestCase):
             "/api/sam31/jobs/{job_id}",
             "/api/sam31/jobs/{job_id}/tracking-results",
             "/api/locateanything/jobs",
+            "/api/locateanything/videos",
             "/api/locateanything/jobs/{job_id}",
             "/api/locateanything/jobs/{job_id}/yolo-zip",
         }.issubset(paths))

@@ -34,6 +34,7 @@ export LOCATEANYTHING_ROOT=/opt/LocateAnything
 export LOCANY_MODEL=nvidia/LocateAnything-3B
 export LOCANY_CACHE_DIR=/data/annotation-cache/locateanything
 export LOCANY_ALLOWED_ROOTS=/data/annotation-transfer/locateanything/videos
+export LOCANY_OUTPUT_ALLOWED_ROOTS=/data/annotation-output/locateanything
 export LOCANY_DEVICE=cuda:1
 export LOCANY_DTYPE=bf16
 

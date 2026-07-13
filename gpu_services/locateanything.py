@@ -5,6 +5,7 @@ import importlib
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import cv2
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 from PIL import Image
 from pydantic import BaseModel, Field
@@ -23,6 +24,7 @@ from pydantic import BaseModel, Field
 DEFAULT_CACHE_DIR = Path(os.environ.get("LOCANY_CACHE_DIR", "/tmp/video-annotation-locateanything"))
 DEFAULT_MODEL = os.environ.get("LOCANY_MODEL", "nvidia/LocateAnything-3B")
 DEFAULT_EXTERNAL_ROOT = os.environ.get("LOCATEANYTHING_ROOT", "")
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mkv", ".mov", ".webm"}
 
 router = APIRouter(prefix="/api/locateanything", tags=["locateanything"])
 JOBS: dict[str, dict[str, Any]] = {}
@@ -37,6 +39,11 @@ SETTINGS: dict[str, Any] = {
     "allowed_roots": [
         Path(item).expanduser().resolve()
         for item in os.environ.get("LOCANY_ALLOWED_ROOTS", "").split(",")
+        if item.strip()
+    ],
+    "output_allowed_roots": [
+        Path(item).expanduser().resolve()
+        for item in os.environ.get("LOCANY_OUTPUT_ALLOWED_ROOTS", "").split(",")
         if item.strip()
     ],
 }
@@ -64,6 +71,7 @@ class LocateAnythingVideoReq(BaseModel):
     use_cache: bool = True
     device: Optional[str] = None
     dtype: Optional[str] = None
+    output_dir: Optional[str] = None
 
 
 def _torch() -> Any:
@@ -134,6 +142,31 @@ def _resolve_video_path(raw_path: str) -> Path:
     if allowed_roots and not any(_is_relative_to(path, root) for root in allowed_roots):
         roots = ", ".join(str(root) for root in allowed_roots)
         raise HTTPException(403, f"Video path is outside allowed roots: {roots}")
+    return path
+
+
+def _resolve_input_path(raw_path: str) -> Path:
+    if "\\" in raw_path or (len(raw_path) >= 2 and raw_path[1] == ":"):
+        raise HTTPException(400, "Direct paths must use the GPU server's POSIX path format")
+    path = Path(raw_path).expanduser().resolve()
+    if not path.exists():
+        raise HTTPException(400, f"Input path does not exist: {path}")
+    allowed_roots: list[Path] = SETTINGS.get("allowed_roots", [])
+    if allowed_roots and not any(_is_relative_to(path, root) for root in allowed_roots):
+        roots = ", ".join(str(root) for root in allowed_roots)
+        raise HTTPException(403, f"Input path is outside allowed roots: {roots}")
+    return path
+
+
+def _resolve_output_dir(raw_path: str) -> Path:
+    path = Path(raw_path).expanduser().resolve()
+    allowed_roots: list[Path] = SETTINGS.get("output_allowed_roots", [])
+    if not allowed_roots:
+        raise RuntimeError("Direct output is disabled; configure LOCANY_OUTPUT_ALLOWED_ROOTS")
+    if not any(_is_relative_to(path, root) for root in allowed_roots):
+        roots = ", ".join(str(root) for root in allowed_roots)
+        raise RuntimeError(f"Output path is outside allowed roots: {roots}")
+    path.mkdir(parents=True, exist_ok=True)
     return path
 
 
@@ -351,10 +384,22 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
                 job["processed_frames"], job["failed_frames"] = processed, failed
 
         _write_zip(out_dir, zip_path)
+        direct_output_dir = None
+        if req.output_dir:
+            direct_output_dir = _resolve_output_dir(req.output_dir)
+            for source in (labels_dir, raw_path, metadata_path, zip_path):
+                destination = direct_output_dir / source.name
+                if source.is_dir():
+                    if destination.exists():
+                        shutil.rmtree(destination)
+                    shutil.copytree(source, destination)
+                elif source.exists():
+                    shutil.copy2(source, destination)
         job.update({
             "status": "done", "message": f"Done: processed {processed} frames, failed {failed}",
             "processed_frames": processed, "failed_frames": failed, "result_zip_path": str(zip_path),
             "labels_dir": str(labels_dir), "metadata_path": str(metadata_path),
+            "direct_output_dir": str(direct_output_dir) if direct_output_dir else "",
         })
     except Exception as exc:
         job["status"] = "failed"
@@ -389,6 +434,7 @@ def health_payload() -> dict[str, Any]:
         "loaded_workers": [{"device": device, "dtype": dtype} for device, dtype in sorted(WORKERS)],
         "cuda_available": cuda_available,
         "allowed_roots": [str(root) for root in SETTINGS.get("allowed_roots", [])],
+        "output_allowed_roots": [str(root) for root in SETTINGS.get("output_allowed_roots", [])],
     }
 
 
@@ -397,11 +443,28 @@ async def health() -> dict[str, Any]:
     return health_payload()
 
 
+@router.get("/videos")
+async def list_videos(path: str = Query(...), recursive: bool = False) -> dict[str, Any]:
+    source = _resolve_input_path(path)
+    if source.is_file():
+        if source.suffix.lower() not in VIDEO_EXTENSIONS:
+            raise HTTPException(400, f"Unsupported video: {source}")
+        videos = [source]
+    else:
+        iterator = source.rglob("*") if recursive else source.iterdir()
+        videos = sorted(item for item in iterator if item.is_file() and item.suffix.lower() in VIDEO_EXTENSIONS)
+    if not videos:
+        raise HTTPException(400, f"No videos found in: {source}")
+    return {"ok": True, "input_path": str(source), "videos": [str(video) for video in videos]}
+
+
 @router.post("/jobs")
 async def create_job(req: LocateAnythingVideoReq) -> dict[str, Any]:
     if not req.prompt.strip() and not req.question.strip() and not req.categories:
         raise HTTPException(400, "prompt, categories, or question is required")
     video_path = _resolve_video_path(req.video_path)
+    if req.output_dir:
+        req.output_dir = str(_resolve_output_dir(req.output_dir))
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {
         "id": job_id, "status": "queued", "message": "Queued", "video_path": str(video_path),
@@ -442,6 +505,7 @@ def configure(
     device: str = os.environ.get("LOCANY_DEVICE", "cuda"),
     dtype: str = os.environ.get("LOCANY_DTYPE", "bf16"),
     allowed_roots: Optional[list[Path]] = None,
+    output_allowed_roots: Optional[list[Path]] = None,
 ) -> None:
     SETTINGS["cache_dir"] = cache_dir.expanduser().resolve()
     SETTINGS["model"] = model
@@ -450,5 +514,7 @@ def configure(
     SETTINGS["default_dtype"] = dtype
     if allowed_roots is not None:
         SETTINGS["allowed_roots"] = [path.expanduser().resolve() for path in allowed_roots]
+    if output_allowed_roots is not None:
+        SETTINGS["output_allowed_roots"] = [path.expanduser().resolve() for path in output_allowed_roots]
     SETTINGS["cache_dir"].mkdir(parents=True, exist_ok=True)
     WORKERS.clear()
