@@ -317,6 +317,44 @@ class PlatformDatabase:
                                str(task.get("part_prefix", "")), now)
         return self.get_task(str(task["task_id"]), now)
 
+    def update_task(self, task_id: str, actor: str, changes: dict[str, str],
+                    now: str) -> dict[str, Any]:
+        allowed = {"product_tag", "part_prefix", *TASK_FIELDS}
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError(f"unsupported task fields: {', '.join(sorted(unknown))}")
+        with self.transaction() as connection:
+            task = connection.execute(
+                "SELECT * FROM tasks WHERE task_id=? AND deleted=0", (task_id,)
+            ).fetchone()
+            if task is None:
+                raise KeyError(task_id)
+            if task["publisher"] != actor:
+                raise PermissionError("only publisher can edit task")
+            values = {key: str(value).strip() for key, value in changes.items()}
+            project = values.get("project", task["project"])
+            content = values.get("annotation_content", task["annotation_content"])
+            values["name"] = f"{project or '未命名项目'} · {content or '标注任务'}"
+            assignments = [f"{column}=?" for column in values]
+            connection.execute(
+                f"UPDATE tasks SET {','.join(assignments)},updated_at=? WHERE task_id=?",
+                [*values.values(), now, task_id],
+            )
+        return self.get_task(task_id, now)
+
+    def delete_task(self, task_id: str, actor: str, now: str) -> None:
+        with self.transaction() as connection:
+            task = connection.execute(
+                "SELECT publisher FROM tasks WHERE task_id=? AND deleted=0", (task_id,)
+            ).fetchone()
+            if task is None:
+                raise KeyError(task_id)
+            if task["publisher"] != actor:
+                raise PermissionError("only publisher can delete task")
+            connection.execute(
+                "UPDATE tasks SET deleted=1,updated_at=? WHERE task_id=?", (now, task_id)
+            )
+
     def _insert_parts(self, connection: sqlite3.Connection, task_id: str, count: int,
                       prefix: str, now: str) -> None:
         row = connection.execute(
@@ -448,8 +486,6 @@ class PlatformDatabase:
             ).fetchone()
             if task is None:
                 raise KeyError(task_id)
-            if task["publisher"] == actor:
-                raise PermissionError("publisher cannot claim own task")
             active = connection.execute(
                 "SELECT 1 FROM parts WHERE task_id=? AND annotator=? AND status='in_progress'",
                 (task_id, actor),

@@ -27,7 +27,7 @@ APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 PROJECT_ROOT = APP_DIR.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "platform_tasks"
-API_SCHEMA_VERSION = 5
+API_SCHEMA_VERSION = 6
 SESSION_COOKIE_NAME = "annotation_platform_session"
 SESSION_TTL_DAYS = int(os.environ.get("ANNOTATION_PLATFORM_SESSION_DAYS", "7"))
 PASSWORD_ITERATIONS = 200_000
@@ -93,6 +93,21 @@ class PublishTasksReq(BaseModel):
 
 class AddPartsReq(BaseModel):
     count: int
+
+
+class UpdateTaskReq(BaseModel):
+    product_tag: Optional[str] = None
+    part_prefix: Optional[str] = None
+    application_date: Optional[str] = None
+    applicant: Optional[str] = None
+    project: Optional[str] = None
+    annotation_content: Optional[str] = None
+    dataset_source: Optional[str] = None
+    hourly_capacity: Optional[str] = None
+    data_amount: Optional[str] = None
+    estimated_hours: Optional[str] = None
+    data_path: Optional[str] = None
+    guide_path: Optional[str] = None
 
 
 class SubmitPartReq(BaseModel):
@@ -450,6 +465,34 @@ async def get_task(task_id: str):
     else:
         task["parts"] = database().list_parts(task_id, now_iso(), actor)
     return task
+
+
+@app.patch("/api/tasks/{task_id}")
+async def update_task(task_id: str, req: UpdateTaskReq):
+    actor = require_user()["username"]
+    changes = {
+        field: value for field, value in req.model_dump(exclude_unset=True).items()
+        if value is not None
+    }
+    if not changes:
+        raise HTTPException(400, "请至少修改一项任务信息")
+    if "product_tag" in changes and not changes["product_tag"].strip():
+        raise HTTPException(400, "产品大标签不能为空")
+    try:
+        task = database().update_task(task_id, actor, changes, now_iso())
+    except BaseException as exc:
+        _raise_database_error(exc)
+    return {"task": task}
+
+
+@app.delete("/api/tasks/{task_id}")
+async def delete_task(task_id: str):
+    actor = require_user()["username"]
+    try:
+        database().delete_task(task_id, actor, now_iso())
+    except BaseException as exc:
+        _raise_database_error(exc)
+    return {"ok": True}
 
 
 @app.post("/api/tasks/{task_id}/parts")

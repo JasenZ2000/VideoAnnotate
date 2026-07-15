@@ -86,8 +86,30 @@ class PlatformDatabaseTests(unittest.TestCase):
             self.db.add_parts("task-1", 1, "worker", "2026-07-15T10:01:00+08:00")
         parts = self.db.add_parts("task-1", 2, "publisher", "2026-07-15T10:01:00+08:00")
         self.assertEqual(len(parts), 3)
+        claimed = self.db.claim_next_part(
+            "task-1", "publisher", "2026-07-15T10:02:00+08:00"
+        )
+        self.assertEqual(claimed["annotator"], "publisher")
+
+    def test_publisher_can_edit_and_delete_task_in_any_state(self) -> None:
+        self.db.create_task(task(), 1, "2026-07-15T10:00:00+08:00")
+        updated = self.db.update_task(
+            "task-1", "publisher",
+            {"product_tag": "AEB", "project": "车辆检测", "part_prefix": "NEW"},
+            "2026-07-15T10:01:00+08:00",
+        )
+        self.assertEqual(updated["product_tag"], "AEB")
+        self.assertEqual(updated["name"], "车辆检测 · 清洗相似图片")
         with self.assertRaises(PermissionError):
-            self.db.claim_next_part("task-1", "publisher", "2026-07-15T10:02:00+08:00")
+            self.db.update_task("task-1", "worker", {"project": "越权"},
+                                "2026-07-15T10:02:00+08:00")
+
+        self.db.claim_next_part("task-1", "publisher", "2026-07-15T10:03:00+08:00")
+        with self.assertRaises(PermissionError):
+            self.db.delete_task("task-1", "worker", "2026-07-15T10:04:00+08:00")
+        self.db.delete_task("task-1", "publisher", "2026-07-15T10:04:00+08:00")
+        with self.assertRaises(KeyError):
+            self.db.get_task("task-1", "2026-07-15T10:05:00+08:00")
 
     def test_user_session_lifecycle(self) -> None:
         self.db.create_user("admin", "hash", "admin", "管理员", "2026-07-15T10:00:00+08:00")

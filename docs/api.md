@@ -12,6 +12,9 @@
 - `GET|POST /api/tasks`
 - `GET /api/tasks/{task_id}`
 - `POST /api/tasks/{task_id}/parts`：发布者追加 Part
+- `PATCH /api/tasks/{task_id}`：发布者编辑任务信息
+- `DELETE /api/tasks/{task_id}`：发布者删除任意状态的自有任务
+- `POST /api/tasks/{task_id}/parts/claim-next`：领取下一个 Part，发布者也可领取自己的任务
 - `POST /api/tasks/{task_id}/parts/claim-next`
 - `POST /api/tasks/{task_id}/parts/{part_id}/start-rework`
 - `POST /api/tasks/{task_id}/parts/{part_id}/submit`

@@ -113,9 +113,36 @@ class WorkflowPlatformTests(unittest.TestCase):
         denied = self.client.post(f"/api/tasks/{task_id}/parts", json={"count": 2})
         self.assertEqual(denied.status_code, 403)
 
+    def test_publisher_can_claim_edit_and_delete_own_task(self) -> None:
+        task_id = self._publish(TABLE.splitlines()[1], 2)["tasks"][0]["task_id"]
+        claimed = self.client.post(f"/api/tasks/{task_id}/parts/claim-next")
+        self.assertEqual(claimed.status_code, 200, claimed.text)
+        self.assertEqual(claimed.json()["part"]["annotator"], "publisher")
+
+        edited = self.client.patch(f"/api/tasks/{task_id}", json={
+            "product_tag": "AEB", "project": "车辆检测", "data_path": r"\\server\new"
+        })
+        self.assertEqual(edited.status_code, 200, edited.text)
+        self.assertEqual(edited.json()["task"]["product_tag"], "AEB")
+        self.assertEqual(edited.json()["task"]["project"], "车辆检测")
+
+        deleted = self.client.delete(f"/api/tasks/{task_id}")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(self.client.get(f"/api/tasks/{task_id}").status_code, 404)
+
+    def test_non_publisher_cannot_edit_or_delete_task(self) -> None:
+        task_id = self._publish(TABLE.splitlines()[1], 1)["tasks"][0]["task_id"]
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={"username": "worker", "password": "worker-pass"})
+        self.assertEqual(
+            self.client.patch(f"/api/tasks/{task_id}", json={"project": "越权"}).status_code,
+            403,
+        )
+        self.assertEqual(self.client.delete(f"/api/tasks/{task_id}").status_code, 403)
+
     def test_health_and_authentication_contract(self) -> None:
         health = self.client.get("/api/health")
-        self.assertEqual(health.json()["api_schema_version"], 5)
+        self.assertEqual(health.json()["api_schema_version"], 6)
         self.client.post("/api/auth/logout")
         self.assertEqual(self.client.get("/api/tasks").status_code, 401)
 
