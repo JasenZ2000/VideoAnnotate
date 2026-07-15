@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>Annotator Config</title>
+<title>视频标注器配置</title>
 <style>
 * { box-sizing: border-box; }
 body { margin: 0; font-family: "Segoe UI", Arial, sans-serif; background: #181818; color: #e5e5e5; }
@@ -35,25 +35,25 @@ label { color: #a8a8a8; font-size: 11px; }
 </head>
 <body>
 <div class="topbar">
-  <button onclick="location.href='/'">Annotator</button>
-  <label>Workspace</label>
-  <input id="workspace-path" placeholder="path/to/workspace">
-  <button class="primary" onclick="loadConfig()">Load</button>
-  <button onclick="useCurrentWorkspace()">Use Open Workspace</button>
+  <button onclick="location.href='/'">返回标注器</button>
+  <label>工作目录</label>
+  <input id="workspace-path" placeholder="工作目录路径">
+  <button class="primary" onclick="loadConfig()">载入配置</button>
+  <button onclick="useCurrentWorkspace()">使用标注器已打开的目录</button>
 </div>
 <div class="layout">
   <aside class="sidebar">
-    <div class="muted" style="margin-bottom:8px">Targets</div>
+    <div class="muted" style="margin-bottom:8px">配置范围</div>
     <div id="target-list"></div>
   </aside>
   <main class="content">
     <div class="actions">
-      <button class="primary" onclick="saveCurrent()">Save Target</button>
-      <button onclick="applyCurrentToAllSegments()">Apply Current To All Segments</button>
-      <button onclick="reloadCurrent()">Reload</button>
+      <button class="primary" onclick="saveCurrent()">保存当前配置</button>
+      <button onclick="applyCurrentToAllSegments()">应用到全部视频分段</button>
+      <button onclick="reloadCurrent()">放弃修改并重载</button>
       <span id="status"></span>
     </div>
-    <div id="title" class="muted">Load a workspace to edit config.</div>
+    <div id="title" class="muted">请先载入工作目录，再编辑配置。</div>
     <div id="form"></div>
   </main>
 </div>
@@ -61,6 +61,16 @@ label { color: #a8a8a8; font-size: 11px; }
 let payload = null;
 let selected = null;
 let currentConfig = null;
+const FIELD_LABELS = {
+  annotator: '标注器性能', sam31: 'SAM3.1 服务', exports: '导出设置',
+  server_url: 'GPU 服务地址', video_transfer: '视频传输方式', device: '默认显卡', dtype: '计算精度',
+  local_path_prefix: '本地共享路径前缀', remote_path_prefix: '远端共享路径前缀',
+  sftp_host: 'SFTP 主机', sftp_port: 'SFTP 端口', sftp_username: 'SFTP 用户名',
+  sftp_key_path: 'SSH 私钥路径', sftp_remote_dir: '远端上传目录',
+  sftp_reuse_existing: '复用远端已有同名文件', class_labels: '类别名称表',
+  frame_buffer_ahead: '预读帧数', frame_batch_size: '帧批次大小', frame_cache_limit: '帧缓存上限',
+  annotation_buffer_ahead: '预读标注帧数', annotation_batch_size: '标注批次大小', annotation_cache_limit: '标注缓存上限',
+};
 
 const primitiveType = value => {
   if (typeof value === 'boolean') return 'boolean';
@@ -99,13 +109,13 @@ async function useCurrentWorkspace() {
     document.getElementById('workspace-path').value = state.workspace;
     await loadConfig();
   } else {
-    setStatus('No workspace is open in annotator.');
+    setStatus('标注器当前没有打开工作目录。');
   }
 }
 
 async function loadConfig() {
   const path = document.getElementById('workspace-path').value.trim();
-  setStatus('Loading...');
+  setStatus('正在载入…');
   try {
     payload = await api('POST', '/api/config/inspect', { path: path || null });
     document.getElementById('workspace-path').value = payload.workspace;
@@ -113,16 +123,16 @@ async function loadConfig() {
     if (selected !== 'root' && !payload.segments.some(s => s.name === selected)) selected = 'root';
     renderTargets();
     selectTarget(selected);
-    setStatus('Loaded');
+    setStatus('配置已载入');
   } catch (e) {
-    setStatus('Error: ' + e.message);
+    setStatus('错误：' + e.message);
   }
 }
 
 function targetEntries() {
   if (!payload) return [];
   return [
-    { id: 'root', label: 'Workspace config', detail: payload.root.config_path, config: payload.root.effective },
+    { id: 'root', label: '工作目录配置', detail: payload.root.config_path, config: payload.root.effective },
     ...payload.segments.map(s => ({ id: s.name, label: s.name, detail: s.config_path, config: s.effective })),
   ];
 }
@@ -154,10 +164,11 @@ function renderForm() {
   form.innerHTML = '';
   if (!currentConfig) return;
   for (const [sectionName, sectionValue] of Object.entries(currentConfig)) {
+    if (sectionName === 'locateanything') continue;
     const section = document.createElement('section');
     section.className = 'section';
     const h2 = document.createElement('h2');
-    h2.textContent = sectionName;
+    h2.textContent = FIELD_LABELS[sectionName] || sectionName;
     section.appendChild(h2);
     const grid = document.createElement('div');
     grid.className = 'grid';
@@ -177,7 +188,7 @@ function renderFields(container, path, value) {
   const field = document.createElement('div');
   field.className = 'field';
   const label = document.createElement('label');
-  label.textContent = path[path.length - 1];
+  label.textContent = FIELD_LABELS[path[path.length - 1]] || path[path.length - 1];
   const pathLabel = document.createElement('div');
   pathLabel.className = 'path';
   pathLabel.textContent = path.join('.');
@@ -211,34 +222,34 @@ function setByPath(path, value) {
 
 async function saveCurrent() {
   if (!payload || !selected || !currentConfig) return;
-  setStatus('Saving...');
+  setStatus('正在保存…');
   try {
     const r = await api('POST', '/api/config/save', {
       path: payload.workspace,
       target: selected,
       config: currentConfig,
     });
-    setStatus(`Saved ${r.count} file(s)`);
+    setStatus(`已保存 ${r.count} 个配置文件`);
     await loadConfig();
   } catch (e) {
-    setStatus('Error: ' + e.message);
+    setStatus('错误：' + e.message);
   }
 }
 
 async function applyCurrentToAllSegments() {
   if (!payload || !currentConfig) return;
-  if (!confirm('Apply the current config to every segment config.json?')) return;
-  setStatus('Saving all segments...');
+  if (!confirm('确定把当前配置应用到每个视频分段的 config.json 吗？')) return;
+  setStatus('正在保存全部分段…');
   try {
     const r = await api('POST', '/api/config/save', {
       path: payload.workspace,
       target: 'all_segments',
       config: currentConfig,
     });
-    setStatus(`Saved ${r.count} segment config file(s)`);
+    setStatus(`已保存 ${r.count} 个分段配置文件`);
     await loadConfig();
   } catch (e) {
-    setStatus('Error: ' + e.message);
+    setStatus('错误：' + e.message);
   }
 }
 

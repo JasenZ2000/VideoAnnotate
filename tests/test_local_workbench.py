@@ -23,8 +23,12 @@ class LocalWorkbenchTests(unittest.TestCase):
 
     def test_both_mounted_apps_serve_their_html(self) -> None:
         client = TestClient(app)
-        self.assertIn("Video Annotator", client.get("/annotator/").text)
-        self.assertIn("Training Frame Sampler", client.get("/sampler/").text)
+        annotator_html = client.get("/annotator/").text
+        self.assertIn("视频标注工作台", annotator_html)
+        self.assertIn("function pointerOnCanvas(event)", annotator_html)
+        self.assertIn("window.devicePixelRatio", annotator_html)
+        self.assertNotIn("LocateAnything YOLO", annotator_html)
+        self.assertIn("训练帧采样器", client.get("/sampler/").text)
 
 
 if __name__ == "__main__":

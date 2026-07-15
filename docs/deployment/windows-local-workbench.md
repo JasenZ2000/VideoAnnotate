@@ -43,7 +43,7 @@ LOCAL_WORKBENCH_PORT=17860
 
 标注包或工作区包含视频、`tracking_results.json` 和 `config.json`。以 `configs/annotator.example.json` 为模板，并设置：
 
-- `sam31.server_url` 和 `locateanything.server_url`：同一个统一 GPU API 地址；
+- `sam31.server_url`：统一 GPU API 地址；
 - `video_transfer`：共享存储使用 `path`，上传文件使用 `sftp`；
 - 共享存储的路径前缀，或 SFTP 主机、用户和远端目录；
 - `exports.class_labels`：任务类别表。
@@ -57,22 +57,10 @@ $env:SAM31_SFTP_PASSWORD="<session-password>"
 
 程序从 `sftp_password_env` 指定的环境变量读取密码。密码不得写入 JSON，也不得随审核结果上传到平台。部门安全策略允许时，优先使用 SSH 密钥。
 
-## 使用 LocateAnything
-
-Annotator 主界面的 **LocateAnything YOLO** 区域提供连接设置入口，可在不修改 JSON 的情况下调整：
-
-- LocateAnything `server_url`；
-- `path` 或 `sftp` 视频传输方式；
-- SFTP 主机、端口、用户名、密码和私钥；
-- 远端上传/缓存目录；
-- 共享路径模式下的本地与远端路径前缀。
-
-Prompt、最大推理帧数和 GPU 编号直接在 LocateAnything 执行区域填写。非敏感连接设置保存在当前浏览器；界面输入的 SFTP 密码只保留在当前页面内存中，关闭或刷新页面后消失，不会写入工作区配置和标注结果。远端上传目录必须位于 GPU 服务 `LOCANY_ALLOWED_ROOTS` 允许的目录内。
-
 ## 使用 SAM3.1
 
-打开工作区，选中或创建目标轨迹，在当前帧保存一个目标框，然后启动 `SAM31 Track Box`。本地服务会上传视频或转换共享路径、提交异步任务、轮询状态，并把返回的目标框合并到所选轨迹中。
+打开工作区，选中或创建目标轨迹，在当前帧保存一个目标框，然后点击 **用 SAM3.1 向后跟踪**。本地服务会上传视频或转换共享路径、提交异步任务、轮询状态，并把返回的目标框合并到所选轨迹中。
 
 必须人工检查生成的后续轨迹。SAM3.1 只是辅助编辑工具，不能代替人工审核结论。
 
-若要把独立生成的 `tracking_results.json` 作为新轨迹加入当前工作区，可在 Annotator 点击 **Append Tracking JSON**。工作台会自动重编号新增轨迹，避免与现有 `track_id` 冲突，并写回当前工作区的 `tracking_results.json`。
+若要把独立生成的 `tracking_results.json` 作为新轨迹加入当前工作区，可在标注器点击 **追加标注 JSON**。工作台会自动重编号新增轨迹，避免与现有 `track_id` 冲突，并写回当前工作区的 `tracking_results.json`。LocateAnything 预标注请使用独立的 `LocateAnythingBatchTool.exe`。

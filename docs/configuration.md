@@ -17,7 +17,7 @@ SQLite 应放在服务器本地可靠磁盘，不建议放在文件锁支持不�
 
 ## 本地 Workbench
 
-Annotator 优先使用工作区内的 `config.json`，项目级后备配置可由 `ANNOTATOR_CONFIG` 指定。其中包括 SAM3.1、LocateAnything、SFTP/共享路径和导出类别名称等设置。
+Annotator 优先使用工作区内的 `config.json`，项目级后备配置可由 `ANNOTATOR_CONFIG` 指定。其中包括 SAM3.1、SFTP/共享路径和导出类别名称等设置。LocateAnything 预标注使用独立的 Qt 批量工具，不再由 Workbench 调用。
 
 ## GPU Services
 

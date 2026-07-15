@@ -12,10 +12,8 @@ import shutil
 import sys
 import threading
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
-import zipfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -35,7 +33,7 @@ from utils.annotator.state import AnnotationState
 from utils.annotator.results import append_tracking_results
 from utils.annotator.export_formats import write_jpeg, write_voc_xml
 
-app = FastAPI(title="Video Annotator")
+app = FastAPI(title="视频标注工作台")
 STATE = AnnotationState()
 _cap: Optional[cv2.VideoCapture] = None
 _cap_pos: int = -1  # tracks current read position to avoid unnecessary seeks
@@ -43,7 +41,6 @@ _cap_lock = threading.Lock()
 _workspace: Optional[Path] = None
 _workspace_version: int = 0
 _sam31_jobs: dict[str, dict[str, Any]] = {}
-_locany_jobs: dict[str, dict[str, Any]] = {}
 
 STATIC_DIR = (
     Path(sys._MEIPASS) / "utils" / "annotator" / "static"
@@ -125,27 +122,6 @@ class Sam31BoxTrackReq(BaseModel):
     replace_after: bool = True
     cuda_device: Optional[int] = None
     use_rect_mask: Optional[bool] = None
-
-class LocateAnythingRemoteReq(BaseModel):
-    prompt: str
-    task: str = "ground_multi"
-    max_frames: int = 0
-    start_frame: int = 0
-    frame_step: int = 1
-    resize_long_edge: Optional[int] = None
-    max_new_tokens: Optional[int] = None
-    cuda_device: Optional[int] = None
-    server_url: Optional[str] = None
-    video_transfer: Optional[str] = None
-    local_path_prefix: Optional[str] = None
-    remote_path_prefix: Optional[str] = None
-    sftp_host: Optional[str] = None
-    sftp_port: Optional[int] = None
-    sftp_username: Optional[str] = None
-    sftp_password: Optional[str] = None
-    sftp_key_path: Optional[str] = None
-    sftp_remote_dir: Optional[str] = None
-    sftp_reuse_existing: Optional[bool] = None
 
 class ConfigInspectReq(BaseModel):
     path: Optional[str] = None
@@ -759,23 +735,9 @@ def _json_http_request(
 
 
 def _gpu_api_url(server_url: str, service: str, endpoint: str) -> str:
-    if service not in {"sam31", "locateanything"}:
+    if service != "sam31":
         raise ValueError(f"Unsupported GPU service namespace: {service}")
     return f"{server_url.rstrip('/')}/api/{service}/{endpoint.lstrip('/')}"
-
-
-def _download_binary(url: str, output_path: Path, timeout: float = 60.0, service_name: str = "remote service") -> None:
-    request = urllib.request.Request(url, method="GET")
-    try:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            with open(output_path, "wb") as f:
-                shutil.copyfileobj(response, f)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"{service_name} HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"{service_name} request failed: {exc}") from exc
 
 
 def _map_video_path_for_sam31(video: Path, sam_cfg: dict[str, Any]) -> str:
@@ -885,153 +847,6 @@ def _prepare_video_path_for_sam31(video: Path, sam_cfg: dict[str, Any], job: dic
     if transfer == "sftp":
         return _upload_video_via_sftp(video, sam_cfg, job)
     raise RuntimeError(f"Unknown sam31.video_transfer: {transfer}")
-
-
-def _locany_config(config: dict[str, Any]) -> dict[str, Any]:
-    cfg = dict(config.get("sam31", {}))
-    for key, value in config.get("locateanything", {}).items():
-        if value == "":
-            continue
-        cfg[key] = value
-    return cfg
-
-
-def _locany_request_config(
-    config: dict[str, Any],
-    req: LocateAnythingRemoteReq,
-) -> dict[str, Any]:
-    cfg = _locany_config(config)
-    string_fields = (
-        "server_url",
-        "video_transfer",
-        "local_path_prefix",
-        "remote_path_prefix",
-        "sftp_host",
-        "sftp_username",
-        "sftp_key_path",
-        "sftp_remote_dir",
-    )
-    for field in string_fields:
-        value = getattr(req, field)
-        if value is not None:
-            cfg[field] = value.strip()
-    if req.sftp_port is not None:
-        if req.sftp_port < 1 or req.sftp_port > 65535:
-            raise ValueError("sftp_port must be between 1 and 65535")
-        cfg["sftp_port"] = req.sftp_port
-    if req.sftp_reuse_existing is not None:
-        cfg["sftp_reuse_existing"] = req.sftp_reuse_existing
-    if req.sftp_password is not None:
-        cfg["sftp_password"] = req.sftp_password
-
-    transfer = str(cfg.get("video_transfer", "path")).lower()
-    if transfer not in {"path", "sftp"}:
-        raise ValueError("video_transfer must be path or sftp")
-    cfg["video_transfer"] = transfer
-    return cfg
-
-
-def _public_locany_settings(config: dict[str, Any]) -> dict[str, Any]:
-    cfg = _locany_config(config)
-    password_env = str(cfg.get("sftp_password_env", "LOCANY_SFTP_PASSWORD")).strip()
-    return {
-        "server_url": str(cfg.get("server_url", "")),
-        "video_transfer": str(cfg.get("video_transfer", "path")),
-        "local_path_prefix": str(cfg.get("local_path_prefix", "")),
-        "remote_path_prefix": str(cfg.get("remote_path_prefix", "")),
-        "sftp_host": str(cfg.get("sftp_host", "")),
-        "sftp_port": int(cfg.get("sftp_port", 22)),
-        "sftp_username": str(cfg.get("sftp_username", "")),
-        "sftp_key_path": str(cfg.get("sftp_key_path", "")),
-        "sftp_remote_dir": str(cfg.get("sftp_remote_dir", "")),
-        "sftp_reuse_existing": bool(cfg.get("sftp_reuse_existing", True)),
-        "sftp_password_env": password_env,
-        "sftp_password_configured": bool(password_env and os.environ.get(password_env)),
-    }
-
-
-def _validate_locany_connection_config(cfg: dict[str, Any]) -> None:
-    server_url = str(cfg.get("server_url", "")).strip()
-    parsed = urllib.parse.urlparse(server_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("locateanything.server_url must be a valid HTTP or HTTPS URL")
-    transfer = str(cfg.get("video_transfer", "path")).lower()
-    if transfer == "sftp":
-        missing = [
-            key
-            for key in ("sftp_host", "sftp_username", "sftp_remote_dir")
-            if not str(cfg.get(key, "")).strip()
-        ]
-        if missing:
-            raise ValueError(f"LocateAnything SFTP settings are missing: {', '.join(missing)}")
-    elif not str(cfg.get("local_path_prefix", "")).strip() or not str(cfg.get("remote_path_prefix", "")).strip():
-        raise ValueError("LocateAnything path transfer requires local_path_prefix and remote_path_prefix")
-
-
-def _test_locany_sftp(cfg: dict[str, Any]) -> dict[str, Any]:
-    try:
-        import paramiko
-    except ImportError as exc:
-        raise RuntimeError("SFTP connection test requires paramiko. Install it with: pip install paramiko") from exc
-
-    password_env = str(cfg.get("sftp_password_env", "LOCANY_SFTP_PASSWORD")).strip()
-    password = cfg.get("sftp_password")
-    if password is None:
-        password = os.environ.get(password_env) if password_env else None
-    connect_kwargs: dict[str, Any] = {
-        "hostname": str(cfg["sftp_host"]),
-        "port": int(cfg.get("sftp_port", 22)),
-        "username": str(cfg["sftp_username"]),
-        "timeout": 10,
-    }
-    key_path = str(cfg.get("sftp_key_path", "")).strip()
-    if key_path:
-        connect_kwargs["key_filename"] = key_path
-    if password:
-        connect_kwargs["password"] = password
-
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(**connect_kwargs)
-    try:
-        sftp = ssh.open_sftp()
-        try:
-            remote_dir = str(cfg["sftp_remote_dir"])
-            try:
-                sftp.stat(remote_dir)
-                directory_exists = True
-            except OSError:
-                directory_exists = False
-            return {"ok": True, "remote_dir": remote_dir, "remote_dir_exists": directory_exists}
-        finally:
-            sftp.close()
-    finally:
-        ssh.close()
-
-
-def _map_video_path_for_locany(video: Path, loc_cfg: dict[str, Any]) -> str:
-    try:
-        return _map_video_path_for_sam31(video, loc_cfg)
-    except RuntimeError as exc:
-        message = str(exc).replace("SAM31", "LocateAnything").replace("sam31.", "locateanything.")
-        raise RuntimeError(message) from exc
-
-
-def _upload_video_via_sftp_for_locany(video: Path, loc_cfg: dict[str, Any], job: dict[str, Any]) -> str:
-    try:
-        return _upload_video_via_sftp(video, loc_cfg, job)
-    except RuntimeError as exc:
-        message = str(exc).replace("sam31.", "locateanything.")
-        raise RuntimeError(message) from exc
-
-
-def _prepare_video_path_for_locany(video: Path, loc_cfg: dict[str, Any], job: dict[str, Any]) -> str:
-    transfer = str(loc_cfg.get("video_transfer", "path")).lower()
-    if transfer == "path":
-        return _map_video_path_for_locany(video, loc_cfg)
-    if transfer == "sftp":
-        return _upload_video_via_sftp_for_locany(video, loc_cfg, job)
-    raise RuntimeError(f"Unknown locateanything.video_transfer: {transfer}")
 
 
 async def _run_remote_sam31_box_track_job_impl(
@@ -1280,212 +1095,6 @@ async def get_sam31_job(job_id: str):
     job = _sam31_jobs.get(job_id)
     if not job:
         raise HTTPException(404, "SAM31 job not found")
-    return job
-
-
-def _safe_extract_zip(zip_path: Path, output_dir: Path) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    root = output_dir.resolve()
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        for member in zf.infolist():
-            target = (output_dir / member.filename).resolve()
-            try:
-                target.relative_to(root)
-            except ValueError as exc:
-                raise RuntimeError(f"Unsafe zip member path: {member.filename}") from exc
-        zf.extractall(output_dir)
-
-
-async def _run_remote_locany_job_impl(
-    job_id: str,
-    req: LocateAnythingRemoteReq,
-    workspace: Path,
-    video: Path,
-    loc_cfg: dict[str, Any],
-) -> None:
-    job = _locany_jobs[job_id]
-    job["status"] = "running"
-    server_url = str(loc_cfg.get("server_url", "")).rstrip("/")
-    if not server_url:
-        raise RuntimeError("locateanything.server_url is required")
-
-    timeout = float(loc_cfg.get("request_timeout", 30))
-    download_timeout = float(loc_cfg.get("download_timeout", 300))
-    poll_interval = float(loc_cfg.get("poll_interval", 5))
-    device = str(loc_cfg.get("device", "cuda"))
-    if req.cuda_device is not None:
-        if req.cuda_device < 0:
-            raise RuntimeError("cuda_device must be >= 0")
-        device = f"cuda:{req.cuda_device}"
-
-    remote_video_path = await asyncio.to_thread(_prepare_video_path_for_locany, video, loc_cfg, job)
-    frame_offset = int(loc_cfg.get("frame_offset", 1))
-    class_id = int(loc_cfg.get("class_id", 0))
-    score = float(loc_cfg.get("score", 1.0))
-
-    payload = {
-        "video_path": remote_video_path,
-        "prompt": req.prompt,
-        "task": req.task or str(loc_cfg.get("task", "ground_multi")),
-        "class_id": class_id,
-        "score": score,
-        "start_frame": max(0, req.start_frame),
-        "max_frames": max(0, req.max_frames),
-        "frame_step": max(1, req.frame_step),
-        "frame_offset": frame_offset,
-        "file_prefix": video.stem,
-        "resize_long_edge": int(req.resize_long_edge or loc_cfg.get("resize_long_edge", 1024)),
-        "generation_mode": str(loc_cfg.get("generation_mode", "slow")),
-        "max_new_tokens": int(req.max_new_tokens or loc_cfg.get("max_new_tokens", 512)),
-        "temperature": float(loc_cfg.get("temperature", 0.0)),
-        "use_cache": bool(loc_cfg.get("use_cache", True)),
-        "device": device,
-        "dtype": str(loc_cfg.get("dtype", "bf16")),
-    }
-
-    job["message"] = "Submitting remote LocateAnything job"
-    remote = await asyncio.to_thread(
-        _json_http_request,
-        "POST",
-        _gpu_api_url(server_url, "locateanything", "jobs"),
-        payload,
-        timeout,
-        "Remote LocateAnything",
-    )
-    remote_job_id = remote["job_id"]
-    job["remote_job_id"] = remote_job_id
-    job["remote_server_url"] = server_url
-    job["remote_video_path"] = remote_video_path
-
-    while True:
-        remote_status = await asyncio.to_thread(
-            _json_http_request,
-            "GET",
-            _gpu_api_url(server_url, "locateanything", f"jobs/{remote_job_id}"),
-            None,
-            timeout,
-            "Remote LocateAnything",
-        )
-        job["message"] = remote_status.get("message", remote_status.get("status", ""))
-        job["remote_status"] = remote_status
-        if remote_status.get("status") == "done":
-            break
-        if remote_status.get("status") == "failed":
-            raise RuntimeError(remote_status.get("message", "Remote LocateAnything failed"))
-        await asyncio.sleep(poll_interval)
-
-    out_dir = workspace / "locateanything_runs" / job_id
-    zip_path = out_dir / "locateanything_yolo.zip"
-    extract_dir = out_dir / "extracted"
-    job["message"] = "Downloading LocateAnything YOLO zip"
-    await asyncio.to_thread(
-        _download_binary,
-        _gpu_api_url(server_url, "locateanything", f"jobs/{remote_job_id}/yolo-zip"),
-        zip_path,
-        download_timeout,
-        "Remote LocateAnything",
-    )
-    _safe_extract_zip(zip_path, extract_dir)
-
-    labels_src = extract_dir / "labels"
-    labels_dst = out_dir / video.stem
-    if labels_dst.exists():
-        shutil.rmtree(labels_dst)
-    if labels_src.is_dir():
-        shutil.move(str(labels_src), str(labels_dst))
-    else:
-        labels_dst.mkdir(parents=True, exist_ok=True)
-
-    metadata_src = extract_dir / "metadata.json"
-    raw_src = extract_dir / "raw_answers.jsonl"
-    if metadata_src.exists():
-        shutil.copy2(str(metadata_src), str(out_dir / "metadata.json"))
-    if raw_src.exists():
-        shutil.copy2(str(raw_src), str(out_dir / "raw_answers.jsonl"))
-
-    job["status"] = "done"
-    job["message"] = f"LocateAnything results saved to {labels_dst}"
-    job["output_dir"] = str(labels_dst)
-    job["zip_path"] = str(zip_path)
-    job["metadata_path"] = str(out_dir / "metadata.json")
-    job["raw_answers_path"] = str(out_dir / "raw_answers.jsonl")
-
-
-async def _run_locany_job(
-    job_id: str,
-    req: LocateAnythingRemoteReq,
-    workspace: Path,
-    video: Path,
-    loc_cfg: dict[str, Any],
-) -> None:
-    try:
-        await _run_remote_locany_job_impl(job_id, req, workspace, video, loc_cfg)
-    except Exception as exc:
-        job = _locany_jobs.get(job_id)
-        if job is not None:
-            job["status"] = "failed"
-            job["message"] = str(exc)
-
-
-@app.get("/api/locateanything/settings")
-async def get_locany_settings():
-    return _public_locany_settings(_load_workspace_config(_workspace))
-
-
-@app.post("/api/locateanything/test-connection")
-async def test_locany_connection(req: LocateAnythingRemoteReq):
-    try:
-        loc_cfg = _locany_request_config(_load_workspace_config(_workspace), req)
-        _validate_locany_connection_config(loc_cfg)
-        server_url = str(loc_cfg["server_url"]).rstrip("/")
-        health = await asyncio.to_thread(
-            _json_http_request,
-            "GET",
-            f"{server_url}/api/health",
-            None,
-            min(float(loc_cfg.get("request_timeout", 30)), 10),
-            "LocateAnything health check",
-        )
-        sftp = None
-        if loc_cfg["video_transfer"] == "sftp":
-            sftp = await asyncio.to_thread(_test_locany_sftp, loc_cfg)
-        return {"ok": True, "api": health, "sftp": sftp}
-    except Exception as exc:
-        raise HTTPException(400, str(exc)) from exc
-
-
-@app.post("/api/locateanything/yolo")
-async def start_locany_yolo(req: LocateAnythingRemoteReq):
-    if _workspace is None:
-        raise HTTPException(400, "No workspace open")
-    if not req.prompt.strip():
-        raise HTTPException(400, "Prompt is required")
-    video = _find_video(_workspace)
-    if not video:
-        raise HTTPException(400, "No video in workspace")
-    try:
-        loc_cfg = _locany_request_config(_load_workspace_config(_workspace), req)
-        _validate_locany_connection_config(loc_cfg)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-
-    job_id = uuid.uuid4().hex
-    _locany_jobs[job_id] = {
-        "id": job_id,
-        "status": "queued",
-        "message": "Queued",
-        "prompt": req.prompt,
-        "video": str(video),
-    }
-    asyncio.create_task(_run_locany_job(job_id, req, _workspace, video, loc_cfg))
-    return {"ok": True, "job_id": job_id}
-
-
-@app.get("/api/locateanything/job/{job_id}")
-async def get_locany_job(job_id: str):
-    job = _locany_jobs.get(job_id)
-    if not job:
-        raise HTTPException(404, "LocateAnything job not found")
     return job
 
 
