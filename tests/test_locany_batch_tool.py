@@ -1,5 +1,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -10,6 +11,8 @@ from locany_batch_tool.server import (
     JOBS,
     BatchReq,
     _check_direct_capabilities,
+    _selected_cuda_devices,
+    parse_cuda_devices,
     _remote_videos,
     _run_batch,
     _videos,
@@ -18,6 +21,16 @@ from locany_batch_tool.server import (
 
 
 class LocateAnythingBatchToolTests(TestCase):
+    def test_cuda_device_list_parser_and_legacy_single_device(self) -> None:
+        self.assertEqual(parse_cuda_devices("0, cuda:2，2,5"), [0, 2, 5])
+        with self.assertRaisesRegex(ValueError, "无效"):
+            parse_cuda_devices("0,x")
+        legacy = BatchReq(
+            server_url="http://gpu-server:10114", mode="direct",
+            input_path="/videos", output_path="/labels", cuda_device=3,
+        )
+        self.assertEqual(_selected_cuda_devices(legacy), [3])
+
     def test_health(self) -> None:
         client = TestClient(app)
         response = client.get("/api/health")
@@ -71,6 +84,8 @@ class LocateAnythingBatchToolTests(TestCase):
         JOBS[job_id] = {"id": job_id, "status": "queued", "message": "Queued"}
 
         def fake_request(method, url, payload=None, timeout=30):
+            if url.endswith("/api/locateanything/health"):
+                return {"devices": ["cuda:0", "cuda:1"], "parallel_jobs": True}
             if method == "POST":
                 self.assertEqual(payload["video_path"], remote_video)
                 return {"job_id": "remote-job"}
@@ -83,6 +98,82 @@ class LocateAnythingBatchToolTests(TestCase):
 
         self.assertEqual(JOBS[job_id]["status"], "done")
         self.assertEqual(JOBS[job_id]["items"][0]["output"], "/data2/labels/sample")
+
+    def test_direct_batch_runs_one_worker_per_selected_gpu(self) -> None:
+        videos = [f"/data2/videos/v{index}.mp4" for index in range(4)]
+        request = BatchReq(
+            server_url="http://gpu-server:10114", mode="direct",
+            input_path="/data2/videos", output_path="/data2/labels",
+            cuda_devices=[0, 1],
+        )
+        job_id = "multi-gpu-test"
+        JOBS[job_id] = {"id": job_id, "status": "queued", "message": "Queued"}
+        first_pair = threading.Barrier(2, timeout=2)
+        payloads = []
+        payload_lock = threading.Lock()
+
+        def fake_request(method, url, payload=None, timeout=30):
+            if url.endswith("/api/locateanything/health"):
+                return {"devices": ["cuda:0", "cuda:1"], "parallel_jobs": True}
+            if method == "POST":
+                with payload_lock:
+                    payloads.append(dict(payload))
+                    call_number = len(payloads)
+                if call_number <= 2:
+                    first_pair.wait()
+                return {"job_id": Path(payload["video_path"]).stem}
+            remote_id = url.rsplit("/", 1)[-1]
+            return {
+                "status": "done", "message": "Done",
+                "assigned_device": next(
+                    item["device"] for item in payloads if Path(item["video_path"]).stem == remote_id
+                ),
+                "direct_output_dir": f"/data2/labels/{remote_id}",
+            }
+
+        with patch("locany_batch_tool.server._remote_videos", return_value=videos), patch(
+            "locany_batch_tool.server._json_request", side_effect=fake_request
+        ):
+            _run_batch(job_id, request)
+
+        job = JOBS[job_id]
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["completed"], 4)
+        self.assertEqual(job["cuda_devices"], [0, 1])
+        self.assertEqual({payload["device"] for payload in payloads}, {"cuda:0", "cuda:1"})
+        self.assertTrue(all(item["status"] == "done" for item in job["items"]))
+
+    def test_batch_rejects_devices_not_enabled_by_gpu_service(self) -> None:
+        request = BatchReq(
+            server_url="http://gpu-server:10114", mode="direct",
+            input_path="/data2/videos", output_path="/data2/labels",
+            cuda_devices=[0, 2],
+        )
+        job_id = "disabled-gpu-test"
+        JOBS[job_id] = {"id": job_id, "status": "queued", "message": "Queued"}
+        with patch("locany_batch_tool.server._remote_videos", return_value=["/data2/videos/v.mp4"]), patch(
+            "locany_batch_tool.server._json_request",
+            return_value={"devices": ["cuda:0", "cuda:1"], "parallel_jobs": True},
+        ):
+            _run_batch(job_id, request)
+        self.assertEqual(JOBS[job_id]["status"], "failed")
+        self.assertIn("cuda:2", JOBS[job_id]["message"])
+
+    def test_multi_gpu_batch_rejects_old_serial_gpu_service(self) -> None:
+        request = BatchReq(
+            server_url="http://gpu-server:10114", mode="direct",
+            input_path="/data2/videos", output_path="/data2/labels",
+            cuda_devices=[0, 1],
+        )
+        job_id = "old-serial-service-test"
+        JOBS[job_id] = {"id": job_id, "status": "queued", "message": "Queued"}
+        with patch("locany_batch_tool.server._remote_videos", return_value=["/data2/videos/v.mp4"]), patch(
+            "locany_batch_tool.server._json_request", return_value={"device": "cuda:0"}
+        ):
+            _run_batch(job_id, request)
+        self.assertEqual(JOBS[job_id]["status"], "failed")
+        self.assertIn("版本过旧", JOBS[job_id]["message"])
+        self.assertIn("Waiting for previous", JOBS[job_id]["message"])
 
     def test_direct_output_must_be_inside_allowed_root(self) -> None:
         original = list(locateanything.SETTINGS.get("output_allowed_roots", []))

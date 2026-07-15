@@ -21,7 +21,7 @@ pip install -r requirements\locany-tool-windows.txt
 
 ## SFTP 模式
 
-填写本地视频或目录、本地 ZIP 输出目录、GPU Services URL 和 SFTP 设置。工具会依次上传视频、提交 LocateAnything 作业，并把每个视频的标注 ZIP 下载为 `<视频名>_yolo.zip`。ZIP 内的 YOLO TXT 位于 `labels/`，Pascal VOC XML 位于 `annotations/`。
+填写本地视频或目录、本地 ZIP 输出目录、GPU Services URL 和 SFTP 设置。工具会上传视频、提交 LocateAnything 作业，并把每个视频的标注 ZIP 下载为 `<视频名>_yolo.zip`。ZIP 内的 YOLO TXT 位于 `labels/`，Pascal VOC XML 位于 `annotations/`。
 
 密码只随当前页面请求发送，不会写入浏览器存储。也可在项目根目录的 `.env.local` 中设置 `LOCANY_SFTP_PASSWORD`；该文件已被 Git 忽略。
 
@@ -44,6 +44,18 @@ export LOCANY_OUTPUT_ALLOWED_ROOTS=/data/labels
 ```
 
 服务端会拒绝允许根目录之外的视频和输出位置。每个视频的 `labels/`、`annotations/`、元数据、原始回答和 ZIP 会写入输出目录下以视频名命名的子目录。
+
+## 多 GPU 并行
+
+“CUDA 设备号”支持使用逗号填写多张卡，例如：
+
+```text
+0,1,3
+```
+
+工具为每张卡启动一个任务线程，同时处理多个视频；某张卡完成一个视频后会继续领取下一个等待中的视频。单个视频仍只使用一张 GPU。GPU Services 端必须在 `LOCANY_DEVICES` 中启用相同设备，例如 `LOCANY_DEVICES=cuda:0,cuda:1,cuda:3`。
+
+SFTP 模式下上传与推理任务也会并行；直连模式不涉及上传。进度列表会显示每个视频请求和实际分配的 CUDA 设备。只填写一个编号时行为与旧版本一致。
 
 ## 类别映射
 

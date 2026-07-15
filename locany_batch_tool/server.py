@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
 import posixpath
+import queue
 import shutil
 import threading
 import time
@@ -25,6 +27,7 @@ from pydantic import BaseModel, Field
 APP_DIR = Path(__file__).resolve().parent
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mkv", ".mov", ".webm"}
 JOBS: dict[str, dict[str, Any]] = {}
+JOB_LOCKS: dict[str, threading.RLock] = {}
 
 app = FastAPI(title="LocateAnything Batch Tool")
 
@@ -57,7 +60,8 @@ class ConnectionReq(BaseModel):
 class BatchReq(ConnectionReq):
     input_path: str
     output_path: str
-    cuda_device: int = 0
+    cuda_devices: list[int] = Field(default_factory=list)
+    cuda_device: Optional[int] = None
     dtype: str = "bf16"
     prompt: str = "person"
     categories: list[str] = Field(default_factory=lambda: ["person"])
@@ -67,6 +71,37 @@ class BatchReq(ConnectionReq):
     reuse_uploads: bool = True
     frame_step: int = 1
     max_frames: int = 0
+
+
+def parse_cuda_devices(value: str) -> list[int]:
+    devices: list[int] = []
+    for raw in value.replace("，", ",").split(","):
+        item = raw.strip().lower()
+        if not item:
+            continue
+        if item.startswith("cuda:"):
+            item = item[5:]
+        if not item.isdigit():
+            raise ValueError(f"无效的 CUDA 设备号：{raw.strip()}")
+        device = int(item)
+        if device < 0 or device > 1024:
+            raise ValueError(f"CUDA 设备号超出范围：{device}")
+        if device not in devices:
+            devices.append(device)
+    if not devices:
+        raise ValueError("请至少填写一个 CUDA 设备号，例如 0 或 0,1")
+    return devices
+
+
+def _selected_cuda_devices(req: BatchReq) -> list[int]:
+    values = req.cuda_devices or ([req.cuda_device] if req.cuda_device is not None else [0])
+    return parse_cuda_devices(",".join(str(value) for value in values))
+
+
+def _job_snapshot(job_id: str) -> dict[str, Any]:
+    lock = JOB_LOCKS.setdefault(job_id, threading.RLock())
+    with lock:
+        return copy.deepcopy(JOBS[job_id])
 
 
 def _json_request(method: str, url: str, payload: Optional[dict[str, Any]] = None, timeout: float = 30) -> dict[str, Any]:
@@ -109,7 +144,11 @@ def _mkdir_p(sftp: Any, remote_dir: str) -> None:
         try:
             sftp.stat(current)
         except OSError:
-            sftp.mkdir(current)
+            try:
+                sftp.mkdir(current)
+            except OSError:
+                # Concurrent upload workers may create the same directory between stat and mkdir.
+                sftp.stat(current)
 
 
 def _videos(input_path: str, recursive: bool) -> list[Path]:
@@ -192,62 +231,138 @@ def _download(url: str, output: Path) -> None:
         shutil.copyfileobj(response, handle)
 
 
+def _run_video_item(
+    job: dict[str, Any], req: BatchReq, item: dict[str, Any], video: Any,
+    device: int, output_root: Optional[Path], update_lock: Any,
+) -> None:
+    base = req.server_url.rstrip("/")
+    video_name = video.name if isinstance(video, Path) else PurePosixPath(video).name
+    video_stem = video.stem if isinstance(video, Path) else PurePosixPath(video).stem
+    with update_lock:
+        item.update(status="preparing", message=f"Preparing on cuda:{device}")
+    if req.mode == "sftp":
+        remote_video = _upload(video, req)
+        direct_output = None
+    else:
+        remote_video = str(video)
+        direct_output = posixpath.join(req.output_path.rstrip("/"), video_stem)
+    payload = {
+        "video_path": remote_video, "prompt": req.prompt,
+        "categories": req.categories, "class_map": req.class_map,
+        "task": req.task, "class_id": next(iter(req.class_map.values()), 0),
+        "device": f"cuda:{device}", "dtype": req.dtype,
+        "frame_step": max(1, req.frame_step), "max_frames": max(0, req.max_frames),
+        "file_prefix": video_stem, "output_dir": direct_output,
+    }
+    created = _json_request("POST", f"{base}/api/locateanything/jobs", payload)
+    remote_job_id = created["job_id"]
+    with update_lock:
+        item.update(status="running", remote_job_id=remote_job_id, remote_video=remote_video)
+    while True:
+        remote = _json_request("GET", f"{base}/api/locateanything/jobs/{remote_job_id}")
+        with update_lock:
+            item["message"] = remote.get("message", "")
+            item["assigned_device"] = remote.get("assigned_device", f"cuda:{device}")
+            job["message"] = (
+                f"已完成 {job['completed']}/{job['total']}，"
+                f"{video_name} 正在 {item['assigned_device']} 运行：{item['message']}"
+            )
+        if remote.get("status") not in {"queued", "running"}:
+            break
+        time.sleep(2)
+    if remote.get("status") != "done":
+        raise RuntimeError(remote.get("message", "remote job failed"))
+    if req.mode == "sftp":
+        zip_path = output_root / f"{video_stem}_yolo.zip"  # type: ignore[operator]
+        _download(f"{base}/api/locateanything/jobs/{remote_job_id}/yolo-zip", zip_path)
+        with update_lock:
+            item["output"] = str(zip_path)
+    else:
+        with update_lock:
+            item["output"] = remote.get("direct_output_dir", direct_output)
+    with update_lock:
+        item["status"] = "done"
+
+
 def _run_batch(job_id: str, req: BatchReq) -> None:
     job = JOBS[job_id]
+    update_lock = JOB_LOCKS.setdefault(job_id, threading.RLock())
     try:
-        videos: list[Any]
         if req.mode == "sftp":
-            videos = _videos(req.input_path, req.recursive)
+            videos: list[Any] = _videos(req.input_path, req.recursive)
         elif req.mode == "direct":
             videos = _remote_videos(req.server_url, req.input_path, req.recursive)
         else:
             raise RuntimeError("mode must be sftp or direct")
-        job.update(status="running", total=len(videos), completed=0, items=[])
-        base = req.server_url.rstrip("/")
+        devices = _selected_cuda_devices(req)
+        health = _json_request("GET", f"{req.server_url.rstrip('/')}/api/locateanything/health")
+        if len(devices) > 1 and not health.get("parallel_jobs", False):
+            raise RuntimeError(
+                "GPU Services 版本过旧，不支持多 GPU 并行调度。"
+                "请更新服务器仓库并重启 gpu_services；旧服务会显示 "
+                "'Waiting for previous LocateAnything job' 并强制串行。"
+            )
+        enabled = [str(device) for device in health.get("devices", [])]
+        if enabled:
+            requested = [f"cuda:{device}" for device in devices]
+            missing = [device for device in requested if device not in enabled]
+            if missing:
+                raise RuntimeError(
+                    f"GPU Services 未启用 {', '.join(missing)}；服务端可用设备：{', '.join(enabled)}"
+                )
+        items = [
+            {"video": str(video), "status": "queued", "message": "等待空闲 GPU"}
+            for video in videos
+        ]
+        with update_lock:
+            job.update(
+                status="running", total=len(videos), completed=0, finished=0, items=items,
+                cuda_devices=devices,
+                message=f"使用 {len(devices)} 张 GPU 并行处理 {len(videos)} 个视频",
+            )
         output_root = Path(req.output_path).expanduser().resolve() if req.mode == "sftp" else None
-        for index, video in enumerate(videos, 1):
-            video_name = video.name if isinstance(video, Path) else PurePosixPath(video).name
-            video_stem = video.stem if isinstance(video, Path) else PurePosixPath(video).stem
-            item: dict[str, Any] = {"video": str(video), "status": "preparing"}
-            job["items"].append(item)
-            job["message"] = f"[{index}/{len(videos)}] Preparing {video_name}"
-            if req.mode == "sftp":
-                remote_video = _upload(video, req)
-                direct_output = None
-            elif req.mode == "direct":
-                remote_video = str(video)
-                direct_output = posixpath.join(req.output_path.rstrip("/"), video_stem)
-            payload = {
-                "video_path": remote_video, "prompt": req.prompt,
-                "categories": req.categories, "class_map": req.class_map,
-                "task": req.task, "class_id": next(iter(req.class_map.values()), 0),
-                "device": f"cuda:{req.cuda_device}", "dtype": req.dtype,
-                "frame_step": max(1, req.frame_step), "max_frames": max(0, req.max_frames),
-                "file_prefix": video_stem, "output_dir": direct_output,
-            }
-            created = _json_request("POST", f"{base}/api/locateanything/jobs", payload)
-            remote_job_id = created["job_id"]
-            item.update(status="running", remote_job_id=remote_job_id, remote_video=remote_video)
+        work: queue.Queue[tuple[int, Any]] = queue.Queue()
+        for index, video in enumerate(videos):
+            work.put((index, video))
+        errors: list[str] = []
+
+        def consume(device: int) -> None:
             while True:
-                remote = _json_request("GET", f"{base}/api/locateanything/jobs/{remote_job_id}")
-                item["message"] = remote.get("message", "")
-                job["message"] = f"[{index}/{len(videos)}] {video_name}: {item['message']}"
-                if remote.get("status") not in {"queued", "running"}:
-                    break
-                time.sleep(2)
-            if remote.get("status") != "done":
-                raise RuntimeError(f"{video_name}: {remote.get('message', 'remote job failed')}")
-            if req.mode == "sftp":
-                zip_path = output_root / f"{video_stem}_yolo.zip"  # type: ignore[operator]
-                _download(f"{base}/api/locateanything/jobs/{remote_job_id}/yolo-zip", zip_path)
-                item["output"] = str(zip_path)
-            else:
-                item["output"] = remote.get("direct_output_dir", direct_output)
-            item["status"] = "done"
-            job["completed"] = index
-        job.update(status="done", message=f"Completed {len(videos)} video(s)")
+                try:
+                    index, video = work.get_nowait()
+                except queue.Empty:
+                    return
+                item = items[index]
+                with update_lock:
+                    item["requested_device"] = f"cuda:{device}"
+                try:
+                    _run_video_item(job, req, item, video, device, output_root, update_lock)
+                    with update_lock:
+                        job["completed"] += 1
+                except Exception as exc:
+                    with update_lock:
+                        item.update(status="failed", message=str(exc))
+                        errors.append(f"{PurePosixPath(str(video).replace(chr(92), '/')).name}: {exc}")
+                finally:
+                    with update_lock:
+                        job["finished"] += 1
+                        job["message"] = f"已处理 {job['finished']}/{job['total']}，成功 {job['completed']}"
+                    work.task_done()
+
+        workers = [threading.Thread(target=consume, args=(device,), daemon=True) for device in devices]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        if errors:
+            with update_lock:
+                job.update(status="failed", message=f"成功 {job['completed']}，失败 {len(errors)}：{errors[0]}")
+        else:
+            with update_lock:
+                job.update(status="done", message=f"已用 {len(devices)} 张 GPU 完成 {len(videos)} 个视频")
     except Exception as exc:
-        job.update(status="failed", message=str(exc))
+        with update_lock:
+            job.update(status="failed", message=str(exc))
 
 
 @app.get("/")
@@ -287,6 +402,7 @@ async def test_connection(req: ConnectionReq) -> dict[str, Any]:
 async def create_batch(req: BatchReq) -> dict[str, Any]:
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {"id": job_id, "status": "queued", "message": "Queued", "completed": 0, "total": 0, "items": []}
+    JOB_LOCKS[job_id] = threading.RLock()
     threading.Thread(target=_run_batch, args=(job_id, req), daemon=True).start()
     return {"ok": True, "job_id": job_id}
 
@@ -295,7 +411,7 @@ async def create_batch(req: BatchReq) -> dict[str, Any]:
 async def get_batch(job_id: str) -> dict[str, Any]:
     if job_id not in JOBS:
         raise HTTPException(404, "Job not found")
-    return JOBS[job_id]
+    return _job_snapshot(job_id)
 
 
 def main(argv: Optional[list[str]] = None) -> None:

@@ -35,13 +35,21 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--sam31-checkpoint", type=Path, default=sam31.DEFAULT_CHECKPOINT)
     parser.add_argument("--sam31-runner", type=Path, default=sam31.DEFAULT_RUNNER)
     parser.add_argument("--sam31-python", default=os.environ.get("SAM31_PYTHON", os.sys.executable))
-    parser.add_argument("--sam31-device", default=os.environ.get("SAM31_DEVICE", "cuda"))
+    parser.add_argument(
+        "--sam31-devices", "--sam31-device", dest="sam31_devices",
+        default=os.environ.get("SAM31_DEVICES", os.environ.get("SAM31_DEVICE", "cuda")),
+        help="Comma-separated devices; --sam31-device remains as a compatibility alias.",
+    )
     parser.add_argument("--sam31-dtype", choices=("fp16", "bf16", "fp32"), default=os.environ.get("SAM31_DTYPE", "fp16"))
     parser.add_argument("--sam31-allowed-root", action="append", type=Path)
     parser.add_argument("--locany-cache-dir", type=Path, default=locateanything.DEFAULT_CACHE_DIR)
     parser.add_argument("--locany-model", default=locateanything.DEFAULT_MODEL)
     parser.add_argument("--locateanything-root", default=os.environ.get("LOCATEANYTHING_ROOT", ""))
-    parser.add_argument("--locany-device", default=os.environ.get("LOCANY_DEVICE", "cuda"))
+    parser.add_argument(
+        "--locany-devices", "--locany-device", dest="locany_devices",
+        default=os.environ.get("LOCANY_DEVICES", os.environ.get("LOCANY_DEVICE", "cuda")),
+        help="Comma-separated devices; --locany-device remains as a compatibility alias.",
+    )
     parser.add_argument("--locany-dtype", choices=("bf16", "fp16", "fp32"), default=os.environ.get("LOCANY_DTYPE", "bf16"))
     parser.add_argument("--locany-allowed-root", action="append", type=Path)
     parser.add_argument("--locany-output-allowed-root", action="append", type=Path)
@@ -53,7 +61,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         checkpoint=args.sam31_checkpoint,
         runner_path=args.sam31_runner,
         runner_python=args.sam31_python,
-        device=args.sam31_device,
+        device=args.sam31_devices,
         dtype=args.sam31_dtype,
         allowed_roots=args.sam31_allowed_root,
     )
@@ -61,7 +69,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         cache_dir=args.locany_cache_dir,
         model=args.locany_model,
         external_root=args.locateanything_root,
-        device=args.locany_device,
+        device=args.locany_devices,
         dtype=args.locany_dtype,
         allowed_roots=args.locany_allowed_root,
         output_allowed_roots=args.locany_output_allowed_root,

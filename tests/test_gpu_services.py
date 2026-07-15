@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from gpu_services import locateanything, sam31
+from gpu_services.device_pool import parse_devices
 from gpu_services.server import app
 
 
@@ -36,6 +37,21 @@ class GpuServicesTests(unittest.TestCase):
         self.assertEqual(payload["service"], "video-annotation-gpu")
         self.assertIn("sam31", payload)
         self.assertIn("locateanything", payload)
+        self.assertTrue(payload["locateanything"]["parallel_jobs"])
+        self.assertEqual(payload["locateanything"]["scheduler"], "per-device-v1")
+
+    def test_multiple_gpu_configuration_is_reported(self) -> None:
+        original_locany = list(locateanything.SETTINGS["devices"])
+        original_sam31 = list(sam31.SETTINGS["devices"])
+        try:
+            locateanything.SETTINGS["devices"] = parse_devices("cuda:0,cuda:1")
+            sam31.SETTINGS["devices"] = parse_devices("cuda:0,cuda:1")
+            payload = TestClient(app).get("/api/health").json()
+            self.assertEqual(payload["locateanything"]["devices"], ["cuda:0", "cuda:1"])
+            self.assertEqual(payload["sam31"]["devices"], ["cuda:0", "cuda:1"])
+        finally:
+            locateanything.SETTINGS["devices"] = original_locany
+            sam31.SETTINGS["devices"] = original_sam31
 
     def test_locateanything_external_root_must_contain_worker(self) -> None:
         original = locateanything.SETTINGS["external_root"]

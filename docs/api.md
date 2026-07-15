@@ -15,7 +15,6 @@
 - `PATCH /api/tasks/{task_id}`：发布者编辑任务信息
 - `DELETE /api/tasks/{task_id}`：发布者删除任意状态的自有任务
 - `POST /api/tasks/{task_id}/parts/claim-next`：领取下一个 Part，发布者也可领取自己的任务
-- `POST /api/tasks/{task_id}/parts/claim-next`
 - `POST /api/tasks/{task_id}/parts/{part_id}/start-rework`
 - `POST /api/tasks/{task_id}/parts/{part_id}/submit`
 - `POST /api/tasks/{task_id}/parts/{part_id}/comments`
@@ -35,4 +34,6 @@
 - `GET /api/locateanything/jobs/{job_id}`
 - `GET /api/locateanything/jobs/{job_id}/yolo-zip`
 
-两类任务服务会返回 `queued`、`running`、`done` 或 `failed` 状态。客户端应按合理的固定间隔轮询，仅在状态变为 `done` 后获取结果文件。
+两类任务服务会返回 `queued`、`running`、`done` 或 `failed` 状态。开始运行后，任务信息中的 `assigned_device` 表示实际分配的设备。客户端应按合理的固定间隔轮询，仅在状态变为 `done` 后获取结果文件。
+
+提交任务时省略 `device` 或设置为 `auto` 可使用服务端多 GPU 自动调度；设置为 `cuda:N` 则固定到指定设备排队。

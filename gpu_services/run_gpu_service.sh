@@ -21,8 +21,13 @@ export LOCANY_MODEL="${LOCANY_MODEL:-/data2/DET_Group/ZZS/locateAnything/eagle/E
 export LOCANY_CACHE_DIR="${LOCANY_CACHE_DIR:-/data2/DET_Group/ZZS/locateAnything/eagle/Embodied/fast_tmp}"
 export LOCANY_ALLOWED_ROOTS="${LOCANY_ALLOWED_ROOTS:-/data2/DET_Group/ZZS/locateAnything/eagle/Embodied/fast_tmp}"
 export LOCANY_OUTPUT_ALLOWED_ROOTS="${LOCANY_OUTPUT_ALLOWED_ROOTS:-/data2/DET_Group/ZZS/locateAnything/eagle/Embodied/fast_tmp/outputs}"
-export LOCANY_DEVICE="${LOCANY_DEVICE:-cuda:0}"
+# Comma-separated devices allow one LocateAnything job per GPU to run in parallel.
+# A request without device (or with device="auto") is assigned to the next free GPU.
+export LOCANY_DEVICES="${LOCANY_DEVICES:-${LOCANY_DEVICE:-cuda:0}}"
 export LOCANY_DTYPE="${LOCANY_DTYPE:-bf16}"
+# 0 unloads the model after every job so model VRAM is returned. Set 1 to trade
+# persistent VRAM usage for faster startup of subsequent jobs.
+export LOCANY_KEEP_MODEL_LOADED="${LOCANY_KEEP_MODEL_LOADED:-0}"
 
 # SAM3.1 remains in its existing ComfyUI environment. The unified service starts
 # its runner through SAM31_PYTHON, so this does not have to be the current Python.
@@ -32,7 +37,7 @@ export SAM31_PYTHON="${SAM31_PYTHON:-python}"
 export SAM31_RUNNER="${SAM31_RUNNER:-$ROOT_DIR/gpu_services/sam31_track.py}"
 export SAM31_CACHE_DIR="${SAM31_CACHE_DIR:-/data2/DET_Group/ZZS/my_sam3/tmp}"
 export SAM31_ALLOWED_ROOTS="${SAM31_ALLOWED_ROOTS:-/data2/DET_Group/ZZS/my_sam3/tmp}"
-export SAM31_DEVICE="${SAM31_DEVICE:-cuda:0}"
+export SAM31_DEVICES="${SAM31_DEVICES:-${SAM31_DEVICE:-cuda:0}}"
 export SAM31_DTYPE="${SAM31_DTYPE:-fp16}"
 
 if [[ ! -f "$LOCATEANYTHING_ROOT/locateanything_worker.py" ]]; then
@@ -47,6 +52,8 @@ fi
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 echo "Starting unified GPU service at http://${GPU_SERVICE_HOST}:${GPU_SERVICE_PORT}"
 echo "LocateAnything root: $LOCATEANYTHING_ROOT"
+echo "LocateAnything devices: $LOCANY_DEVICES (keep model loaded: $LOCANY_KEEP_MODEL_LOADED)"
 echo "SAM3.1 runner Python: $SAM31_PYTHON"
 echo "SAM3.1 runner: $SAM31_RUNNER"
+echo "SAM3.1 devices: $SAM31_DEVICES"
 exec "$PYTHON_BIN" -m gpu_services.server --host "$GPU_SERVICE_HOST" --port "$GPU_SERVICE_PORT" "$@"

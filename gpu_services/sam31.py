@@ -11,6 +11,8 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from gpu_services.device_pool import GPU_DEVICE_POOL, parse_devices
+
 
 DEFAULT_COMFY_ROOT = Path(os.environ.get("SAM31_COMFY_ROOT", "/opt/ComfyUI"))
 DEFAULT_CHECKPOINT = Path(
@@ -29,7 +31,7 @@ SETTINGS: dict[str, Any] = {
     "cache_dir": DEFAULT_CACHE_DIR,
     "runner_path": DEFAULT_RUNNER,
     "runner_python": os.environ.get("SAM31_PYTHON", sys.executable),
-    "default_device": os.environ.get("SAM31_DEVICE", "cuda"),
+    "devices": parse_devices(os.environ.get("SAM31_DEVICES", os.environ.get("SAM31_DEVICE", "cuda"))),
     "default_dtype": os.environ.get("SAM31_DTYPE", "fp16"),
     "allowed_roots": [
         Path(item).expanduser().resolve()
@@ -84,66 +86,77 @@ def _validate_bbox(bbox: list[float]) -> None:
 
 async def _run_job(job_id: str, req: Sam31JobReq, video_path: Path) -> None:
     job = JOBS[job_id]
-    job["status"] = "running"
-    job["message"] = "Starting SAM3.1 runner"
+    job["message"] = "Waiting for an available GPU"
+    device: Optional[str] = None
+    try:
+        device = await asyncio.to_thread(GPU_DEVICE_POOL.acquire, SETTINGS["devices"], req.device)
+        job["assigned_device"] = device
+        job["status"] = "running"
+        job["message"] = f"Starting SAM3.1 runner on {device}"
 
-    out_dir = Path(SETTINGS["cache_dir"]) / job_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    runner_path = Path(SETTINGS["runner_path"])
-    command = [
-        str(SETTINGS["runner_python"]),
-        str(runner_path),
-        "--video",
-        str(video_path),
-        "--bbox",
-        ",".join(f"{value:.3f}" for value in req.bbox),
-        "--start-frame",
-        str(req.start_frame),
-        "--out-dir",
-        str(out_dir),
-        "--max-frames",
-        str(max(0, req.max_frames)),
-        "--class-id",
-        str(req.class_id),
-        "--comfy-root",
-        str(SETTINGS["comfy_root"]),
-        "--checkpoint",
-        str(SETTINGS["checkpoint"]),
-        "--device",
-        req.device or str(SETTINGS["default_device"]),
-        "--dtype",
-        req.dtype or str(SETTINGS["default_dtype"]),
-        "--min-mask-area",
-        str(max(1, req.min_mask_area)),
-    ]
-    if req.use_rect_mask:
-        command.append("--use-rect-mask")
+        out_dir = Path(SETTINGS["cache_dir"]) / job_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        runner_path = Path(SETTINGS["runner_path"])
+        command = [
+            str(SETTINGS["runner_python"]),
+            str(runner_path),
+            "--video",
+            str(video_path),
+            "--bbox",
+            ",".join(f"{value:.3f}" for value in req.bbox),
+            "--start-frame",
+            str(req.start_frame),
+            "--out-dir",
+            str(out_dir),
+            "--max-frames",
+            str(max(0, req.max_frames)),
+            "--class-id",
+            str(req.class_id),
+            "--comfy-root",
+            str(SETTINGS["comfy_root"]),
+            "--checkpoint",
+            str(SETTINGS["checkpoint"]),
+            "--device",
+            device,
+            "--dtype",
+            req.dtype or str(SETTINGS["default_dtype"]),
+            "--min-mask-area",
+            str(max(1, req.min_mask_area)),
+        ]
+        if req.use_rect_mask:
+            command.append("--use-rect-mask")
 
-    job["command"] = command
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        cwd=str(runner_path.parent),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await process.communicate()
-    job["returncode"] = process.returncode
-    job["stdout"] = stdout.decode("utf-8", errors="replace")[-8000:]
-    job["stderr"] = stderr.decode("utf-8", errors="replace")[-8000:]
+        job["command"] = command
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(runner_path.parent),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        job["returncode"] = process.returncode
+        job["stdout"] = stdout.decode("utf-8", errors="replace")[-8000:]
+        job["stderr"] = stderr.decode("utf-8", errors="replace")[-8000:]
 
-    result_path = out_dir / "tracking_results.json"
-    job["result_path"] = str(result_path)
-    if process.returncode != 0:
+        result_path = out_dir / "tracking_results.json"
+        job["result_path"] = str(result_path)
+        if process.returncode != 0:
+            job["status"] = "failed"
+            job["message"] = f"SAM3.1 runner failed with exit code {process.returncode}"
+            return
+        if not result_path.exists():
+            job["status"] = "failed"
+            job["message"] = "SAM3.1 runner did not write tracking_results.json"
+            return
+
+        job["status"] = "done"
+        job["message"] = "Done"
+    except Exception as exc:
         job["status"] = "failed"
-        job["message"] = f"SAM3.1 runner failed with exit code {process.returncode}"
-        return
-    if not result_path.exists():
-        job["status"] = "failed"
-        job["message"] = "SAM3.1 runner did not write tracking_results.json"
-        return
-
-    job["status"] = "done"
-    job["message"] = "Done"
+        job["message"] = str(exc)
+    finally:
+        if device is not None:
+            GPU_DEVICE_POOL.release(device)
 
 
 def health_payload() -> dict[str, Any]:
@@ -155,6 +168,8 @@ def health_payload() -> dict[str, Any]:
         "checkpoint": str(SETTINGS["checkpoint"]),
         "runner_path": str(SETTINGS["runner_path"]),
         "runner_python": str(SETTINGS["runner_python"]),
+        "devices": list(SETTINGS["devices"]),
+        "device_pool": GPU_DEVICE_POOL.snapshot(),
         "allowed_roots": [str(root) for root in SETTINGS.get("allowed_roots", [])],
     }
 
@@ -170,6 +185,10 @@ async def create_job(req: Sam31JobReq) -> dict[str, Any]:
     _validate_bbox(req.bbox)
     if req.start_frame < 0:
         raise HTTPException(400, "start_frame must be >= 0")
+    try:
+        GPU_DEVICE_POOL.validate(SETTINGS["devices"], req.device)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {
@@ -215,7 +234,7 @@ def configure(
     checkpoint: Path = DEFAULT_CHECKPOINT,
     runner_path: Path = DEFAULT_RUNNER,
     runner_python: str = os.environ.get("SAM31_PYTHON", sys.executable),
-    device: str = os.environ.get("SAM31_DEVICE", "cuda"),
+    device: str = os.environ.get("SAM31_DEVICES", os.environ.get("SAM31_DEVICE", "cuda")),
     dtype: str = os.environ.get("SAM31_DTYPE", "fp16"),
     allowed_roots: Optional[list[Path]] = None,
 ) -> None:
@@ -224,7 +243,7 @@ def configure(
     SETTINGS["checkpoint"] = checkpoint.expanduser().resolve()
     SETTINGS["runner_path"] = runner_path.expanduser().resolve()
     SETTINGS["runner_python"] = runner_python
-    SETTINGS["default_device"] = device
+    SETTINGS["devices"] = parse_devices(device)
     SETTINGS["default_dtype"] = dtype
     if allowed_roots is not None:
         SETTINGS["allowed_roots"] = [path.expanduser().resolve() for path in allowed_roots]

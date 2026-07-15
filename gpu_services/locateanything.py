@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import importlib
 import json
 import os
@@ -21,6 +22,8 @@ from fastapi.responses import FileResponse
 from PIL import Image
 from pydantic import BaseModel, Field
 
+from gpu_services.device_pool import GPU_DEVICE_POOL, parse_devices
+
 
 DEFAULT_CACHE_DIR = Path(os.environ.get("LOCANY_CACHE_DIR", "/tmp/video-annotation-locateanything"))
 DEFAULT_MODEL = os.environ.get("LOCANY_MODEL", "nvidia/LocateAnything-3B")
@@ -30,13 +33,14 @@ VIDEO_EXTENSIONS = {".mp4", ".avi", ".mkv", ".mov", ".webm"}
 router = APIRouter(prefix="/api/locateanything", tags=["locateanything"])
 JOBS: dict[str, dict[str, Any]] = {}
 WORKERS: dict[tuple[str, str], Any] = {}
-JOB_RUN_LOCK = threading.Lock()
+WORKERS_LOCK = threading.Lock()
 SETTINGS: dict[str, Any] = {
     "cache_dir": DEFAULT_CACHE_DIR,
     "model": DEFAULT_MODEL,
     "external_root": DEFAULT_EXTERNAL_ROOT,
-    "default_device": os.environ.get("LOCANY_DEVICE", "cuda"),
+    "devices": parse_devices(os.environ.get("LOCANY_DEVICES", os.environ.get("LOCANY_DEVICE", "cuda"))),
     "default_dtype": os.environ.get("LOCANY_DTYPE", "bf16"),
+    "keep_model_loaded": os.environ.get("LOCANY_KEEP_MODEL_LOADED", "0") == "1",
     "allowed_roots": [
         Path(item).expanduser().resolve()
         for item in os.environ.get("LOCANY_ALLOWED_ROOTS", "").split(",")
@@ -171,20 +175,39 @@ def _resolve_output_dir(raw_path: str) -> Path:
     return path
 
 
-def _ensure_worker(req: LocateAnythingVideoReq) -> Any:
-    device = req.device or str(SETTINGS["default_device"])
-    if device == "cuda":
-        device = "cuda:0"
+def _ensure_worker(req: LocateAnythingVideoReq, device: str) -> Any:
     dtype_name = req.dtype or str(SETTINGS["default_dtype"])
     key = (device, dtype_name)
-    if key not in WORKERS:
-        worker_type = _worker_type()
-        WORKERS[key] = worker_type(
-            str(SETTINGS["model"]),
-            device=device,
-            dtype=_parse_dtype(dtype_name),
-        )
+    with WORKERS_LOCK:
+        if key not in WORKERS:
+            worker_type = _worker_type()
+            WORKERS[key] = worker_type(
+                str(SETTINGS["model"]),
+                device=device,
+                dtype=_parse_dtype(dtype_name),
+            )
     return WORKERS[key]
+
+
+def _release_worker(device: str, dtype_name: str) -> None:
+    with WORKERS_LOCK:
+        worker = WORKERS.pop((device, dtype_name), None)
+    if worker is None:
+        return
+    del worker
+    gc.collect()
+    torch = _torch()
+    if device.startswith("cuda") and torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize(device)
+        except Exception:
+            pass
+        with torch.cuda.device(device):
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
 
 
 def _run_model(worker: Any, image: Image.Image, req: LocateAnythingVideoReq) -> dict[str, Any]:
@@ -331,12 +354,10 @@ def _write_zip(source_dir: Path, zip_path: Path) -> None:
 
 def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) -> None:
     job = JOBS[job_id]
-    if not JOB_RUN_LOCK.acquire(blocking=False):
-        job["status"] = "queued"
-        job["message"] = "Waiting for previous LocateAnything job"
-        JOB_RUN_LOCK.acquire()
-    job["status"] = "running"
-    job["message"] = "Loading LocateAnything model"
+    job["message"] = "Waiting for an available GPU"
+    device: Optional[str] = None
+    dtype_name = req.dtype or str(SETTINGS["default_dtype"])
+    worker: Any = None
     out_dir = Path(SETTINGS["cache_dir"]) / job_id
     labels_dir = out_dir / "labels"
     annotations_dir = out_dir / "annotations"
@@ -346,8 +367,16 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
     metadata_path = out_dir / "metadata.json"
     zip_path = out_dir / "locateanything_yolo.zip"
     cap: Optional[cv2.VideoCapture] = None
+    result: Any = None
+    frame: Any = None
+    original: Any = None
+    inference_image: Any = None
     try:
-        worker = _ensure_worker(req)
+        device = GPU_DEVICE_POOL.acquire(SETTINGS["devices"], req.device)
+        job["assigned_device"] = device
+        job["status"] = "running"
+        job["message"] = f"Loading LocateAnything model on {device}"
+        worker = _ensure_worker(req, device)
         torch = _torch()
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -395,8 +424,8 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
                     original, req.resize_long_edge, req.resize_scale
                 )
                 result = _run_model(worker, inference_image, req)
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
+                if device.startswith("cuda") and torch.cuda.is_available():
+                    torch.cuda.synchronize(device)
                 answer = str(result.get("answer", ""))
                 lines, boxes = [], []
                 for item in _extract_items(answer, width, height):
@@ -430,8 +459,9 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
                         "frame_idx": frame_idx, "frame_id": frame_id,
                         "txt": txt_path.name, "xml": xml_path.name, "error": str(exc),
                     }, ensure_ascii=False) + "\n")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                if device.startswith("cuda") and torch.cuda.is_available():
+                    with torch.cuda.device(device):
+                        torch.cuda.empty_cache()
             if processed and processed % 10 == 0:
                 elapsed = max(0.001, time.perf_counter() - started)
                 job["message"] = f"Processed {processed} frames ({processed / elapsed:.3f} fps)"
@@ -462,7 +492,13 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
     finally:
         if cap is not None:
             cap.release()
-        JOB_RUN_LOCK.release()
+        worker = None
+        result = frame = original = inference_image = None
+        gc.collect()
+        if device is not None:
+            if not SETTINGS.get("keep_model_loaded", False):
+                _release_worker(device, dtype_name)
+            GPU_DEVICE_POOL.release(device)
 
 
 async def _run_job(job_id: str, req: LocateAnythingVideoReq, video_path: Path) -> None:
@@ -483,11 +519,15 @@ def health_payload() -> dict[str, Any]:
         "cache_dir": str(SETTINGS["cache_dir"]),
         "external_root": root_text,
         "worker_available": bool(worker_path and worker_path.is_file()),
-        "device": str(SETTINGS["default_device"]),
+        "devices": list(SETTINGS["devices"]),
         "dtype": str(SETTINGS["default_dtype"]),
+        "keep_model_loaded": bool(SETTINGS.get("keep_model_loaded", False)),
+        "scheduler": "per-device-v1",
+        "parallel_jobs": True,
         "model_loaded": bool(WORKERS),
         "loaded_workers": [{"device": device, "dtype": dtype} for device, dtype in sorted(WORKERS)],
         "cuda_available": cuda_available,
+        "device_pool": GPU_DEVICE_POOL.snapshot(),
         "allowed_roots": [str(root) for root in SETTINGS.get("allowed_roots", [])],
         "output_allowed_roots": [str(root) for root in SETTINGS.get("output_allowed_roots", [])],
     }
@@ -518,6 +558,10 @@ async def create_job(req: LocateAnythingVideoReq) -> dict[str, Any]:
     if not req.prompt.strip() and not req.question.strip() and not req.categories:
         raise HTTPException(400, "prompt, categories, or question is required")
     video_path = _resolve_video_path(req.video_path)
+    try:
+        GPU_DEVICE_POOL.validate(SETTINGS["devices"], req.device)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     if req.output_dir:
         req.output_dir = str(_resolve_output_dir(req.output_dir))
     job_id = uuid.uuid4().hex
@@ -557,16 +601,19 @@ def configure(
     cache_dir: Path = DEFAULT_CACHE_DIR,
     model: str = DEFAULT_MODEL,
     external_root: str = DEFAULT_EXTERNAL_ROOT,
-    device: str = os.environ.get("LOCANY_DEVICE", "cuda"),
+    device: str = os.environ.get("LOCANY_DEVICES", os.environ.get("LOCANY_DEVICE", "cuda")),
     dtype: str = os.environ.get("LOCANY_DTYPE", "bf16"),
+    keep_model_loaded: Optional[bool] = None,
     allowed_roots: Optional[list[Path]] = None,
     output_allowed_roots: Optional[list[Path]] = None,
 ) -> None:
     SETTINGS["cache_dir"] = cache_dir.expanduser().resolve()
     SETTINGS["model"] = model
     SETTINGS["external_root"] = external_root
-    SETTINGS["default_device"] = device
+    SETTINGS["devices"] = parse_devices(device)
     SETTINGS["default_dtype"] = dtype
+    if keep_model_loaded is not None:
+        SETTINGS["keep_model_loaded"] = keep_model_loaded
     if allowed_roots is not None:
         SETTINGS["allowed_roots"] = [path.expanduser().resolve() for path in allowed_roots]
     if output_allowed_roots is not None:

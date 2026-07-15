@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import sys
 import threading
 import time
@@ -19,7 +18,7 @@ from PySide6.QtWidgets import (
 
 from locany_batch_tool.server import (
     JOBS, BatchReq, ConnectionReq, _check_direct_capabilities, _connect_sftp,
-    _json_request, _run_batch,
+    _job_snapshot, _json_request, _run_batch, parse_cuda_devices,
 )
 from locany_batch_tool.postprocess import organize_prelabels
 
@@ -73,10 +72,11 @@ class MainWindow(QMainWindow):
         grid = QGridLayout(connection)
         self.server_url = QLineEdit("http://192.168.21.226:10114")
         self.mode = QComboBox(); self.mode.addItem("SFTP 上传并下载结果", "sftp"); self.mode.addItem("共享文件系统直连", "direct")
-        self.cuda = QSpinBox(); self.cuda.setRange(0, 64)
+        self.cuda = QLineEdit("0"); self.cuda.setPlaceholderText("例如 0,1,3")
+        self.cuda.setToolTip("逗号分隔多张 GPU；每张卡同时运行一个视频任务")
         grid.addWidget(QLabel("GPU Services 地址"), 0, 0); grid.addWidget(self.server_url, 0, 1, 1, 3)
         grid.addWidget(QLabel("工作模式"), 1, 0); grid.addWidget(self.mode, 1, 1)
-        grid.addWidget(QLabel("CUDA 设备号"), 1, 2); grid.addWidget(self.cuda, 1, 3)
+        grid.addWidget(QLabel("CUDA 设备号（可多选）"), 1, 2); grid.addWidget(self.cuda, 1, 3)
         self.sftp_frame = QFrame(); sftp = QGridLayout(self.sftp_frame); sftp.setContentsMargins(0, 8, 0, 0)
         self.sftp_host = QLineEdit("192.168.21.226"); self.sftp_port = QSpinBox(); self.sftp_port.setRange(1,65535); self.sftp_port.setValue(22)
         self.sftp_user = QLineEdit("hx"); self.sftp_password = QLineEdit(); self.sftp_password.setEchoMode(QLineEdit.EchoMode.Password); self.sftp_password.setPlaceholderText("留空时读取 LOCANY_SFTP_PASSWORD")
@@ -195,7 +195,7 @@ class MainWindow(QMainWindow):
         categories,mapping=self._mapping();connection=self._connection()
         if not self.input_path.text().strip():raise ValueError("请选择视频或视频目录")
         if not self.output_path.text().strip():raise ValueError("请选择或填写输出目录")
-        return BatchReq(**connection.model_dump(),input_path=self.input_path.text().strip(),output_path=self.output_path.text().strip(),cuda_device=self.cuda.value(),dtype=self.dtype.currentText(),prompt=self.prompt.text().strip() or "person",categories=categories,class_map=mapping,task=self.task.currentText(),recursive=self.recursive.isChecked(),reuse_uploads=self.reuse.isChecked(),frame_step=self.frame_step.value(),max_frames=self.max_frames.value())
+        return BatchReq(**connection.model_dump(),input_path=self.input_path.text().strip(),output_path=self.output_path.text().strip(),cuda_devices=parse_cuda_devices(self.cuda.text()),dtype=self.dtype.currentText(),prompt=self.prompt.text().strip() or "person",categories=categories,class_map=mapping,task=self.task.currentText(),recursive=self.recursive.isChecked(),reuse_uploads=self.reuse.isChecked(),frame_step=self.frame_step.value(),max_frames=self.max_frames.value())
 
     def _launch(self, worker: TaskWorker, on_success: Callable[[dict],None]) -> None:
         if self.thread is not None and self.thread.isRunning():
@@ -229,10 +229,10 @@ class MainWindow(QMainWindow):
         def action(worker:TaskWorker)->dict:
             job_id=uuid.uuid4().hex;JOBS[job_id]={"id":job_id,"status":"queued","message":"Queued","completed":0,"total":0,"items":[]}
             process=threading.Thread(target=_run_batch,args=(job_id,req),daemon=True);process.start()
-            while process.is_alive():worker.progress.emit(copy.deepcopy(JOBS[job_id]));time.sleep(.5)
-            process.join();worker.progress.emit(copy.deepcopy(JOBS[job_id]));job=JOBS[job_id]
+            while process.is_alive():worker.progress.emit(_job_snapshot(job_id));time.sleep(.5)
+            process.join();worker.progress.emit(_job_snapshot(job_id));job=_job_snapshot(job_id)
             if job["status"]!="done":raise RuntimeError(job["message"])
-            return copy.deepcopy(job)
+            return job
         self._launch(TaskWorker(action),self._batch_ok)
 
     def _run_postprocess(self, dry_run: bool) -> None:
@@ -264,11 +264,11 @@ class MainWindow(QMainWindow):
     def _show_progress(self,job:dict) -> None:
         total=int(job.get("total",0));done=int(job.get("completed",0));self.progress.setRange(0,max(1,total));self.progress.setValue(done);self.status.setText(str(job.get("message","")))
         lines=[]
-        for item in job.get("items",[]):lines.append(f"[{item.get('status','')}] {str(item.get('video','')).replace(chr(92),'/').rsplit('/',1)[-1]}\n  {item.get('message','')}{chr(10)+'  → '+item['output'] if item.get('output') else ''}")
+        for item in job.get("items",[]):lines.append(f"[{item.get('status','')}] {str(item.get('video','')).replace(chr(92),'/').rsplit('/',1)[-1]} · {item.get('assigned_device') or item.get('requested_device','等待分配')}\n  {item.get('message','')}{chr(10)+'  → '+item['output'] if item.get('output') else ''}")
         self.log.setPlainText("\n".join(lines))
 
     def _connection_ok(self,result:dict) -> None:
-        gpu=result["gpu"];extra="，SFTP 正常" if "sftp" in result else "，直连接口与输出目录正常";self.test_result.setText(f"连接成功：{gpu.get('device')}/{gpu.get('dtype')}{extra}");self.test_result.setStyleSheet("color:#16803c")
+        gpu=result["gpu"];extra="，SFTP 正常" if "sftp" in result else "，直连接口与输出目录正常";devices=",".join(gpu.get("devices",[])) or str(gpu.get("device","未知"));self.test_result.setText(f"连接成功：{devices}/{gpu.get('dtype')}{extra}");self.test_result.setStyleSheet("color:#16803c")
     def _batch_ok(self,result:dict) -> None:
         self._show_progress(result);QMessageBox.information(self,"任务完成",f"已完成 {result.get('completed',0)} 个视频。")
     def _failed(self,message:str) -> None:
@@ -277,16 +277,17 @@ class MainWindow(QMainWindow):
         self.test_button.setEnabled(True);self.run_button.setEnabled(True);self.post_preview_button.setEnabled(True);self.post_run_button.setEnabled(True);self.worker=None;self.thread=None
 
     def _save_settings(self) -> None:
-        values={"server_url":self.server_url.text(),"mode":self.mode.currentData(),"cuda":self.cuda.value(),"sftp_host":self.sftp_host.text(),"sftp_port":self.sftp_port.value(),"sftp_user":self.sftp_user.text(),"sftp_key":self.sftp_key.text(),"remote_dir":self.remote_dir.text(),"input_path":self.input_path.text(),"output_path":self.output_path.text(),"prompt":self.prompt.text(),"classes":self.classes.toPlainText(),"task":self.task.currentText(),"dtype":self.dtype.currentText(),"frame_step":self.frame_step.value(),"max_frames":self.max_frames.value(),"recursive":self.recursive.isChecked(),"reuse":self.reuse.isChecked(),"post_video_dir":self.post_video_dir.text(),"post_prelabel_dir":self.post_prelabel_dir.text()}
+        values={"server_url":self.server_url.text(),"mode":self.mode.currentData(),"cuda_devices":self.cuda.text(),"sftp_host":self.sftp_host.text(),"sftp_port":self.sftp_port.value(),"sftp_user":self.sftp_user.text(),"sftp_key":self.sftp_key.text(),"remote_dir":self.remote_dir.text(),"input_path":self.input_path.text(),"output_path":self.output_path.text(),"prompt":self.prompt.text(),"classes":self.classes.toPlainText(),"task":self.task.currentText(),"dtype":self.dtype.currentText(),"frame_step":self.frame_step.value(),"max_frames":self.max_frames.value(),"recursive":self.recursive.isChecked(),"reuse":self.reuse.isChecked(),"post_video_dir":self.post_video_dir.text(),"post_prelabel_dir":self.post_prelabel_dir.text()}
         for key,value in values.items():self.settings.setValue(key,value)
     def _load_settings(self) -> None:
-        text_fields={"server_url":self.server_url,"sftp_host":self.sftp_host,"sftp_user":self.sftp_user,"sftp_key":self.sftp_key,"remote_dir":self.remote_dir,"input_path":self.input_path,"output_path":self.output_path,"prompt":self.prompt,"post_video_dir":self.post_video_dir,"post_prelabel_dir":self.post_prelabel_dir}
+        text_fields={"server_url":self.server_url,"cuda_devices":self.cuda,"sftp_host":self.sftp_host,"sftp_user":self.sftp_user,"sftp_key":self.sftp_key,"remote_dir":self.remote_dir,"input_path":self.input_path,"output_path":self.output_path,"prompt":self.prompt,"post_video_dir":self.post_video_dir,"post_prelabel_dir":self.post_prelabel_dir}
         for key,widget in text_fields.items():
             value=self.settings.value(key)
             if value is not None:widget.setText(str(value))
         classes=self.settings.value("classes")
         if classes is not None:self.classes.setPlainText(str(classes))
-        for key,widget in (("cuda",self.cuda),("sftp_port",self.sftp_port),("frame_step",self.frame_step),("max_frames",self.max_frames)):
+        if self.settings.value("cuda_devices") is None and self.settings.value("cuda") is not None:self.cuda.setText(str(self.settings.value("cuda")))
+        for key,widget in (("sftp_port",self.sftp_port),("frame_step",self.frame_step),("max_frames",self.max_frames)):
             value=self.settings.value(key)
             if value is not None:widget.setValue(int(value))
         for key,widget in (("mode",self.mode),("task",self.task),("dtype",self.dtype)):
