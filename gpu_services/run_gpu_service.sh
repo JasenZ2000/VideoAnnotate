@@ -19,11 +19,11 @@ export GPU_SERVICE_PORT="${GPU_SERVICE_PORT:-10114}"
 export LOCATEANYTHING_ROOT="${LOCATEANYTHING_ROOT:-/data2/DET_Group/ZZS/locateAnything/eagle/Embodied}"
 export LOCANY_MODEL="${LOCANY_MODEL:-/data2/DET_Group/ZZS/locateAnything/eagle/Embodied/pretrain/LocateAnything-3B}"
 export LOCANY_CACHE_DIR="${LOCANY_CACHE_DIR:-/data2/DET_Group/ZZS/locateAnything/eagle/Embodied/fast_tmp}"
-export LOCANY_ALLOWED_ROOTS="${LOCANY_ALLOWED_ROOTS:-/data2/DET_Group/ZZS/locateAnything/eagle/Embodied/fast_tmp}"
-export LOCANY_OUTPUT_ALLOWED_ROOTS="${LOCANY_OUTPUT_ALLOWED_ROOTS:-/data2/DET_Group/ZZS/locateAnything/eagle/Embodied/fast_tmp/outputs}"
+export LOCANY_ALLOWED_ROOTS="${LOCANY_ALLOWED_ROOTS:-/data2/DET_Group/ZZS}"
+export LOCANY_OUTPUT_ALLOWED_ROOTS="${LOCANY_OUTPUT_ALLOWED_ROOTS:-/data2/DET_Group/ZZS}"
 # Comma-separated devices allow one LocateAnything job per GPU to run in parallel.
 # A request without device (or with device="auto") is assigned to the next free GPU.
-export LOCANY_DEVICES="${LOCANY_DEVICES:-${LOCANY_DEVICE:-cuda:0}}"
+export LOCANY_DEVICES="cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7"
 export LOCANY_DTYPE="${LOCANY_DTYPE:-bf16}"
 # 0 unloads the model after every job so model VRAM is returned. Set 1 to trade
 # persistent VRAM usage for faster startup of subsequent jobs.
@@ -36,8 +36,8 @@ export SAM31_CHECKPOINT="${SAM31_CHECKPOINT:-/data2/DET_Group/ZZS/my_sam3/sam3.1
 export SAM31_PYTHON="${SAM31_PYTHON:-python}"
 export SAM31_RUNNER="${SAM31_RUNNER:-$ROOT_DIR/gpu_services/sam31_track.py}"
 export SAM31_CACHE_DIR="${SAM31_CACHE_DIR:-/data2/DET_Group/ZZS/my_sam3/tmp}"
-export SAM31_ALLOWED_ROOTS="${SAM31_ALLOWED_ROOTS:-/data2/DET_Group/ZZS/my_sam3/tmp}"
-export SAM31_DEVICES="${SAM31_DEVICES:-${SAM31_DEVICE:-cuda:0}}"
+export SAM31_ALLOWED_ROOTS="${SAM31_ALLOWED_ROOTS:-/data2/DET_Group/ZZS}"
+export SAM31_DEVICES="cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7"
 export SAM31_DTYPE="${SAM31_DTYPE:-fp16}"
 
 if [[ ! -f "$LOCATEANYTHING_ROOT/locateanything_worker.py" ]]; then
