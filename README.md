@@ -11,33 +11,30 @@ flowchart LR
     P["Windows public machine<br/>Workflow Platform"]
     G["Linux GPU server<br/>Unified GPU API"]
     A["Employee Windows PC<br/>Local Workbench"]
-    D["Task storage<br/>videos / segments / labels / results"]
+    D["Shared storage<br/>videos / labels / guides"]
 
     P --> D
-    P -->|"async prelabel jobs"| G
-    A -->|"download / review / upload"| P
+    A --> D
     A -->|"interactive bbox tracking"| G
 ```
 
 | Component | Runs on | Responsibility |
 | --- | --- | --- |
-| `workflow_platform` | Windows public machine | Task registration, upload, assignment, segmentation, remote LocateAnything jobs, tracking and result distribution |
+| `workflow_platform` | Windows public machine | Spreadsheet task publishing, Part claiming, timing, notes, review and team statistics |
 | `local_workbench` | Employee Windows PC | One local service exposing manual annotation and frame sampling |
 | `annotator` | Local workbench | Low-latency manual inspection, cleanup and remote GPU calls |
 | `frame_sampler` | Local workbench | Variable-density training-frame sampling before YOLO export |
-| `utils/mot_pipeline` | Local workbench and platform | YOLO parsing, bidirectional tracking, trajectory fusion, smoothing and format conversion |
+| `utils/mot_pipeline` | Local workbench | YOLO parsing, bidirectional tracking, trajectory fusion, smoothing and format conversion |
 | `gpu_services` | Linux GPU server | Single API exposing LocateAnything video prelabeling and SAM3.1 bbox tracking |
 
 ## Annotation Flow
 
-1. Publisher creates a task, class table, assignee and notes on the platform.
-2. Upload one or more complete videos and optional full-video YOLO label ZIPs.
-3. Split each long video into segments based on scene density and workload.
-4. Use uploaded YOLO labels, run segment LocateAnything, or start without prelabels.
-5. Run the default MOT tracking/fusion pipeline for each segment.
-6. Download an annotation package and clean tracks locally with Annotator.
-7. Use remote SAM3.1 interactively for difficult gaps or occlusions.
-8. Upload reviewed results and export the final YOLO dataset.
+1. A publisher pastes one or more rows from the annotation task spreadsheet and sets a product tag, Part count and prefix.
+2. Annotators claim the next available Part; the platform starts timing automatically.
+3. Annotators work with the shared files and local tools, then submit a note for review.
+4. The publisher approves the Part or returns it with rework instructions.
+5. Rework is timed separately and added to the Part's accumulated work time.
+6. GPU prelabeling and local annotation remain independent tools; the platform stores no videos or labels.
 
 The canonical YOLO line is:
 
@@ -55,8 +52,6 @@ Coordinates are normalized to `[0, 1]`. Input without `score` is also accepted.
 py -3.11 -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements\platform.txt
-Copy-Item configs\platform.example.json configs\platform.local.json
-$env:ANNOTATION_PLATFORM_CONFIG="$PWD\configs\platform.local.json"
 $env:ANNOTATION_PLATFORM_TASKS_DIR="D:\annotation_tasks"
 .\scripts\windows\run-platform.ps1
 ```
@@ -115,7 +110,7 @@ python scripts/check-services.py \
 local_workbench/       single-process local service that mounts both UIs
 utils/annotator/       implementation of the annotation UI and API
 utils/frame_sampler/   implementation of the variable-density frame sampler
-workflow_platform/     shared task platform UI and API
+workflow_platform/     lightweight multi-user task collaboration UI and API
 utils/mot_pipeline/    shared tracking, fusion and converters
 gpu_services/          unified SAM3.1 / LocateAnything HTTP service
 configs/               safe configuration examples

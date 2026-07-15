@@ -33,7 +33,11 @@ LOCAL_WORKBENCH_HOST=127.0.0.1
 LOCAL_WORKBENCH_PORT=17860
 ```
 
-配置文件必须与 exe 放在同一目录。端口已被占用时，控制台会提示修改该文件。该文件会启动同一个本地服务；默认保留控制台便于查看启动和错误日志。传入 `-Windowed` 可生成无控制台版本。
+配置文件必须与 exe 放在同一目录。端口已被占用或启动阶段发生其他错误时，控制台会显示具体原因；打包版会等待按 Enter 键后再关闭窗口，便于查看错误信息。该文件会启动同一个本地服务；默认保留控制台便于查看启动和错误日志。传入 `-Windowed` 可生成无控制台版本。
+
+## 导出 YOLO 与 VOC
+
+标注器的 `Export YOLO + VOC` 会在工作区的 `yoloset` 目录中同时生成 `images/*.jpg`、`labels/*.txt` 和 `annotations/*.xml`。三个目录中的文件使用相同名称，并以视频原名作为前缀，例如 `0001_frame_000000.jpg/.txt/.xml`。XML 类别名称来自配置中的 `exports.class_labels`；未配置的类别使用数字 class ID。包含中文等 Unicode 字符的 Windows 工作区路径也可正常导出图片。
 
 ## 工作区配置
 

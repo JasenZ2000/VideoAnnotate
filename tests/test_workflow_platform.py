@@ -1,251 +1,123 @@
 from __future__ import annotations
 
-import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 
-from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import workflow_platform.server as platform
-from workflow_platform.server import (
-    CreateTaskReq,
-    LocateAnythingSettingsReq,
-    health,
-    locateanything_remote_video_path,
-    parse_classes_text,
-)
+
+
+TABLE = """申请日期\t申请人\t项目\t标注内容\t数据集溯源\t每小时可标\t数据量\t预计工时/单人\t数据路径\t标注说明书路径
+2022/8/10\t刘湛基\t行人检测\t手工清洗相似度高的图片\t\t1000\t15074\t15\t\\\\server\\data\t\\\\server\\guide.pdf
+2022/8/18\t刘湛基\t反光衣客诉\t清洗图片\t客户视频\t2000\t24000\t12\t\\\\server\\data2\t\\\\server\\guide2.pdf"""
 
 
 class WorkflowPlatformTests(unittest.TestCase):
-    def test_class_table_accepts_supported_notation(self) -> None:
-        classes = parse_classes_text("0 person\ncar=1\n2: bicycle")
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.old_settings = dict(platform.SETTINGS)
+        platform.SETTINGS["data_dir"] = Path(self.temporary.name)
+        platform.SETTINGS["database_path"] = str(Path(self.temporary.name) / "metadata.sqlite3")
+        self.client = TestClient(platform.app)
+        response = self.client.post("/api/auth/bootstrap-admin", json={
+            "username": "publisher", "password": "publisher-pass", "display_name": "发布者"
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.client.post("/api/users", json={
+            "username": "worker", "password": "worker-pass", "display_name": "标注员"
+        })
+
+    def tearDown(self) -> None:
+        self.client.close()
+        platform.SETTINGS.clear()
+        platform.SETTINGS.update(self.old_settings)
+        self.temporary.cleanup()
+
+    def _publish(self, table: str = TABLE, count: int = 2) -> dict:
+        response = self.client.post("/api/tasks", json={
+            "clipboard_text": table, "product_tag": "BSD", "part_count": count,
+            "part_prefix": "BSD",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def test_table_parser_supports_header_and_headerless_rows(self) -> None:
+        rows = platform.parse_spreadsheet_rows(TABLE)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["project"], "行人检测")
+        self.assertEqual(rows[0]["data_path"], r"\\server\data")
+        headerless = platform.parse_spreadsheet_rows(TABLE.splitlines()[1])
+        self.assertEqual(headerless[0]["applicant"], "刘湛基")
+
+    def test_publish_multiple_rows_and_publisher_detail(self) -> None:
+        created = self._publish()
+        self.assertEqual(created["count"], 2)
+        task_id = created["tasks"][0]["task_id"]
+        detail = self.client.get(f"/api/tasks/{task_id}").json()
+        self.assertTrue(detail["is_publisher"])
+        self.assertEqual(detail["part_summary"]["total"], 2)
+        self.assertEqual([part["name"] for part in detail["parts"]],
+                         ["BSD_part_001", "BSD_part_002"])
+        self.assertIn("statistics", detail)
+
+    def test_worker_claim_submit_rework_resubmit_and_approve(self) -> None:
+        task_id = self._publish(TABLE.splitlines()[1], 2)["tasks"][0]["task_id"]
+        self.client.post("/api/auth/logout")
+        login = self.client.post("/api/auth/login", json={
+            "username": "worker", "password": "worker-pass"
+        })
+        self.assertEqual(login.status_code, 200)
+        claimed = self.client.post(f"/api/tasks/{task_id}/parts/claim-next")
+        self.assertEqual(claimed.status_code, 200, claimed.text)
+        part_id = claimed.json()["part"]["part_id"]
+        submitted = self.client.post(
+            f"/api/tasks/{task_id}/parts/{part_id}/submit", json={"note": "有两张模糊图"}
+        )
+        self.assertEqual(submitted.json()["part"]["status"], "submitted")
+
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={"username": "publisher", "password": "publisher-pass"})
+        reviewed = self.client.post(
+            f"/api/tasks/{task_id}/parts/{part_id}/review",
+            json={"action": "rework", "note": "请补充漏标"},
+        )
+        self.assertEqual(reviewed.json()["part"]["status"], "rework")
+
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={"username": "worker", "password": "worker-pass"})
         self.assertEqual(
-            classes,
-            [
-                {"id": 0, "name": "person"},
-                {"id": 1, "name": "car"},
-                {"id": 2, "name": "bicycle"},
-            ],
+            self.client.post(f"/api/tasks/{task_id}/parts/{part_id}/start-rework").status_code, 200
+        )
+        self.client.post(
+            f"/api/tasks/{task_id}/parts/{part_id}/submit", json={"note": "已经修改"}
         )
 
-    def test_class_table_rejects_duplicate_ids(self) -> None:
-        with self.assertRaises(HTTPException):
-            parse_classes_text("0 person\n0 car")
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={"username": "publisher", "password": "publisher-pass"})
+        approved = self.client.post(
+            f"/api/tasks/{task_id}/parts/{part_id}/review",
+            json={"action": "approve", "note": "通过"},
+        )
+        self.assertEqual(approved.json()["part"]["status"], "completed")
+        detail = self.client.get(f"/api/tasks/{task_id}").json()
+        self.assertEqual(detail["statistics"][0]["completed"], 1)
 
-    def test_health_contract(self) -> None:
-        payload = asyncio.run(health())
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["service"], "annotation-platform")
-        self.assertEqual(payload["api_schema_version"], 4)
-        self.assertEqual(payload["database"]["quick_check"], "ok")
+    def test_worker_cannot_see_statistics_or_add_parts(self) -> None:
+        task_id = self._publish(TABLE.splitlines()[1], 1)["tasks"][0]["task_id"]
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={"username": "worker", "password": "worker-pass"})
+        detail = self.client.get(f"/api/tasks/{task_id}").json()
+        self.assertNotIn("statistics", detail)
+        denied = self.client.post(f"/api/tasks/{task_id}/parts", json={"count": 2})
+        self.assertEqual(denied.status_code, 403)
 
-    def test_task_creation_requires_responsible_people(self) -> None:
-        with self.assertRaises(HTTPException) as context:
-            asyncio.run(platform.create_task(CreateTaskReq(name="缺少负责人")))
-        self.assertEqual(context.exception.status_code, 400)
-
-    def test_orphaned_legacy_task_can_assign_responsible_people(self) -> None:
-        old_settings = dict(platform.SETTINGS)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            platform.SETTINGS["tasks_dir"] = root
-            platform.SETTINGS["database_path"] = str(root / "metadata.sqlite3")
-            task_id = "legacy-orphan"
-            (root / task_id).mkdir()
-            try:
-                platform.database().save_task({
-                    "task_id": task_id,
-                    "name": "旧版未指定人员任务",
-                    "publisher": "",
-                    "manager": "",
-                    "annotators": [],
-                    "created_at": "2026-07-02T10:00:00+08:00",
-                    "updated_at": "2026-07-02T10:00:00+08:00",
-                })
-                response = asyncio.run(platform.update_task(
-                    task_id,
-                    platform.UpdateTaskReq(
-                        actor="接管人",
-                        publisher="发布人",
-                        manager="负责人",
-                        annotators="标注员甲, 标注员乙",
-                    ),
-                ))
-                self.assertEqual(response["task"]["publisher"], "发布人")
-                self.assertEqual(response["task"]["manager"], "负责人")
-                self.assertEqual(response["task"]["annotators"], ["标注员甲", "标注员乙"])
-            finally:
-                platform.SETTINGS.clear()
-                platform.SETTINGS.update(old_settings)
-
-    def test_task_api_uses_sqlite_without_writing_task_json(self) -> None:
-        old_settings = dict(platform.SETTINGS)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            platform.SETTINGS["tasks_dir"] = root
-            platform.SETTINGS["database_path"] = str(root / "metadata.sqlite3")
-            try:
-                response = asyncio.run(platform.create_task(CreateTaskReq(
-                    name="SQLite API 测试",
-                    classes="0 person\n1 car",
-                    task_type="general",
-                    publisher="publisher",
-                    manager="manager",
-                    annotators="ann-a, ann-b",
-                    instructions="任务说明",
-                    part_count=3,
-                )))
-                task_id = response["task"]["task_id"]
-                detail = asyncio.run(platform.get_task(task_id))
-                self.assertEqual(len(detail["classes"]), 2)
-                self.assertEqual(detail["events"][0]["message"], "Task created")
-                self.assertEqual(detail["publisher"], "publisher")
-                self.assertEqual(detail["annotators"], ["ann-a", "ann-b"])
-                self.assertEqual(detail["part_summary"]["total"], 3)
-                claimed = asyncio.run(platform.claim_next_part(
-                    task_id,
-                    platform.ActorReq(actor="ann-a"),
-                ))
-                self.assertEqual(claimed["part"]["status"], "in_progress")
-                submitted = asyncio.run(platform.submit_part(
-                    task_id,
-                    claimed["part"]["part_id"],
-                    platform.SubmitPartReq(actor="ann-a", note="完成"),
-                ))
-                self.assertEqual(submitted["part"]["status"], "submitted")
-                reviewed = asyncio.run(platform.review_part(
-                    task_id,
-                    claimed["part"]["part_id"],
-                    platform.ReviewPartReq(actor="manager", action="approve", note="通过"),
-                ))
-                self.assertEqual(reviewed["part"]["status"], "completed")
-                with self.assertRaises(HTTPException):
-                    asyncio.run(platform.claim_next_part(
-                        task_id,
-                        platform.ActorReq(actor="outsider"),
-                    ))
-                self.assertTrue((root / "metadata.sqlite3").exists())
-                self.assertFalse((root / task_id / "task.json").exists())
-            finally:
-                platform.SETTINGS.clear()
-                platform.SETTINGS.update(old_settings)
-
-    def test_video_task_locany_settings_are_saved_without_password(self) -> None:
-        old_settings = dict(platform.SETTINGS)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            platform.SETTINGS["tasks_dir"] = root
-            platform.SETTINGS["database_path"] = str(root / "metadata.sqlite3")
-            try:
-                created = asyncio.run(platform.create_task(CreateTaskReq(
-                    name="Video Task",
-                    task_type="video_detection",
-                    publisher="publisher",
-                    manager="manager",
-                    prompt="person",
-                    classes="0 person\n1 car",
-                )))
-                task_id = created["task"]["task_id"]
-                response = asyncio.run(platform.save_task_locany_settings(
-                    task_id,
-                    LocateAnythingSettingsReq(
-                        actor="manager",
-                        prompt="person car",
-                        classes="0 person\n1 car",
-                        server_url="http://gpu-server:9010",
-                        video_transfer="path",
-                        local_path_prefix="D:/shared/videos",
-                        remote_path_prefix="/data/shared/videos",
-                        sftp_host="gpu-server",
-                        sftp_port=22,
-                        sftp_username="annotator",
-                        sftp_password="secret",
-                        sftp_password_env="LOCANY_SFTP_PASSWORD",
-                        sftp_remote_dir="/data/cache/locany",
-                        device="cuda:1",
-                        dtype="bf16",
-                    ),
-                ))
-                self.assertEqual(response["prompt"], "person car")
-                self.assertEqual(response["settings"]["device"], "cuda:1")
-                self.assertFalse("sftp_password" in response["settings"])
-                config_path = root / task_id / "config.json"
-                self.assertTrue(config_path.exists())
-                payload = config_path.read_text(encoding="utf-8")
-                self.assertIn('"server_url": "http://gpu-server:9010"', payload)
-                self.assertNotIn("secret", payload)
-            finally:
-                platform.SETTINGS.clear()
-                platform.SETTINGS.update(old_settings)
-
-    def test_locany_path_mapping_uses_prefixes(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            video_root = root / "shared" / "videos"
-            video_root.mkdir(parents=True)
-            video = video_root / "clip.mp4"
-            video.write_bytes(b"demo")
-            remote = locateanything_remote_video_path(
-                video,
-                {
-                    "video_transfer": "path",
-                    "local_path_prefix": str(video_root),
-                    "remote_path_prefix": "/data/shared/videos",
-                },
-                root,
-            )
-            self.assertEqual(remote, "/data/shared/videos/clip.mp4")
-
-    def test_auth_bootstrap_login_and_admin_user_creation(self) -> None:
-        old_settings = dict(platform.SETTINGS)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            platform.SETTINGS["tasks_dir"] = root
-            platform.SETTINGS["database_path"] = str(root / "metadata.sqlite3")
-            try:
-                client = TestClient(platform.app)
-                me = client.get("/api/auth/me")
-                self.assertEqual(me.status_code, 200)
-                self.assertTrue(me.json()["bootstrap_required"])
-
-                bootstrap = client.post("/api/auth/bootstrap-admin", json={
-                    "username": "admin",
-                    "password": "admin-pass-123",
-                    "display_name": "Admin",
-                })
-                self.assertEqual(bootstrap.status_code, 200)
-                self.assertEqual(bootstrap.json()["user"]["role"], "admin")
-
-                users = client.get("/api/users")
-                self.assertEqual(users.status_code, 200)
-                self.assertEqual(len(users.json()["users"]), 1)
-
-                created = client.post("/api/users", json={
-                    "username": "worker",
-                    "password": "worker-pass-123",
-                    "role": "user",
-                    "display_name": "Worker",
-                })
-                self.assertEqual(created.status_code, 200)
-                self.assertEqual(created.json()["user"]["username"], "worker")
-
-                client.post("/api/auth/logout")
-                denied = client.get("/api/tasks")
-                self.assertEqual(denied.status_code, 401)
-
-                login = client.post("/api/auth/login", json={
-                    "username": "worker",
-                    "password": "worker-pass-123",
-                })
-                self.assertEqual(login.status_code, 200)
-                me_again = client.get("/api/auth/me")
-                self.assertEqual(me_again.status_code, 200)
-                self.assertEqual(me_again.json()["user"]["username"], "worker")
-            finally:
-                platform.SETTINGS.clear()
-                platform.SETTINGS.update(old_settings)
+    def test_health_and_authentication_contract(self) -> None:
+        health = self.client.get("/api/health")
+        self.assertEqual(health.json()["api_schema_version"], 5)
+        self.client.post("/api/auth/logout")
+        self.assertEqual(self.client.get("/api/tasks").status_code, 401)
 
 
 if __name__ == "__main__":

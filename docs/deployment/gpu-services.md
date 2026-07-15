@@ -52,7 +52,7 @@ export SAM31_DTYPE=fp16
 ./gpu_services/run_gpu_service.sh
 ```
 
-`LOCANY_CACHE_DIR` 和 `SAM31_CACHE_DIR` 是服务自己的结果缓存目录。标注器和平台的 SFTP 上传目录不是缓存目录，且必须分别落在对应的 `*_ALLOWED_ROOTS` 内。
+`LOCANY_CACHE_DIR` 和 `SAM31_CACHE_DIR` 是服务自己的结果缓存目录。本地 Workbench 或 LocateAnything Qt 工具使用的 SFTP 上传目录不是缓存目录，且必须分别落在对应的 `*_ALLOWED_ROOTS` 内。协作平台不连接 GPU Services。
 
 每次请求可以选择 `cuda:N`。LocateAnything 会按 `device + dtype` 缓存模型实例，所以启用多张卡会在每张卡上各加载一份模型；其推理任务仍在单个服务进程内串行执行。
 

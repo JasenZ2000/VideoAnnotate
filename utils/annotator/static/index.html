@@ -63,12 +63,12 @@ dialog::backdrop { background: rgba(0,0,0,.72); }
   <button onclick="loadProject()">Load</button>
   <button class="primary" onclick="exportResults()">Export JSON</button>
   <button onclick="appendTrackingResults()">Append Tracking JSON</button>
-  <button class="primary" onclick="exportYolo()">Export YOLO</button>
+  <button class="primary" onclick="exportYolo()">Export YOLO + VOC</button>
   <label style="display:inline">every</label>
   <input id="yolo-interval" type="number" style="width:40px" value="1" min="1">
   <label style="display:inline">f</label>
   <span style="width:10px"></span>
-  <button class="primary" onclick="exportMergedYolo()">Export Merged YOLO</button>
+  <button class="primary" onclick="exportMergedYolo()">Export Merged YOLO + VOC</button>
 </div>
 
 <!-- Segment Selector -->
@@ -1095,10 +1095,10 @@ async function openSegment(segPath) {
 
 async function exportMergedYolo() {
   const interval = parseInt(document.getElementById('yolo-interval').value) || 1;
-  setStatus('Exporting merged YOLO dataset from all segments...');
+  setStatus('Exporting merged YOLO + VOC dataset from all segments...');
   try {
     const r = await api('POST', '/api/export-merged-yolo', { interval });
-    setStatus(`Merged YOLO: ${r.frames_saved} frames (interval=${r.interval}) → ${r.output_dir}`);
+    setStatus(`Merged YOLO + VOC: ${r.frames_saved} frames (interval=${r.interval}) → ${r.output_dir}`);
   } catch (e) { setStatus('Error: '+e.message); }
 }
 
@@ -1185,10 +1185,10 @@ async function appendTrackingResults() {
 }
 async function exportYolo() {
   const interval = parseInt(document.getElementById('yolo-interval').value) || 1;
-  setStatus(`Exporting YOLO dataset (every ${interval} frames)...`);
+  setStatus(`Exporting YOLO + VOC dataset (every ${interval} frames)...`);
   try {
     const r = await api('POST', '/api/export-yolo', { interval });
-    setStatus(`YOLO dataset: ${r.frames_saved} frames saved (interval=${r.interval}) → ${r.output_dir}`);
+    setStatus(`YOLO + VOC dataset: ${r.frames_saved} frames saved (interval=${r.interval}) → ${r.output_dir}`);
   } catch (e) { setStatus('Error: '+e.message); }
 }
 

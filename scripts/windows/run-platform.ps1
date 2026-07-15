@@ -4,7 +4,6 @@ param(
     [int]$Port = 0,
     [string]$TasksDir = "",
     [string]$Database = "",
-    [string]$Config = "",
     [string]$Python = "python",
     [switch]$Restart,
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -28,10 +27,6 @@ if (-not $TasksDir) {
 if (-not $Database) {
     $Database = if ($env:ANNOTATION_PLATFORM_DB) { $env:ANNOTATION_PLATFORM_DB } else { Join-Path $TasksDir "platform.sqlite3" }
 }
-if (-not $Config) {
-    $Config = if ($env:ANNOTATION_PLATFORM_CONFIG) { $env:ANNOTATION_PLATFORM_CONFIG } else { Join-Path $projectRoot "config.json" }
-}
-
 function Get-PlatformListenerPids {
     $listenerPattern = "^\s*TCP\s+\S+:$Port\s+\S+\s+LISTENING\s+(\d+)\s*$"
     return @(
@@ -51,7 +46,7 @@ if ($listenerPids.Count -gt 0) {
     $healthIdentifiesPlatform = $false
     try {
         $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 3
-        $healthIdentifiesPlatform = $health.service -eq "annotation-platform"
+        $healthIdentifiesPlatform = $health.service -eq "annotation-collaboration-platform"
     }
     catch {
         Write-Warning "The existing service did not answer the platform health check. Process names will still be verified before restart."
@@ -90,7 +85,6 @@ Write-Host "Database: $Database"
     --port $Port `
     --tasks-dir $TasksDir `
     --database $Database `
-    --config $Config `
     @ServerArgs
 
 if ($LASTEXITCODE -ne 0) {

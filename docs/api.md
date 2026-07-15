@@ -2,28 +2,23 @@
 
 每个 FastAPI 服务都在 `/docs` 路径提供可交互的 OpenAPI 文档。
 
-## 作业流程平台
+## 多人标注协作平台
 
 - `GET /api/health`
+- `GET /api/auth/me`
+- `POST /api/auth/bootstrap-admin|login|logout|change-password`
+- `GET|POST /api/users`、`PATCH /api/users/{username}`
+- `POST /api/tasks/preview`：解析粘贴的表格行
 - `GET|POST /api/tasks`
-- `GET|PATCH|DELETE /api/tasks/{task_id}`
-- `POST /api/tasks/{task_id}/video`
-- `POST /api/tasks/{task_id}/labels-zip`
-- `POST /api/tasks/{task_id}/split-video`
-- `POST /api/tasks/{task_id}/run-locateanything`
-- `POST /api/tasks/{task_id}/run-segment-locateanything`
-- `POST /api/tasks/{task_id}/run-tracking`
-- `POST /api/tasks/{task_id}/run-segment-tracking`
-- `POST /api/tasks/{task_id}/parts`
+- `GET /api/tasks/{task_id}`
+- `POST /api/tasks/{task_id}/parts`：发布者追加 Part
 - `POST /api/tasks/{task_id}/parts/claim-next`
-- `POST /api/tasks/{task_id}/parts/{part_id}/start|submit|release|review`
-- `POST /api/tasks/{task_id}/attachments`
-- `GET /api/tasks/{task_id}/attachments/{attachment_id}/download`
-- `POST /api/tasks/{task_id}/issues`
-- `POST /api/tasks/{task_id}/issues/{issue_id}/resolve`
-- 同一任务路径下还提供标注包生成、审核结果上传和 YOLO 导出接口
+- `POST /api/tasks/{task_id}/parts/{part_id}/start-rework`
+- `POST /api/tasks/{task_id}/parts/{part_id}/submit`
+- `POST /api/tasks/{task_id}/parts/{part_id}/comments`
+- `POST /api/tasks/{task_id}/parts/{part_id}/review`
 
-健康检查结果包含 SQLite 路径、数据结构版本、`quick_check` 结果、任务和事件数量，以及旧 JSON 迁移的成功与失败计数。
+平台 API 不再包含视频上传、LocateAnything、跟踪、分段或标注导出功能。
 
 ## 统一 GPU 服务
 

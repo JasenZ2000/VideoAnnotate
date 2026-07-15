@@ -21,6 +21,7 @@ from locany_batch_tool.server import (
     JOBS, BatchReq, ConnectionReq, _check_direct_capabilities, _connect_sftp,
     _json_request, _run_batch,
 )
+from locany_batch_tool.postprocess import organize_prelabels
 
 
 class TaskWorker(QObject):
@@ -120,6 +121,27 @@ class MainWindow(QMainWindow):
         progress_box=QGroupBox("任务进度");progress_layout=QVBoxLayout(progress_box);self.progress=QProgressBar();self.progress.setRange(0,1);self.progress.setValue(0)
         self.status=QLabel("等待任务");self.log=QPlainTextEdit();self.log.setReadOnly(True);self.log.setMinimumHeight(150)
         progress_layout.addWidget(self.progress);progress_layout.addWidget(self.status);progress_layout.addWidget(self.log);root.addWidget(progress_box)
+
+        postprocess = QGroupBox("Windows 本地预标注目录后处理（可选）")
+        post_layout = QGridLayout(postprocess)
+        help_text = QLabel(
+            "按视频名匹配预标注子目录，将视频复制进去，并把其中的 labels 目录改成视频同名目录。"
+            "建议先预览；重复执行不会覆盖已有的不同文件。"
+        )
+        help_text.setWordWrap(True);help_text.setStyleSheet("color:#667085")
+        self.post_video_dir = QLineEdit(r"D:\cosmos_vid")
+        self.post_prelabel_dir = QLineEdit(r"D:\test")
+        self.post_video_button = QPushButton("选择目录…");self.post_video_button.clicked.connect(self._choose_post_video_dir)
+        self.post_prelabel_button = QPushButton("选择目录…");self.post_prelabel_button.clicked.connect(self._choose_post_prelabel_dir)
+        self.post_preview_button = QPushButton("预览变更");self.post_preview_button.clicked.connect(lambda: self._run_postprocess(True))
+        self.post_run_button = QPushButton("执行整理");self.post_run_button.clicked.connect(lambda: self._run_postprocess(False))
+        self.post_log = QPlainTextEdit();self.post_log.setReadOnly(True);self.post_log.setMinimumHeight(150)
+        post_layout.addWidget(help_text,0,0,1,4)
+        post_layout.addWidget(QLabel("视频目录"),1,0);post_layout.addWidget(self.post_video_dir,1,1,1,2);post_layout.addWidget(self.post_video_button,1,3)
+        post_layout.addWidget(QLabel("预标注目录"),2,0);post_layout.addWidget(self.post_prelabel_dir,2,1,1,2);post_layout.addWidget(self.post_prelabel_button,2,3)
+        post_actions=QHBoxLayout();post_actions.addStretch();post_actions.addWidget(self.post_preview_button);post_actions.addWidget(self.post_run_button)
+        post_layout.addLayout(post_actions,3,0,1,4);post_layout.addWidget(self.post_log,4,0,1,4)
+        root.addWidget(postprocess)
         root.addStretch()
         scroll.setWidget(body);self.setCentralWidget(scroll)
         self.mode.currentIndexChanged.connect(self._mode_changed)
@@ -137,6 +159,12 @@ class MainWindow(QMainWindow):
     def _choose_key(self) -> None:
         path,_=QFileDialog.getOpenFileName(self,"选择 SSH 私钥",self.sftp_key.text(),"所有文件 (*)");
         if path:self.sftp_key.setText(path)
+    def _choose_post_video_dir(self) -> None:
+        path=QFileDialog.getExistingDirectory(self,"选择本地视频目录",self.post_video_dir.text());
+        if path:self.post_video_dir.setText(path)
+    def _choose_post_prelabel_dir(self) -> None:
+        path=QFileDialog.getExistingDirectory(self,"选择本地预标注目录",self.post_prelabel_dir.text());
+        if path:self.post_prelabel_dir.setText(path)
 
     def _mode_changed(self) -> None:
         sftp=self.mode.currentData()=="sftp";self.sftp_frame.setVisible(sftp);self.reuse.setVisible(sftp)
@@ -170,6 +198,9 @@ class MainWindow(QMainWindow):
         return BatchReq(**connection.model_dump(),input_path=self.input_path.text().strip(),output_path=self.output_path.text().strip(),cuda_device=self.cuda.value(),dtype=self.dtype.currentText(),prompt=self.prompt.text().strip() or "person",categories=categories,class_map=mapping,task=self.task.currentText(),recursive=self.recursive.isChecked(),reuse_uploads=self.reuse.isChecked(),frame_step=self.frame_step.value(),max_frames=self.max_frames.value())
 
     def _launch(self, worker: TaskWorker, on_success: Callable[[dict],None]) -> None:
+        if self.thread is not None and self.thread.isRunning():
+            self._failed("已有任务正在运行，请等待其完成");return
+        self.test_button.setEnabled(False);self.run_button.setEnabled(False);self.post_preview_button.setEnabled(False);self.post_run_button.setEnabled(False)
         self.thread=QThread(self);self.worker=worker;worker.moveToThread(self.thread);self.thread.started.connect(worker.run);worker.progress.connect(self._show_progress);worker.succeeded.connect(on_success);worker.failed.connect(self._failed);worker.finished.connect(self.thread.quit);worker.finished.connect(worker.deleteLater);self.thread.finished.connect(self._thread_done);self.thread.start()
 
     def _test_connection(self) -> None:
@@ -204,6 +235,32 @@ class MainWindow(QMainWindow):
             return copy.deepcopy(job)
         self._launch(TaskWorker(action),self._batch_ok)
 
+    def _run_postprocess(self, dry_run: bool) -> None:
+        video_dir=self.post_video_dir.text().strip();prelabel_dir=self.post_prelabel_dir.text().strip()
+        if not video_dir or not prelabel_dir:
+            self._failed("请填写视频目录和预标注目录");return
+        if not dry_run:
+            answer=QMessageBox.question(self,"确认执行","将复制视频并重命名/合并 labels 目录。是否继续？")
+            if answer!=QMessageBox.StandardButton.Yes:return
+        self._save_settings();self.post_preview_button.setEnabled(False);self.post_run_button.setEnabled(False)
+        self.post_log.setPlainText("正在预览…" if dry_run else "正在整理…")
+        self._launch(TaskWorker(lambda _: organize_prelabels(video_dir,prelabel_dir,dry_run=dry_run)),self._postprocess_ok)
+
+    def _postprocess_ok(self,result:dict) -> None:
+        counts=result["counts"]
+        lines=[
+            ("预览完成" if result["dry_run"] else "整理完成")+
+            f"：视频 {result['video_count']}，匹配 {result['matched_count']}，"
+            f"待处理/完成 {counts['ready']+counts['done']}，跳过 {counts['skipped']}，错误 {counts['error']}"
+        ]
+        for item in result["items"]:
+            lines.append(f"[{item['status']}] {item['name']}")
+            for action in item.get("actions",[]):lines.append(f"  - {action}")
+            if item.get("error"):lines.append(f"  ! {item['error']}")
+        self.post_log.setPlainText("\n".join(lines))
+        if not result["dry_run"]:
+            QMessageBox.information(self,"整理完成",lines[0])
+
     def _show_progress(self,job:dict) -> None:
         total=int(job.get("total",0));done=int(job.get("completed",0));self.progress.setRange(0,max(1,total));self.progress.setValue(done);self.status.setText(str(job.get("message","")))
         lines=[]
@@ -217,13 +274,13 @@ class MainWindow(QMainWindow):
     def _failed(self,message:str) -> None:
         self.status.setText(message);self.test_result.setText("失败："+message);self.test_result.setStyleSheet("color:#b42318");QMessageBox.critical(self,"操作失败",message)
     def _thread_done(self) -> None:
-        self.test_button.setEnabled(True);self.run_button.setEnabled(True);self.worker=None;self.thread=None
+        self.test_button.setEnabled(True);self.run_button.setEnabled(True);self.post_preview_button.setEnabled(True);self.post_run_button.setEnabled(True);self.worker=None;self.thread=None
 
     def _save_settings(self) -> None:
-        values={"server_url":self.server_url.text(),"mode":self.mode.currentData(),"cuda":self.cuda.value(),"sftp_host":self.sftp_host.text(),"sftp_port":self.sftp_port.value(),"sftp_user":self.sftp_user.text(),"sftp_key":self.sftp_key.text(),"remote_dir":self.remote_dir.text(),"input_path":self.input_path.text(),"output_path":self.output_path.text(),"prompt":self.prompt.text(),"classes":self.classes.toPlainText(),"task":self.task.currentText(),"dtype":self.dtype.currentText(),"frame_step":self.frame_step.value(),"max_frames":self.max_frames.value(),"recursive":self.recursive.isChecked(),"reuse":self.reuse.isChecked()}
+        values={"server_url":self.server_url.text(),"mode":self.mode.currentData(),"cuda":self.cuda.value(),"sftp_host":self.sftp_host.text(),"sftp_port":self.sftp_port.value(),"sftp_user":self.sftp_user.text(),"sftp_key":self.sftp_key.text(),"remote_dir":self.remote_dir.text(),"input_path":self.input_path.text(),"output_path":self.output_path.text(),"prompt":self.prompt.text(),"classes":self.classes.toPlainText(),"task":self.task.currentText(),"dtype":self.dtype.currentText(),"frame_step":self.frame_step.value(),"max_frames":self.max_frames.value(),"recursive":self.recursive.isChecked(),"reuse":self.reuse.isChecked(),"post_video_dir":self.post_video_dir.text(),"post_prelabel_dir":self.post_prelabel_dir.text()}
         for key,value in values.items():self.settings.setValue(key,value)
     def _load_settings(self) -> None:
-        text_fields={"server_url":self.server_url,"sftp_host":self.sftp_host,"sftp_user":self.sftp_user,"sftp_key":self.sftp_key,"remote_dir":self.remote_dir,"input_path":self.input_path,"output_path":self.output_path,"prompt":self.prompt}
+        text_fields={"server_url":self.server_url,"sftp_host":self.sftp_host,"sftp_user":self.sftp_user,"sftp_key":self.sftp_key,"remote_dir":self.remote_dir,"input_path":self.input_path,"output_path":self.output_path,"prompt":self.prompt,"post_video_dir":self.post_video_dir,"post_prelabel_dir":self.post_prelabel_dir}
         for key,widget in text_fields.items():
             value=self.settings.value(key)
             if value is not None:widget.setText(str(value))

@@ -27,7 +27,7 @@ python scripts/check-services.py --platform http://127.0.0.1:8088
 - 任务编排逻辑放在 `workflow_platform/`。
 - 交互式标注与采样实现放在 `utils/annotator/` 和 `utils/frame_sampler/`。
 - 本地工作台的单进程装配逻辑放在 `local_workbench/`。
-- 本地工作台和平台共用的跟踪与格式转换逻辑放在 `utils/mot_pipeline/`。
+- 本地工作台使用的跟踪与格式转换逻辑放在 `utils/mot_pipeline/`；协作平台不导入该模块。
 - GPU HTTP 接口集中在 `gpu_services/`，以 `/api/sam31` 和 `/api/locateanything` 分隔。
 - LocateAnything 是外部运行时；项目内适配层通过 `LOCATEANYTHING_ROOT` 加载其 `locateanything_worker.py`。
 
@@ -36,7 +36,7 @@ python scripts/check-services.py --platform http://127.0.0.1:8088
 ## 发布检查清单
 
 1. 执行单元测试和编译检查。
-2. 在 Windows 上测试平台的任务创建、上传和分段流程。
+2. 在 Windows 上测试平台的表格粘贴、领取、计时、提交、退修和审核流程。
 3. 在 Linux 上通过同一个 GPU 服务分别用一个短视频测试 LocateAnything 分段任务和 SAM3.1 目标框任务。
 4. 检查导出 YOLO 中的类别 ID。
 5. 确认暂存区不包含 `*.local.json`、凭据、视频或模型权重。

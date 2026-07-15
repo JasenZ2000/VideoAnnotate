@@ -4,7 +4,6 @@ param(
     [int]$Port = 0,
     [string]$TasksDir = "",
     [string]$Database = "",
-    [string]$Config = "",
     [string]$Python = "",
     [switch]$Restart,
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -39,7 +38,6 @@ $arguments = @{
 }
 if ($TasksDir) { $arguments.TasksDir = $TasksDir }
 if ($Database) { $arguments.Database = $Database }
-if ($Config) { $arguments.Config = $Config }
 if ($Restart) { $arguments.Restart = $true }
 if ($ServerArgs) { $arguments.ServerArgs = $ServerArgs }
 

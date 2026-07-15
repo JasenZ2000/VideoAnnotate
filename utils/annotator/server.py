@@ -33,6 +33,7 @@ import uvicorn
 
 from utils.annotator.state import AnnotationState
 from utils.annotator.results import append_tracking_results
+from utils.annotator.export_formats import write_jpeg, write_voc_xml
 
 app = FastAPI(title="Video Annotator")
 STATE = AnnotationState()
@@ -1689,7 +1690,7 @@ async def append_tracking_results_endpoint(req: AppendTrackingResultsReq):
 
 @app.post("/api/export-yolo")
 async def export_yolo(request: Request):
-    """Export YOLO dataset: images/ + labels/ with configurable frame interval."""
+    """Export images with YOLO TXT and Pascal VOC XML annotations."""
     global _cap_pos
     if _workspace is None:
         raise HTTPException(400, "No workspace open")
@@ -1705,8 +1706,17 @@ async def export_yolo(request: Request):
     yoloset_dir = _workspace / "yoloset"
     images_dir = yoloset_dir / "images"
     labels_dir = yoloset_dir / "labels"
+    annotations_dir = yoloset_dir / "annotations"
     images_dir.mkdir(parents=True, exist_ok=True)
     labels_dir.mkdir(parents=True, exist_ok=True)
+    annotations_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_class_labels = _get_workspace_config().get("exports", {}).get("class_labels", {})
+    class_labels = {
+        int(class_id): str(label)
+        for class_id, label in raw_class_labels.items()
+        if str(class_id).lstrip("-").isdigit()
+    }
 
     # Collect all annotated frames across all tracks
     all_annotations: dict[int, list[tuple[int, list[float]]]] = {}
@@ -1720,48 +1730,52 @@ async def export_yolo(request: Request):
     # Determine which frames to export
     frame_indices = list(range(0, STATE.frame_count, interval))
     w, h = STATE.width, STATE.height
-
-    # Seek to start
-    _cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    _cap_pos = 0
+    video_stem = Path(STATE.video_path).stem or "video"
 
     saved_count = 0
-    frame_idx = 0
-    next_export = 0  # index into frame_indices
+    with _cap_lock:
+        for target in frame_indices:
+            if _cap_pos != target:
+                _cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+                _cap_pos = target
+            ok, frame = _cap.read()
+            if not ok:
+                raise HTTPException(500, f"Cannot read frame {target} while exporting")
+            _cap_pos = target + 1
 
-    while next_export < len(frame_indices):
-        target = frame_indices[next_export]
-        # Seek if needed
-        if _cap_pos != target:
-            _cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-            _cap_pos = target
-        ok, frame = _cap.read()
-        if not ok:
-            break
-        _cap_pos = target + 1
+            stem = f"{video_stem}_frame_{target:06d}"
+            img_name = f"{stem}.jpg"
+            annotations = all_annotations.get(target, [])
+            write_jpeg(images_dir / img_name, frame)
+            write_voc_xml(
+                annotations_dir / f"{stem}.xml",
+                img_name,
+                w,
+                h,
+                annotations,
+                class_labels,
+            )
 
-        # Save image
-        img_name = f"frame_{target:06d}.jpg"
-        cv2.imwrite(str(images_dir / img_name), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            with (labels_dir / f"{stem}.txt").open("w", encoding="utf-8") as f:
+                for class_id, bbox in annotations:
+                    x1, y1, x2, y2 = bbox
+                    cx = (x1 + x2) / 2.0 / w
+                    cy = (y1 + y2) / 2.0 / h
+                    bw = (x2 - x1) / w
+                    bh = (y2 - y1) / h
+                    f.write(f"{class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
 
-        # Save label
-        txt_name = f"frame_{target:06d}.txt"
-        label_path = labels_dir / txt_name
-        annotations = all_annotations.get(target, [])
-        with open(label_path, "w", encoding="utf-8") as f:
-            for class_id, bbox in annotations:
-                x1, y1, x2, y2 = bbox
-                cx = (x1 + x2) / 2.0 / w
-                cy = (y1 + y2) / 2.0 / h
-                bw = (x2 - x1) / w
-                bh = (y2 - y1) / h
-                f.write(f"{class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+            saved_count += 1
 
-        saved_count += 1
-        next_export += 1
-
-    return {"ok": True, "output_dir": str(yoloset_dir), "frames_saved": saved_count,
-            "interval": interval}
+    return {
+        "ok": True,
+        "output_dir": str(yoloset_dir),
+        "images_dir": str(images_dir),
+        "labels_dir": str(labels_dir),
+        "annotations_dir": str(annotations_dir),
+        "frames_saved": saved_count,
+        "interval": interval,
+    }
 
 
 @app.post("/api/split-workspace")
@@ -1884,7 +1898,7 @@ async def list_segments():
 
 @app.post("/api/export-merged-yolo")
 async def export_merged_yolo(req: ExportMergedYoloReq):
-    """Export a merged YOLO dataset from all segments that have tracking_results."""
+    """Export merged images with YOLO TXT and Pascal VOC XML annotations."""
     if _workspace is None:
         raise HTTPException(400, "No workspace open")
 
@@ -1896,8 +1910,17 @@ async def export_merged_yolo(req: ExportMergedYoloReq):
     yoloset_dir = _workspace / "yoloset"
     images_dir = yoloset_dir / "images"
     labels_dir = yoloset_dir / "labels"
+    annotations_dir = yoloset_dir / "annotations"
     images_dir.mkdir(parents=True, exist_ok=True)
     labels_dir.mkdir(parents=True, exist_ok=True)
+    annotations_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_class_labels = _get_workspace_config().get("exports", {}).get("class_labels", {})
+    class_labels = {
+        int(class_id): str(label)
+        for class_id, label in raw_class_labels.items()
+        if str(class_id).lstrip("-").isdigit()
+    }
 
     total_saved = 0
 
@@ -1943,11 +1966,20 @@ async def export_merged_yolo(req: ExportMergedYoloReq):
                 break
 
             img_name = f"{seg_name}_frame_{fidx:06d}.jpg"
-            cv2.imwrite(str(images_dir / img_name), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            write_jpeg(images_dir / img_name, frame)
 
-            txt_name = f"{seg_name}_frame_{fidx:06d}.txt"
-            with open(labels_dir / txt_name, "w", encoding="utf-8") as f:
-                for class_id, bbox in frame_anns.get(fidx, []):
+            stem = f"{seg_name}_frame_{fidx:06d}"
+            annotations = frame_anns.get(fidx, [])
+            write_voc_xml(
+                annotations_dir / f"{stem}.xml",
+                img_name,
+                seg_w,
+                seg_h,
+                annotations,
+                class_labels,
+            )
+            with open(labels_dir / f"{stem}.txt", "w", encoding="utf-8") as f:
+                for class_id, bbox in annotations:
                     x1, y1, x2, y2 = bbox
                     cx = (x1 + x2) / 2.0 / seg_w
                     cy = (y1 + y2) / 2.0 / seg_h
@@ -1958,8 +1990,15 @@ async def export_merged_yolo(req: ExportMergedYoloReq):
             total_saved += 1
         cap.release()
 
-    return {"ok": True, "output_dir": str(yoloset_dir), "frames_saved": total_saved,
-            "interval": interval}
+    return {
+        "ok": True,
+        "output_dir": str(yoloset_dir),
+        "images_dir": str(images_dir),
+        "labels_dir": str(labels_dir),
+        "annotations_dir": str(annotations_dir),
+        "frames_saved": total_saved,
+        "interval": interval,
+    }
 
 
 @app.post("/api/run-pipeline-all-segments")

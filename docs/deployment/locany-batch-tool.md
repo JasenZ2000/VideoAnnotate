@@ -56,3 +56,21 @@ export LOCANY_OUTPUT_ALLOWED_ROOTS=/data/labels
 ```
 
 Prompt 可独立填写；类别映射会作为 LocateAnything 的 `categories` 与 `class_map` 提交。
+
+## Windows 本地预标注目录后处理
+
+Qt 工具底部提供独立的 Windows 本地后处理区。填写视频目录和预标注目录后，工具按视频文件名（不含扩展名）匹配预标注子目录。例如：
+
+```text
+D:\videos\0001.mp4
+D:\prelabels\0001\labels\
+```
+
+执行后整理为：
+
+```text
+D:\prelabels\0001\0001.mp4
+D:\prelabels\0001\0001\
+```
+
+建议先点击“预览变更”。操作可以重复执行：已复制且大小一致的视频会被复用，已经改名的目录会被跳过；如果 `labels` 与同名目录同时存在，则只在没有内容冲突时合并。目标视频大小不同或同名标注文件内容不同时会报错，不会覆盖原文件。
