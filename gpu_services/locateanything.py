@@ -325,16 +325,21 @@ def _resize_for_inference(image: Image.Image, long_edge: int, scale: float) -> t
 
 def _extract_items(answer: str, image_width: int, image_height: int) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    box_pattern = re.compile(
-        r"(?:<ref>(?P<label>.*?)</ref>)?"
-        r"<box><(?P<x1>\d+)><(?P<y1>\d+)><(?P<x2>\d+)><(?P<y2>\d+)></box>"
+    token_pattern = re.compile(
+        r"<ref>(?P<label>.*?)</ref>"
+        r"|<box><(?P<x1>\d+)><(?P<y1>\d+)><(?P<x2>\d+)><(?P<y2>\d+)></box>",
+        re.DOTALL,
     )
-    for match in box_pattern.finditer(answer):
+    current_label = ""
+    for match in token_pattern.finditer(answer):
+        if match.group("label") is not None:
+            current_label = match.group("label").strip()
+            continue
         x1, y1, x2, y2 = [int(match.group(name)) for name in ("x1", "y1", "x2", "y2")]
         items.append(
             {
                 "type": "box",
-                "label": (match.group("label") or "").strip(),
+                "label": current_label,
                 "bbox_xyxy": [
                     x1 / 1000 * image_width,
                     y1 / 1000 * image_height,

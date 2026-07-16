@@ -566,7 +566,7 @@ class PlatformDatabase:
         return next(item for item in parts if item["part_id"] == part_id)
 
     def review_part(self, task_id: str, part_id: int, actor: str, action: str,
-                    note: str, now: str) -> dict[str, Any]:
+                    note: str, now: str, *, is_admin: bool = False) -> dict[str, Any]:
         if action not in {"approve", "rework"}:
             raise ValueError("action must be approve or rework")
         with self.transaction() as connection:
@@ -576,8 +576,8 @@ class PlatformDatabase:
             ).fetchone()
             if row is None:
                 raise KeyError(part_id)
-            if row["publisher"] != actor:
-                raise PermissionError("only publisher can review")
+            if row["publisher"] != actor and not is_admin:
+                raise PermissionError("only publisher or admin can review")
             if row["status"] != "submitted":
                 raise ValueError("only submitted part can be reviewed")
             status = "completed" if action == "approve" else "rework"

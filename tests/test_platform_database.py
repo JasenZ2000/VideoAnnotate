@@ -91,6 +91,25 @@ class PlatformDatabaseTests(unittest.TestCase):
         )
         self.assertEqual(claimed["annotator"], "publisher")
 
+    def test_admin_flag_can_review_another_publishers_part(self) -> None:
+        self.db.create_task(task(), 1, "2026-07-15T10:00:00+08:00")
+        claimed = self.db.claim_next_part(
+            "task-1", "worker", "2026-07-15T10:01:00+08:00"
+        )
+        self.db.submit_part(
+            "task-1", claimed["part_id"], "worker", "已完成", "2026-07-15T10:02:00+08:00"
+        )
+        with self.assertRaisesRegex(PermissionError, "publisher or admin"):
+            self.db.review_part(
+                "task-1", claimed["part_id"], "other-user", "approve", "", "2026-07-15T10:03:00+08:00"
+            )
+        reviewed = self.db.review_part(
+            "task-1", claimed["part_id"], "admin-user", "approve", "管理员通过",
+            "2026-07-15T10:04:00+08:00", is_admin=True,
+        )
+        self.assertEqual(reviewed["status"], "completed")
+        self.assertEqual(reviewed["comments"][-1]["actor"], "admin-user")
+
     def test_publisher_can_edit_and_delete_task_in_any_state(self) -> None:
         self.db.create_task(task(), 1, "2026-07-15T10:00:00+08:00")
         updated = self.db.update_task(

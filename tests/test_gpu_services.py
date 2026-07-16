@@ -95,6 +95,26 @@ class GpuServicesTests(unittest.TestCase):
             root = ET.parse(output).getroot()
             self.assertEqual(root.findall("object"), [])
 
+    def test_locateanything_keeps_ref_label_for_all_following_boxes(self) -> None:
+        answer = (
+            "<ref>person</ref>"
+            "<box><10><20><110><220></box><box><120><30><220><230></box>"
+            "<ref>car</ref>"
+            "<box><300><400><600><700></box><box><610><410><900><710></box>"
+        )
+        items = locateanything._extract_items(answer, 1000, 1000)
+        self.assertEqual([item["label"] for item in items], ["person", "person", "car", "car"])
+
+        request = locateanything.LocateAnythingInferenceReq(
+            prompt="person</c>car",
+            class_map={"person": 0, "car": 1},
+        )
+        class_map = locateanything._normalized_class_map(request)
+        self.assertEqual(
+            [locateanything._class_id_for_item(item, request, class_map) for item in items],
+            [0, 0, 1, 1],
+        )
+
     def test_locateanything_lists_image_directory_recursively(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -144,8 +164,8 @@ class GpuServicesTests(unittest.TestCase):
             request = locateanything.LocateAnythingImageDirectoryReq(
                 input_dir=str(input_dir),
                 recursive=True,
-                prompt="person",
-                class_map={"person": 4},
+                prompt="person</c>car",
+                class_map={"person": 4, "car": 7},
                 copy_images=True,
                 device="cpu",
             )
@@ -164,7 +184,12 @@ class GpuServicesTests(unittest.TestCase):
                     patch.object(
                         locateanything,
                         "_run_model",
-                        return_value={"answer": "<ref>person</ref><box><100><200><500><800></box>"},
+                        return_value={
+                            "answer": (
+                                "<ref>person</ref><box><100><200><500><800></box>"
+                                "<ref>car</ref><box><550><300><900><700></box>"
+                            )
+                        },
                     ),
                 ):
                     locateanything._run_image_job_sync(job_id, request, input_dir.resolve(), items)
@@ -180,7 +205,8 @@ class GpuServicesTests(unittest.TestCase):
             output = cache_dir / job_id
             self.assertTrue((output / "images" / "first.jpg").is_file())
             self.assertTrue((output / "images" / "nested" / "second.png").is_file())
-            self.assertTrue((output / "labels" / "first.txt").read_text().startswith("4 "))
+            yolo_classes = [line.split()[0] for line in (output / "labels" / "first.txt").read_text().splitlines()]
+            self.assertEqual(yolo_classes, ["4", "7"])
             self.assertEqual(
                 ET.parse(output / "annotations" / "nested" / "second.xml").getroot().findtext("object/name"),
                 "person",

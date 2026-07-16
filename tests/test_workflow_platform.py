@@ -76,6 +76,11 @@ class WorkflowPlatformTests(unittest.TestCase):
             f"/api/tasks/{task_id}/parts/{part_id}/submit", json={"note": "有两张模糊图"}
         )
         self.assertEqual(submitted.json()["part"]["status"], "submitted")
+        denied = self.client.post(
+            f"/api/tasks/{task_id}/parts/{part_id}/review",
+            json={"action": "approve", "note": "越权审核"},
+        )
+        self.assertEqual(denied.status_code, 403)
 
         self.client.post("/api/auth/logout")
         self.client.post("/api/auth/login", json={"username": "publisher", "password": "publisher-pass"})
@@ -103,6 +108,39 @@ class WorkflowPlatformTests(unittest.TestCase):
         self.assertEqual(approved.json()["part"]["status"], "completed")
         detail = self.client.get(f"/api/tasks/{task_id}").json()
         self.assertEqual(detail["statistics"][0]["completed"], 1)
+
+    def test_admin_can_review_parts_from_another_publishers_task(self) -> None:
+        self.client.post("/api/users", json={
+            "username": "reviewer", "password": "reviewer-pass",
+            "display_name": "审核管理员", "role": "admin",
+        })
+        task_id = self._publish(TABLE.splitlines()[1], 2)["tasks"][0]["task_id"]
+
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={"username": "worker", "password": "worker-pass"})
+        claimed = self.client.post(f"/api/tasks/{task_id}/parts/claim-next").json()["part"]
+        self.client.post(
+            f"/api/tasks/{task_id}/parts/{claimed['part_id']}/submit",
+            json={"note": "等待管理员审核"},
+        )
+
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={
+            "username": "reviewer", "password": "reviewer-pass",
+        })
+        detail = self.client.get(f"/api/tasks/{task_id}").json()
+        self.assertFalse(detail["is_publisher"])
+        self.assertTrue(detail["can_review"])
+        self.assertEqual(len(detail["parts"]), 2)
+        self.assertNotIn("statistics", detail)
+
+        reviewed = self.client.post(
+            f"/api/tasks/{task_id}/parts/{claimed['part_id']}/review",
+            json={"action": "approve", "note": "管理员检查通过"},
+        )
+        self.assertEqual(reviewed.status_code, 200, reviewed.text)
+        self.assertEqual(reviewed.json()["part"]["status"], "completed")
+        self.assertEqual(reviewed.json()["part"]["comments"][-1]["actor"], "reviewer")
 
     def test_worker_cannot_see_statistics_or_add_parts(self) -> None:
         task_id = self._publish(TABLE.splitlines()[1], 1)["tasks"][0]["task_id"]
@@ -142,7 +180,7 @@ class WorkflowPlatformTests(unittest.TestCase):
 
     def test_health_and_authentication_contract(self) -> None:
         health = self.client.get("/api/health")
-        self.assertEqual(health.json()["api_schema_version"], 6)
+        self.assertEqual(health.json()["api_schema_version"], 7)
         self.client.post("/api/auth/logout")
         self.assertEqual(self.client.get("/api/tasks").status_code, 401)
 

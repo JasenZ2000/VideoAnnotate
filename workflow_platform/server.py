@@ -27,7 +27,7 @@ APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 PROJECT_ROOT = APP_DIR.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "platform_tasks"
-API_SCHEMA_VERSION = 6
+API_SCHEMA_VERSION = 7
 SESSION_COOKIE_NAME = "annotation_platform_session"
 SESSION_TTL_DAYS = int(os.environ.get("ANNOTATION_PLATFORM_SESSION_DAYS", "7"))
 PASSWORD_ITERATIONS = 200_000
@@ -438,10 +438,12 @@ async def publish_tasks(req: PublishTasksReq):
 
 @app.get("/api/tasks")
 async def list_tasks():
-    actor = require_user()["username"]
+    user = require_user()
+    actor = user["username"]
     tasks = database().list_tasks(now_iso())
     for task in tasks:
         task["is_publisher"] = task["publisher"] == actor
+        task["can_review"] = task["is_publisher"] or user.get("role") == "admin"
         mine = database().list_parts(task["task_id"], now_iso(), actor)
         task["my_parts"] = len(mine)
         task["my_rework"] = sum(1 for part in mine if part["status"] == "rework")
@@ -451,18 +453,22 @@ async def list_tasks():
 
 @app.get("/api/tasks/{task_id}")
 async def get_task(task_id: str):
-    actor = require_user()["username"]
+    user = require_user()
+    actor = user["username"]
     try:
         task = database().get_task(task_id, now_iso())
     except KeyError as exc:
         raise HTTPException(404, "任务不存在") from exc
     publisher = task["publisher"] == actor
+    can_review = publisher or user.get("role") == "admin"
     task["is_publisher"] = publisher
+    task["can_review"] = can_review
     task["available_parts"] = task["part_summary"]["pending"]
-    if publisher:
+    if can_review:
         task["parts"] = database().list_parts(task_id, now_iso())
+    if publisher:
         task["statistics"] = database().annotator_statistics(task_id, now_iso())
-    else:
+    elif not can_review:
         task["parts"] = database().list_parts(task_id, now_iso(), actor)
     return task
 
@@ -549,9 +555,13 @@ async def add_comment(task_id: str, part_id: int, req: CommentReq):
 
 @app.post("/api/tasks/{task_id}/parts/{part_id}/review")
 async def review_part(task_id: str, part_id: int, req: ReviewPartReq):
-    actor = require_user()["username"]
+    user = require_user()
+    actor = user["username"]
     try:
-        part = database().review_part(task_id, part_id, actor, req.action, req.note, now_iso())
+        part = database().review_part(
+            task_id, part_id, actor, req.action, req.note, now_iso(),
+            is_admin=user.get("role") == "admin",
+        )
     except BaseException as exc:
         _raise_database_error(exc)
     return {"part": part}
