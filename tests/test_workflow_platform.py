@@ -51,6 +51,51 @@ class WorkflowPlatformTests(unittest.TestCase):
         headerless = platform.parse_spreadsheet_rows(TABLE.splitlines()[1])
         self.assertEqual(headerless[0]["applicant"], "刘湛基")
 
+    def test_part_manifest_builds_nested_work_paths_and_rejects_duplicates(self) -> None:
+        specs = platform.parse_part_manifest(
+            "split_001\ncamera_a/split_002\n特殊任务\tcamera_b/split_003",
+            r"\\server\dataset",
+        )
+        self.assertEqual([item["name"] for item in specs], [
+            "split_001", "camera_a / split_002", "特殊任务",
+        ])
+        self.assertEqual(specs[1]["work_path"], r"\\server\dataset\camera_a\split_002")
+        with self.assertRaisesRegex(ValueError, "重复工作目录"):
+            platform.parse_part_manifest("split_001\nsplit_001", r"\\server\dataset")
+
+    def test_publish_with_part_manifest_exposes_work_directory_to_worker(self) -> None:
+        row = TABLE.splitlines()[1]
+        response = self.client.post("/api/tasks", json={
+            "clipboard_text": row,
+            "product_tag": "BSD",
+            "part_count": 0,
+            "part_manifest": "split_001\ngroup_a/split_002",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        task_id = response.json()["tasks"][0]["task_id"]
+        detail = self.client.get(f"/api/tasks/{task_id}").json()
+        self.assertEqual([part["name"] for part in detail["parts"]], [
+            "split_001", "group_a / split_002",
+        ])
+        self.assertEqual(
+            detail["parts"][1]["work_path"], r"\\server\data\group_a\split_002",
+        )
+
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={"username": "worker", "password": "worker-pass"})
+        claimed = self.client.post(f"/api/tasks/{task_id}/parts/claim-next").json()["part"]
+        self.assertEqual(claimed["work_path"], r"\\server\data\split_001")
+
+    def test_manifest_publish_requires_one_task_row(self) -> None:
+        response = self.client.post("/api/tasks/preview", json={
+            "clipboard_text": TABLE,
+            "product_tag": "BSD",
+            "part_count": 0,
+            "part_manifest": "split_001",
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("一次只能发布一行任务", response.text)
+
     def test_publish_multiple_rows_and_publisher_detail(self) -> None:
         created = self._publish()
         self.assertEqual(created["count"], 2)
@@ -180,7 +225,7 @@ class WorkflowPlatformTests(unittest.TestCase):
 
     def test_health_and_authentication_contract(self) -> None:
         health = self.client.get("/api/health")
-        self.assertEqual(health.json()["api_schema_version"], 7)
+        self.assertEqual(health.json()["api_schema_version"], 8)
         self.client.post("/api/auth/logout")
         self.assertEqual(self.client.get("/api/tasks").status_code, 401)
 

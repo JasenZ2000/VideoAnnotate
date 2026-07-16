@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import io
 import os
+import re
 import secrets
 import threading
 import uuid
@@ -27,7 +28,7 @@ APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 PROJECT_ROOT = APP_DIR.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "platform_tasks"
-API_SCHEMA_VERSION = 7
+API_SCHEMA_VERSION = 8
 SESSION_COOKIE_NAME = "annotation_platform_session"
 SESSION_TTL_DAYS = int(os.environ.get("ANNOTATION_PLATFORM_SESSION_DAYS", "7"))
 PASSWORD_ITERATIONS = 200_000
@@ -87,8 +88,9 @@ class ChangePasswordReq(BaseModel):
 class PublishTasksReq(BaseModel):
     clipboard_text: str
     product_tag: str
-    part_count: int
+    part_count: int = 0
     part_prefix: str = ""
+    part_manifest: str = ""
 
 
 class AddPartsReq(BaseModel):
@@ -253,6 +255,52 @@ def parse_spreadsheet_rows(text: str) -> list[dict[str, str]]:
     return result
 
 
+def _work_path(data_root: str, manifest_path: str) -> str:
+    path = manifest_path.strip()
+    if path.startswith(("/", "\\\\")) or re.match(r"^[A-Za-z]:[\\/]", path):
+        return path
+    root = data_root.strip()
+    if not root:
+        raise ValueError("清单使用相对路径时，任务表中的数据路径不能为空")
+    if path in {".", ".\\", "./"}:
+        return root.rstrip("/\\")
+    separator = "\\" if "\\" in root and "/" not in root else "/"
+    return root.rstrip("/\\") + separator + path.strip("/\\").replace("/", separator).replace("\\", separator)
+
+
+def parse_part_manifest(text: str, data_root: str) -> list[dict[str, str]]:
+    specs: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for line_number, row in enumerate(csv.reader(io.StringIO(text), delimiter="\t"), 1):
+        cells = [cell.strip() for cell in row]
+        if not any(cells):
+            continue
+        if len(cells) > 2:
+            raise ValueError(f"Part 清单第 {line_number} 行最多只能有两列：显示名和路径")
+        display_name, raw_path = ("", cells[0]) if len(cells) == 1 else (cells[0], cells[1])
+        if not raw_path:
+            raise ValueError(f"Part 清单第 {line_number} 行缺少工作目录")
+        work_path = _work_path(data_root, raw_path)
+        key = work_path.replace("\\", "/").rstrip("/").casefold()
+        if key in seen:
+            raise ValueError(f"Part 清单包含重复工作目录：{work_path}")
+        seen.add(key)
+        if not display_name:
+            if raw_path.startswith(("/", "\\\\")) or re.match(r"^[A-Za-z]:[\\/]", raw_path):
+                display_name = raw_path.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1]
+            else:
+                display_name = (
+                    "数据集根目录" if raw_path in {".", ".\\", "./"} else
+                    " / ".join(part for part in re.split(r"[\\/]", raw_path.strip("/\\")) if part)
+                )
+        specs.append({"name": display_name, "work_path": work_path})
+    if not specs:
+        raise ValueError("Part 工作目录清单为空")
+    if len(specs) > 10000:
+        raise ValueError("Part 工作目录清单不能超过 10000 行")
+    return specs
+
+
 @app.middleware("http")
 async def authentication(request: Request, call_next):
     token = CURRENT_USER.set(None)
@@ -398,9 +446,20 @@ async def preview_tasks(req: PublishTasksReq):
     require_user()
     try:
         rows = parse_spreadsheet_rows(req.clipboard_text)
+        part_specs = None
+        if req.part_manifest.strip():
+            if len(rows) != 1:
+                raise ValueError("使用 Part 工作目录清单时，一次只能发布一行任务")
+            part_specs = parse_part_manifest(req.part_manifest, rows[0]["data_path"])
+        elif req.part_count < 1 or req.part_count > 10000:
+            raise ValueError("Part 数量必须在 1 到 10000 之间")
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return {"rows": rows, "count": len(rows)}
+    return {
+        "rows": rows, "count": len(rows),
+        "part_count": len(part_specs) if part_specs is not None else req.part_count,
+        "part_preview": (part_specs or [])[:20],
+    }
 
 
 @app.post("/api/tasks")
@@ -409,12 +468,18 @@ async def publish_tasks(req: PublishTasksReq):
     tag = req.product_tag.strip()
     if not tag:
         raise HTTPException(400, "请填写产品大标签")
-    if req.part_count < 1 or req.part_count > 10000:
+    if not req.part_manifest.strip() and (req.part_count < 1 or req.part_count > 10000):
         raise HTTPException(400, "Part 数量必须在 1 到 10000 之间")
     try:
         rows = parse_spreadsheet_rows(req.clipboard_text)
+        if req.part_manifest.strip() and len(rows) != 1:
+            raise ValueError("使用 Part 工作目录清单时，一次只能发布一行任务")
         created = []
         for row in rows:
+            part_specs = (
+                parse_part_manifest(req.part_manifest, row["data_path"])
+                if req.part_manifest.strip() else None
+            )
             now = now_iso()
             project = row["project"] or "未命名项目"
             content = row["annotation_content"] or "标注任务"
@@ -430,7 +495,9 @@ async def publish_tasks(req: PublishTasksReq):
                 "created_at": now,
                 "updated_at": now,
             }
-            created.append(database().create_task(task, req.part_count, now))
+            created.append(database().create_task(
+                task, req.part_count, now, part_specs=part_specs,
+            ))
     except BaseException as exc:
         _raise_database_error(exc)
     return {"tasks": created, "count": len(created)}

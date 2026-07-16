@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 PART_STATUSES = ("pending", "in_progress", "submitted", "rework", "completed")
 TASK_FIELDS = (
     "application_date",
@@ -122,6 +122,7 @@ class PlatformDatabase:
                     part_index INTEGER NOT NULL,
                     name TEXT NOT NULL,
                     instructions TEXT NOT NULL DEFAULT '',
+                    work_path TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'pending',
                     annotator TEXT,
                     claimed_at TEXT,
@@ -179,6 +180,9 @@ class PlatformDatabase:
             for column, definition in additions.items():
                 if column not in task_columns:
                     connection.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
+            part_columns = {row["name"] for row in connection.execute("PRAGMA table_info(parts)")}
+            if "work_path" not in part_columns:
+                connection.execute("ALTER TABLE parts ADD COLUMN work_path TEXT NOT NULL DEFAULT ''")
             task_columns.update(additions)
             legacy_columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
             if "assignee" in legacy_columns:
@@ -302,8 +306,10 @@ class PlatformDatabase:
             connection.execute("DELETE FROM user_sessions WHERE token_hash=?", (token_hash,))
 
     # Tasks
-    def create_task(self, task: dict[str, Any], part_count: int, now: str) -> dict[str, Any]:
-        if part_count < 1 or part_count > 10000:
+    def create_task(self, task: dict[str, Any], part_count: int, now: str,
+                    part_specs: Optional[list[dict[str, str]]] = None) -> dict[str, Any]:
+        effective_count = len(part_specs) if part_specs is not None else part_count
+        if effective_count < 1 or effective_count > 10000:
             raise ValueError("part count must be between 1 and 10000")
         columns = ["task_id", "name", "status", "publisher", "manager", "product_tag",
                    "part_prefix", *TASK_FIELDS, "created_at", "updated_at"]
@@ -313,8 +319,10 @@ class PlatformDatabase:
                 f"INSERT INTO tasks({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
                 values,
             )
-            self._insert_parts(connection, task["task_id"], part_count,
-                               str(task.get("part_prefix", "")), now)
+            self._insert_parts(
+                connection, task["task_id"], effective_count,
+                str(task.get("part_prefix", "")), now, part_specs=part_specs,
+            )
         return self.get_task(str(task["task_id"]), now)
 
     def update_task(self, task_id: str, actor: str, changes: dict[str, str],
@@ -356,19 +364,24 @@ class PlatformDatabase:
             )
 
     def _insert_parts(self, connection: sqlite3.Connection, task_id: str, count: int,
-                      prefix: str, now: str) -> None:
+                      prefix: str, now: str,
+                      part_specs: Optional[list[dict[str, str]]] = None) -> None:
         row = connection.execute(
             "SELECT COALESCE(MAX(part_index),0) FROM parts WHERE task_id=?", (task_id,)
         ).fetchone()
         start = int(row[0]) + 1
         clean = prefix.strip()
         separator = "" if not clean or clean.endswith(("_", "-", " ")) else "_"
-        for index in range(start, start + count):
-            name = f"{clean}{separator}part_{index:03d}"
+        for offset, index in enumerate(range(start, start + count)):
+            spec = part_specs[offset] if part_specs is not None else None
+            name = str(spec.get("name", "")).strip() if spec else ""
+            if not name:
+                name = f"{clean}{separator}part_{index:03d}"
+            work_path = str(spec.get("work_path", "")).strip() if spec else ""
             connection.execute(
-                "INSERT INTO parts(task_id,part_index,name,status,created_at,updated_at) "
-                "VALUES(?,?,?,'pending',?,?)",
-                (task_id, index, name, now, now),
+                "INSERT INTO parts(task_id,part_index,name,work_path,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,'pending',?,?)",
+                (task_id, index, name, work_path, now, now),
             )
 
     def add_parts(self, task_id: str, count: int, actor: str, now: str) -> list[dict[str, Any]]:

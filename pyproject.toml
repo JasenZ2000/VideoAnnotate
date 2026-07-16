@@ -19,6 +19,7 @@ local-workbench = "local_workbench.server:main"
 gpu-services = "gpu_services.server:main"
 locany-batch-tool = "locany_batch_tool.gui:main"
 dataset-split-tool = "dataset_split_tool.gui:main"
+part-directory-scanner = "workflow_platform.part_scanner_gui:main"
 
 [build-system]
 requires = ["hatchling"]

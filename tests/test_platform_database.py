@@ -71,6 +71,19 @@ class PlatformDatabaseTests(unittest.TestCase):
         self.assertEqual(stats[0]["completed"], 1)
         self.assertEqual(stats[0]["work_seconds"], 900)
 
+    def test_task_can_create_parts_from_work_directory_specs(self) -> None:
+        self.db.create_task(
+            task(), 0, "2026-07-15T10:00:00+08:00",
+            part_specs=[
+                {"name": "split_001", "work_path": r"\\server\data\split_001"},
+                {"name": "group / split_002", "work_path": r"\\server\data\group\split_002"},
+            ],
+        )
+        parts = self.db.list_parts("task-1", "2026-07-15T10:00:00+08:00")
+        self.assertEqual([part["name"] for part in parts], ["split_001", "group / split_002"])
+        self.assertEqual(parts[1]["work_path"], r"\\server\data\group\split_002")
+        self.assertEqual(self.db.health()["schema_version"], 5)
+
     def test_concurrent_claims_get_different_parts(self) -> None:
         self.db.create_task(task(), 2, "2026-07-15T10:00:00+08:00")
         with ThreadPoolExecutor(max_workers=2) as executor:

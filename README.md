@@ -79,6 +79,8 @@ To build a Windows executable, install `requirements\windows-build.txt` and run 
 
 On Windows, start the workflow platform with `workflow_platform\run.ps1`. Its default port is `8088`; either edit `$DefaultPort` near the top of that file or override it at launch with `-Port 8090`.
 
+For non-technical publishers, build `PartDirectoryScannerTool.exe` with `scripts\windows\build-part-directory-scanner.ps1`. The Qt tool selects a dataset root through a folder dialog, discovers nested Part work directories, previews them, and copies a manifest directly into the workflow platform publish form.
+
 For standalone LocateAnything batch pre-labeling, run `locany_batch_tool\run.ps1`. It opens a Qt desktop interface that tests GPU/SFTP connectivity and provides separate modes for video batches and image-directory inference, with either SFTP upload/download or direct server-side paths. Build the Windows executable with `scripts\windows\build-locany-batch-tool.ps1`.
 
 ### Linux GPU services
