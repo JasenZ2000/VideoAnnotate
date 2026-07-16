@@ -28,6 +28,7 @@ class LocalWorkbenchTests(unittest.TestCase):
         self.assertIn("function pointerOnCanvas(event)", annotator_html)
         self.assertIn("window.devicePixelRatio", annotator_html)
         self.assertNotIn("LocateAnything YOLO", annotator_html)
+        self.assertIn("将此后标注分离成新轨迹", annotator_html)
         self.assertIn("训练帧采样器", client.get("/sampler/").text)
 
 

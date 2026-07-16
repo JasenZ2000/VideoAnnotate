@@ -16,7 +16,7 @@ import urllib.request
 import uuid
 import webbrowser
 from pathlib import Path, PurePosixPath
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).resolve().parent
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mkv", ".mov", ".webm"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 JOBS: dict[str, dict[str, Any]] = {}
 JOB_LOCKS: dict[str, threading.RLock] = {}
 
@@ -55,6 +56,7 @@ class ConnectionReq(BaseModel):
     sftp_password: str = ""
     sftp_key_path: str = ""
     sftp_remote_dir: str = ""
+    task_kind: Literal["video", "images"] = "video"
 
 
 class BatchReq(ConnectionReq):
@@ -71,6 +73,8 @@ class BatchReq(ConnectionReq):
     reuse_uploads: bool = True
     frame_step: int = 1
     max_frames: int = 0
+    max_images: int = 0
+    copy_images: bool = False
 
 
 def parse_cuda_devices(value: str) -> list[int]:
@@ -166,6 +170,17 @@ def _videos(input_path: str, recursive: bool) -> list[Path]:
     return videos
 
 
+def _images(input_path: str, recursive: bool) -> list[Path]:
+    source = Path(input_path).expanduser().resolve()
+    if not source.is_dir():
+        raise RuntimeError(f"Image input must be a directory: {source}")
+    iterator = source.rglob("*") if recursive else source.iterdir()
+    images = sorted(path for path in iterator if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
+    if not images:
+        raise RuntimeError(f"No supported images found in: {source}")
+    return images
+
+
 def _remote_videos(server_url: str, input_path: str, recursive: bool) -> list[str]:
     query = urllib.parse.urlencode({"path": input_path, "recursive": str(recursive).lower()})
     try:
@@ -183,13 +198,35 @@ def _remote_videos(server_url: str, input_path: str, recursive: bool) -> list[st
     return videos
 
 
-def _check_direct_capabilities(server_url: str, health: dict[str, Any]) -> None:
+def _check_task_api(server_url: str, task_kind: str = "video") -> None:
+    openapi = _json_request("GET", f"{server_url.rstrip('/')}/openapi.json")
+    required_path = (
+        "/api/locateanything/image-jobs"
+        if task_kind == "images"
+        else "/api/locateanything/jobs"
+    )
+    if required_path not in openapi.get("paths", {}):
+        raise RuntimeError(
+            f"GPU Services is too old for this mode: missing {required_path}. "
+            "Update the server repository and restart GPU Services."
+        )
+
+
+def _check_direct_capabilities(
+    server_url: str, health: dict[str, Any], task_kind: str = "video",
+) -> None:
+    _check_task_api(server_url, task_kind)
     openapi = _json_request("GET", f"{server_url.rstrip('/')}/openapi.json")
     paths = openapi.get("paths", {})
-    if "/api/locateanything/videos" not in paths:
+    required_path = (
+        "/api/locateanything/image-jobs"
+        if task_kind == "images"
+        else "/api/locateanything/videos"
+    )
+    if required_path not in paths:
         raise RuntimeError(
-            "GPU Services 版本过旧：直连模式需要 /api/locateanything/videos。"
-            "请更新服务器代码并重启 GPU Services。"
+            f"GPU Services is too old for this mode: missing {required_path}. "
+            "Update the server repository and restart GPU Services."
         )
     output_roots = health.get("output_allowed_roots", [])
     if not output_roots:
@@ -229,6 +266,41 @@ def _download(url: str, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(url, timeout=600) as response, open(output, "wb") as handle:
         shutil.copyfileobj(response, handle)
+
+
+def _image_remote_root(source: Path, images: list[Path]) -> str:
+    manifest = [str(source.resolve())]
+    for image in images:
+        stat = image.stat()
+        manifest.append(f"{image.relative_to(source).as_posix()}|{stat.st_size}|{int(stat.st_mtime)}")
+    digest = hashlib.sha1("\n".join(manifest).encode("utf-8")).hexdigest()[:12]
+    safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in source.name)
+    return f"images_{safe_name or 'input'}_{digest}"
+
+
+def _upload_image_directory(source: Path, images: list[Path], req: BatchReq) -> str:
+    remote_root = posixpath.join(req.sftp_remote_dir.rstrip("/"), _image_remote_root(source, images))
+    client = _connect_sftp(req)
+    try:
+        sftp = client.open_sftp()
+        try:
+            _mkdir_p(sftp, remote_root)
+            for image in images:
+                relative = image.relative_to(source).as_posix()
+                remote_path = posixpath.join(remote_root, relative)
+                _mkdir_p(sftp, posixpath.dirname(remote_path))
+                if req.reuse_uploads:
+                    try:
+                        if sftp.stat(remote_path).st_size == image.stat().st_size:
+                            continue
+                    except OSError:
+                        pass
+                sftp.put(str(image), remote_path)
+            return remote_root
+        finally:
+            sftp.close()
+    finally:
+        client.close()
 
 
 def _run_video_item(
@@ -284,10 +356,97 @@ def _run_video_item(
         item["status"] = "done"
 
 
+def _run_image_batch(job_id: str, req: BatchReq) -> None:
+    job = JOBS[job_id]
+    update_lock = JOB_LOCKS.setdefault(job_id, threading.RLock())
+    devices = _selected_cuda_devices(req)
+    if len(devices) != 1:
+        raise RuntimeError("Image-directory inference currently requires exactly one CUDA device.")
+    device = devices[0]
+    base = req.server_url.rstrip("/")
+    health = _json_request("GET", f"{base}/api/locateanything/health")
+    enabled = [str(value) for value in health.get("devices", [])]
+    if enabled and f"cuda:{device}" not in enabled:
+        raise RuntimeError(f"GPU Services has not enabled cuda:{device}; available devices: {', '.join(enabled)}")
+
+    if req.mode == "sftp":
+        source = Path(req.input_path).expanduser().resolve()
+        images = _images(str(source), req.recursive)
+        with update_lock:
+            job.update(
+                status="running", total=1, completed=0, finished=0,
+                cuda_devices=devices,
+                items=[{"input": str(source), "status": "preparing", "message": f"Uploading {len(images)} images"}],
+                message=f"Uploading {len(images)} images to GPU Services",
+            )
+        remote_input = _upload_image_directory(source, images, req)
+        direct_output = None
+        local_output = Path(req.output_path).expanduser().resolve()
+        result_name = f"{source.name}_images.zip"
+    elif req.mode == "direct":
+        _check_direct_capabilities(req.server_url, health, "images")
+        remote_input = req.input_path
+        direct_output = req.output_path
+        local_output = None
+        result_name = ""
+        with update_lock:
+            job.update(
+                status="running", total=1, completed=0, finished=0,
+                cuda_devices=devices,
+                items=[{"input": remote_input, "status": "preparing", "message": "Preparing image-directory job"}],
+                message="Preparing image-directory inference",
+            )
+    else:
+        raise RuntimeError("mode must be sftp or direct")
+
+    item = job["items"][0]
+    payload = {
+        "input_dir": remote_input,
+        "prompt": req.prompt,
+        "categories": req.categories,
+        "class_map": req.class_map,
+        "task": req.task,
+        "class_id": next(iter(req.class_map.values()), 0),
+        "device": f"cuda:{device}",
+        "dtype": req.dtype,
+        "recursive": req.recursive,
+        "max_images": max(0, req.max_images),
+        "copy_images": req.copy_images,
+        "output_dir": direct_output,
+    }
+    created = _json_request("POST", f"{base}/api/locateanything/image-jobs", payload)
+    remote_job_id = created["job_id"]
+    with update_lock:
+        item.update(status="running", remote_job_id=remote_job_id, requested_device=f"cuda:{device}")
+    while True:
+        remote = _json_request("GET", f"{base}/api/locateanything/image-jobs/{remote_job_id}")
+        with update_lock:
+            item["message"] = remote.get("message", "")
+            item["assigned_device"] = remote.get("assigned_device", f"cuda:{device}")
+            job["message"] = item["message"] or "Running image-directory inference"
+        if remote.get("status") not in {"queued", "running"}:
+            break
+        time.sleep(2)
+    if remote.get("status") != "done":
+        raise RuntimeError(remote.get("message", "remote image job failed"))
+    if req.mode == "sftp":
+        zip_path = local_output / result_name  # type: ignore[operator]
+        _download(f"{base}/api/locateanything/image-jobs/{remote_job_id}/annotations-zip", zip_path)
+        output = str(zip_path)
+    else:
+        output = remote.get("direct_output_dir", direct_output)
+    with update_lock:
+        item.update(status="done", output=output)
+        job.update(status="done", completed=1, finished=1, message="Image-directory inference completed")
+
+
 def _run_batch(job_id: str, req: BatchReq) -> None:
     job = JOBS[job_id]
     update_lock = JOB_LOCKS.setdefault(job_id, threading.RLock())
     try:
+        if req.task_kind == "images":
+            _run_image_batch(job_id, req)
+            return
         if req.mode == "sftp":
             videos: list[Any] = _videos(req.input_path, req.recursive)
         elif req.mode == "direct":
@@ -381,6 +540,7 @@ async def test_connection(req: ConnectionReq) -> dict[str, Any]:
         gpu = _json_request("GET", f"{req.server_url.rstrip('/')}/api/locateanything/health")
         result: dict[str, Any] = {"ok": True, "gpu": gpu}
         if req.mode == "sftp":
+            _check_task_api(req.server_url, req.task_kind)
             client = _connect_sftp(req)
             try:
                 sftp = client.open_sftp()
@@ -391,7 +551,7 @@ async def test_connection(req: ConnectionReq) -> dict[str, Any]:
             finally:
                 client.close()
         else:
-            _check_direct_capabilities(req.server_url, gpu)
+            _check_direct_capabilities(req.server_url, gpu, req.task_kind)
             result["direct"] = {"ok": True, "output_allowed_roots": gpu.get("output_allowed_roots", [])}
         return result
     except Exception as exc:

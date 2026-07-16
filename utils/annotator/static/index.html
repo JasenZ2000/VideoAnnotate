@@ -126,6 +126,7 @@ label { font-size: 11px; color: #aaa; display: block; margin-bottom: 2px; }
         <button class="danger" onclick="deleteAllBefore()" style="flex:1">删除此前标注</button>
         <button class="danger" onclick="deleteAllAfter()" style="flex:1">删除此后标注</button>
       </div>
+      <button onclick="splitTrackAfter()" style="width:100%; margin-bottom:4px" title="当前帧保留在原轨迹；之后的标注移动到继承相同类别的新轨迹">将此后标注分离成新轨迹</button>
     </div>
     <div class="panel">
       <label>区间插值与清理</label>
@@ -661,6 +662,18 @@ async function deleteAllAfter() {
     await refreshState(); fetchAnnotations(currentFrame); setStatus(`已删除第 ${currentFrame} 帧以后的 ${r.deleted} 帧标注`);
   } catch (e) { setStatus('Error: '+e.message); }
 }
+async function splitTrackAfter() {
+  const sourceTrackId = activeTrackId;
+  if (!confirm(`确定把轨迹 ${sourceTrackId} 在第 ${currentFrame} 帧之后的全部标注分离为一条新轨迹吗？\n\n当前帧及此前标注仍保留在原轨迹，新轨迹会继承相同类别。`)) return;
+  try {
+    const r = await api('POST', '/api/split-after', { track_id: sourceTrackId, frame_idx: currentFrame });
+    clearAnnotationCache();
+    activeTrackId = r.new_track_id;
+    await refreshState();
+    seekToFrame(r.start_frame);
+    setStatus(`已把轨迹 ${sourceTrackId} 的后续 ${r.moved} 帧分离为新轨迹 ${r.new_track_id}`);
+  } catch (e) { setStatus('Error: '+e.message); }
+}
 async function copyPrevAnnotation() {
   const t = state.tracks.find(t => t.track_id === activeTrackId);
   if (!t) return;
@@ -952,7 +965,10 @@ async function renderVideos() {
   } catch (e) { setStatus('Error: '+e.message); }
 }
 async function saveProject() {
-  try { await api('POST', '/api/save'); setStatus('项目已保存'); }
+  try {
+    const r = await api('POST', '/api/save');
+    setStatus(`项目已保存，下次打开会恢复当前 ${r.num_tracks} 条轨迹`);
+  }
   catch (e) { setStatus('Error: '+e.message); }
 }
 async function loadProject() {

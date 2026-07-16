@@ -29,9 +29,11 @@ DEFAULT_CACHE_DIR = Path(os.environ.get("LOCANY_CACHE_DIR", "/tmp/video-annotati
 DEFAULT_MODEL = os.environ.get("LOCANY_MODEL", "nvidia/LocateAnything-3B")
 DEFAULT_EXTERNAL_ROOT = os.environ.get("LOCATEANYTHING_ROOT", "")
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mkv", ".mov", ".webm"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 router = APIRouter(prefix="/api/locateanything", tags=["locateanything"])
 JOBS: dict[str, dict[str, Any]] = {}
+IMAGE_JOBS: dict[str, dict[str, Any]] = {}
 WORKERS: dict[tuple[str, str], Any] = {}
 WORKERS_LOCK = threading.Lock()
 SETTINGS: dict[str, Any] = {
@@ -54,8 +56,7 @@ SETTINGS: dict[str, Any] = {
 }
 
 
-class LocateAnythingVideoReq(BaseModel):
-    video_path: str
+class LocateAnythingInferenceReq(BaseModel):
     prompt: str = "person"
     categories: list[str] = Field(default_factory=list)
     class_map: dict[str, int] = Field(default_factory=dict)
@@ -63,11 +64,6 @@ class LocateAnythingVideoReq(BaseModel):
     question: str = ""
     class_id: int = 0
     score: float = 1.0
-    start_frame: int = 0
-    max_frames: int = 0
-    frame_step: int = 1
-    frame_offset: int = 1
-    file_prefix: str = ""
     resize_long_edge: int = 1024
     resize_scale: float = 1.0
     generation_mode: str = "slow"
@@ -77,6 +73,22 @@ class LocateAnythingVideoReq(BaseModel):
     device: Optional[str] = None
     dtype: Optional[str] = None
     output_dir: Optional[str] = None
+
+
+class LocateAnythingVideoReq(LocateAnythingInferenceReq):
+    video_path: str
+    start_frame: int = 0
+    max_frames: int = 0
+    frame_step: int = 1
+    frame_offset: int = 1
+    file_prefix: str = ""
+
+
+class LocateAnythingImageDirectoryReq(LocateAnythingInferenceReq):
+    input_dir: str
+    recursive: bool = False
+    max_images: int = Field(default=0, ge=0)
+    copy_images: bool = False
 
 
 def _torch() -> Any:
@@ -163,6 +175,55 @@ def _resolve_input_path(raw_path: str) -> Path:
     return path
 
 
+def _resolve_image_directory(raw_path: str) -> Path:
+    path = _resolve_input_path(raw_path)
+    if not path.is_dir():
+        raise HTTPException(400, f"Image input must be a directory: {path}")
+    return path
+
+
+def _list_image_files(input_dir: Path, recursive: bool, max_images: int = 0) -> list[tuple[Path, Path]]:
+    iterator = input_dir.rglob("*") if recursive else input_dir.iterdir()
+    items: list[tuple[Path, Path]] = []
+    for candidate in iterator:
+        if not candidate.is_file() or candidate.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        resolved = candidate.resolve()
+        if not _is_relative_to(resolved, input_dir):
+            continue
+        items.append((resolved, resolved.relative_to(input_dir)))
+    items.sort(key=lambda item: item[1].as_posix().casefold())
+    if max_images > 0:
+        items = items[:max_images]
+    if not items:
+        raise ValueError(f"No supported images found in: {input_dir}")
+
+    annotation_paths: dict[str, Path] = {}
+    for _, relative in items:
+        annotation_relative = relative.with_suffix(".txt")
+        collision_key = annotation_relative.as_posix().casefold()
+        previous = annotation_paths.get(collision_key)
+        if previous is not None:
+            raise ValueError(
+                "Image filenames would produce the same annotation path: "
+                f"{previous} and {relative}"
+            )
+        annotation_paths[collision_key] = relative
+    return items
+
+
+def _validate_image_output_layout(input_dir: Path, output_dir: Path, copy_images: bool) -> None:
+    directory_names = ["labels", "annotations"]
+    if copy_images:
+        directory_names.append("images")
+    for name in directory_names:
+        destination = (output_dir / name).resolve()
+        if _is_relative_to(destination, input_dir) or _is_relative_to(input_dir, destination):
+            raise ValueError(
+                f"Image output directory would overwrite or nest inside the input directory: {destination}"
+            )
+
+
 def _resolve_output_dir(raw_path: str) -> Path:
     path = Path(raw_path).expanduser().resolve()
     allowed_roots: list[Path] = SETTINGS.get("output_allowed_roots", [])
@@ -175,7 +236,7 @@ def _resolve_output_dir(raw_path: str) -> Path:
     return path
 
 
-def _ensure_worker(req: LocateAnythingVideoReq, device: str) -> Any:
+def _ensure_worker(req: LocateAnythingInferenceReq, device: str) -> Any:
     dtype_name = req.dtype or str(SETTINGS["default_dtype"])
     key = (device, dtype_name)
     with WORKERS_LOCK:
@@ -210,7 +271,7 @@ def _release_worker(device: str, dtype_name: str) -> None:
                 pass
 
 
-def _run_model(worker: Any, image: Image.Image, req: LocateAnythingVideoReq) -> dict[str, Any]:
+def _run_model(worker: Any, image: Image.Image, req: LocateAnythingInferenceReq) -> dict[str, Any]:
     common = {
         "generation_mode": req.generation_mode,
         "max_new_tokens": req.max_new_tokens,
@@ -234,7 +295,7 @@ def _normalize_label(label: str) -> str:
     return " ".join(label.strip().lower().split())
 
 
-def _normalized_class_map(req: LocateAnythingVideoReq) -> dict[str, int]:
+def _normalized_class_map(req: LocateAnythingInferenceReq) -> dict[str, int]:
     return {
         normalized: int(class_id)
         for label, class_id in req.class_map.items()
@@ -242,7 +303,7 @@ def _normalized_class_map(req: LocateAnythingVideoReq) -> dict[str, int]:
     }
 
 
-def _class_id_for_item(item: dict[str, Any], req: LocateAnythingVideoReq, class_map: dict[str, int]) -> int:
+def _class_id_for_item(item: dict[str, Any], req: LocateAnythingInferenceReq, class_map: dict[str, int]) -> int:
     label = _normalize_label(str(item.get("label", "")))
     if label and label in class_map:
         return class_map[label]
@@ -505,6 +566,178 @@ async def _run_job(job_id: str, req: LocateAnythingVideoReq, video_path: Path) -
     await asyncio.to_thread(_run_job_sync, job_id, req, video_path)
 
 
+def _run_image_job_sync(
+    job_id: str,
+    req: LocateAnythingImageDirectoryReq,
+    input_dir: Path,
+    image_items: list[tuple[Path, Path]],
+) -> None:
+    job = IMAGE_JOBS[job_id]
+    job["message"] = "Waiting for an available GPU"
+    device: Optional[str] = None
+    dtype_name = req.dtype or str(SETTINGS["default_dtype"])
+    worker: Any = None
+    out_dir = Path(SETTINGS["cache_dir"]) / job_id
+    images_dir = out_dir / "images"
+    labels_dir = out_dir / "labels"
+    annotations_dir = out_dir / "annotations"
+    labels_dir.mkdir(parents=True, exist_ok=True)
+    annotations_dir.mkdir(parents=True, exist_ok=True)
+    if req.copy_images:
+        images_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = out_dir / "raw_answers.jsonl"
+    metadata_path = out_dir / "metadata.json"
+    zip_path = out_dir / "locateanything_images.zip"
+    result: Any = None
+    original: Any = None
+    inference_image: Any = None
+    try:
+        device = GPU_DEVICE_POOL.acquire(SETTINGS["devices"], req.device)
+        job["assigned_device"] = device
+        job["status"] = "running"
+        job["message"] = f"Loading LocateAnything model on {device}"
+        worker = _ensure_worker(req, device)
+        torch = _torch()
+        class_map = _normalized_class_map(req)
+        metadata = {
+            "input_dir": str(input_dir),
+            "recursive": req.recursive,
+            "max_images": req.max_images,
+            "copy_images": req.copy_images,
+            "prompt": req.prompt,
+            "categories": req.categories,
+            "class_map": req.class_map,
+            "task": req.task,
+            "question": req.question,
+            "class_id": req.class_id,
+            "score": req.score,
+            "total_images": len(image_items),
+            "image_extensions": sorted(IMAGE_EXTENSIONS),
+        }
+        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        processed = failed = 0
+        started = time.perf_counter()
+        for image_path, relative_path in image_items:
+            txt_relative = relative_path.with_suffix(".txt")
+            xml_relative = relative_path.with_suffix(".xml")
+            txt_path = labels_dir / txt_relative
+            xml_path = annotations_dir / xml_relative
+            width = height = 0
+            try:
+                if req.copy_images:
+                    image_output = images_dir / relative_path
+                    image_output.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(image_path, image_output)
+                with Image.open(image_path) as opened:
+                    original = opened.convert("RGB")
+                width, height = original.size
+                inference_image, resize_ratio = _resize_for_inference(
+                    original, req.resize_long_edge, req.resize_scale
+                )
+                result = _run_model(worker, inference_image, req)
+                if device.startswith("cuda") and torch.cuda.is_available():
+                    torch.cuda.synchronize(device)
+                answer = str(result.get("answer", ""))
+                lines, boxes = [], []
+                for item in _extract_items(answer, width, height):
+                    box = [float(value) for value in item["bbox_xyxy"]]
+                    mapped_class_id = _class_id_for_item(item, req, class_map)
+                    line = _box_to_yolo_line(box, width, height, mapped_class_id, req.score)
+                    if line is not None:
+                        lines.append(line)
+                        boxes.append({
+                            "label": item.get("label") or req.prompt or "object",
+                            "class_id": mapped_class_id,
+                            "bbox_xyxy": box,
+                        })
+                _write_text_atomic(txt_path, "\n".join(lines) + ("\n" if lines else ""))
+                _write_voc_xml(xml_path, relative_path.as_posix(), width, height, boxes)
+                with open(raw_path, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({
+                        "image": relative_path.as_posix(),
+                        "txt": txt_relative.as_posix(),
+                        "xml": xml_relative.as_posix(),
+                        "answer": answer,
+                        "num_boxes": len(lines),
+                        "boxes": boxes,
+                        "image_size": [width, height],
+                        "inference_image_size": [inference_image.width, inference_image.height],
+                        "inference_resize_ratio": resize_ratio,
+                    }, ensure_ascii=False) + "\n")
+                processed += 1
+            except Exception as exc:
+                failed += 1
+                _write_text_atomic(txt_path, "")
+                _write_voc_xml(xml_path, relative_path.as_posix(), width, height, [])
+                with open(raw_path, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({
+                        "image": relative_path.as_posix(),
+                        "txt": txt_relative.as_posix(),
+                        "xml": xml_relative.as_posix(),
+                        "error": str(exc),
+                    }, ensure_ascii=False) + "\n")
+                if device.startswith("cuda") and torch.cuda.is_available():
+                    with torch.cuda.device(device):
+                        torch.cuda.empty_cache()
+            completed = processed + failed
+            elapsed = max(0.001, time.perf_counter() - started)
+            job.update({
+                "message": f"Processed {completed}/{len(image_items)} images ({completed / elapsed:.3f} images/s)",
+                "current_image": relative_path.as_posix(),
+                "processed_images": processed,
+                "failed_images": failed,
+            })
+
+        _write_zip(out_dir, zip_path)
+        direct_output_dir = None
+        if req.output_dir:
+            direct_output_dir = _resolve_output_dir(req.output_dir)
+            sources = [labels_dir, annotations_dir, raw_path, metadata_path, zip_path]
+            if req.copy_images:
+                sources.insert(0, images_dir)
+            for source in sources:
+                destination = direct_output_dir / source.name
+                if source.is_dir():
+                    if destination.exists():
+                        shutil.rmtree(destination)
+                    shutil.copytree(source, destination)
+                elif source.exists():
+                    shutil.copy2(source, destination)
+        job.update({
+            "status": "done",
+            "message": f"Done: processed {processed} images, failed {failed}",
+            "processed_images": processed,
+            "failed_images": failed,
+            "result_zip_path": str(zip_path),
+            "images_dir": str(images_dir) if req.copy_images else "",
+            "labels_dir": str(labels_dir),
+            "annotations_dir": str(annotations_dir),
+            "metadata_path": str(metadata_path),
+            "direct_output_dir": str(direct_output_dir) if direct_output_dir else "",
+        })
+    except Exception as exc:
+        job["status"] = "failed"
+        job["message"] = str(exc)
+    finally:
+        worker = None
+        result = original = inference_image = None
+        gc.collect()
+        if device is not None:
+            if not SETTINGS.get("keep_model_loaded", False):
+                _release_worker(device, dtype_name)
+            GPU_DEVICE_POOL.release(device)
+
+
+async def _run_image_job(
+    job_id: str,
+    req: LocateAnythingImageDirectoryReq,
+    input_dir: Path,
+    image_items: list[tuple[Path, Path]],
+) -> None:
+    await asyncio.to_thread(_run_image_job_sync, job_id, req, input_dir, image_items)
+
+
 def health_payload() -> dict[str, Any]:
     root_text = str(SETTINGS.get("external_root", "")).strip()
     worker_path = Path(root_text).expanduser() / "locateanything_worker.py" if root_text else None
@@ -524,6 +757,7 @@ def health_payload() -> dict[str, Any]:
         "keep_model_loaded": bool(SETTINGS.get("keep_model_loaded", False)),
         "scheduler": "per-device-v1",
         "parallel_jobs": True,
+        "image_directory_jobs": True,
         "model_loaded": bool(WORKERS),
         "loaded_workers": [{"device": device, "dtype": dtype} for device, dtype in sorted(WORKERS)],
         "cuda_available": cuda_available,
@@ -551,6 +785,65 @@ async def list_videos(path: str = Query(...), recursive: bool = False) -> dict[s
     if not videos:
         raise HTTPException(400, f"No videos found in: {source}")
     return {"ok": True, "input_path": str(source), "videos": [str(video) for video in videos]}
+
+
+@router.post("/image-jobs")
+async def create_image_job(req: LocateAnythingImageDirectoryReq) -> dict[str, Any]:
+    if not req.prompt.strip() and not req.question.strip() and not req.categories:
+        raise HTTPException(400, "prompt, categories, or question is required")
+    input_dir = _resolve_image_directory(req.input_dir)
+    try:
+        image_items = _list_image_files(input_dir, req.recursive, req.max_images)
+        GPU_DEVICE_POOL.validate(SETTINGS["devices"], req.device)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if req.output_dir:
+        output_dir = _resolve_output_dir(req.output_dir)
+        try:
+            _validate_image_output_layout(input_dir, output_dir, req.copy_images)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        req.output_dir = str(output_dir)
+    job_id = uuid.uuid4().hex
+    IMAGE_JOBS[job_id] = {
+        "id": job_id,
+        "job_type": "image_directory",
+        "status": "queued",
+        "message": "Queued",
+        "input_dir": str(input_dir),
+        "total_images": len(image_items),
+        "prompt": req.prompt,
+        "categories": req.categories,
+    }
+    asyncio.create_task(_run_image_job(job_id, req, input_dir, image_items))
+    return {"ok": True, "job_id": job_id, "status": "queued", "total_images": len(image_items)}
+
+
+@router.get("/image-jobs/{job_id}")
+async def get_image_job(job_id: str) -> dict[str, Any]:
+    job = IMAGE_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Image job not found")
+    public = dict(job)
+    public.pop("result_zip_path", None)
+    return public
+
+
+@router.get("/image-jobs/{job_id}/annotations-zip")
+async def get_image_annotations_zip(job_id: str) -> FileResponse:
+    job = IMAGE_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Image job not found")
+    if job.get("status") != "done":
+        raise HTTPException(400, f"Job is not done: {job.get('status')}")
+    zip_path = Path(job["result_zip_path"])
+    if not zip_path.exists():
+        raise HTTPException(404, "Result zip not found")
+    return FileResponse(
+        str(zip_path),
+        media_type="application/zip",
+        filename="locateanything_images.zip",
+    )
 
 
 @router.post("/jobs")

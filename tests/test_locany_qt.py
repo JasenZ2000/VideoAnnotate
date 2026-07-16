@@ -28,3 +28,15 @@ class LocateAnythingQtTests(TestCase):
         self.assertEqual(results, [{"ok": True}])
         self.assertIsNone(window.worker)
         window.close()
+
+    def test_image_mode_hides_video_only_controls(self) -> None:
+        window = MainWindow()
+        window.task_kind.setCurrentIndex(window.task_kind.findData("images"))
+        self.app.processEvents()
+        self.assertTrue(window.file_button.isHidden())
+        self.assertTrue(window.frame_step.isHidden())
+        self.assertTrue(window.postprocess_group.isHidden())
+        self.assertIn("图片目录", window.paths_group.title())
+        self.assertIn("一张 GPU", window.task_kind_note.text())
+        self.assertIn("图片目录", window.run_button.text())
+        window.close()

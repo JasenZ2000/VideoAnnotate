@@ -5,9 +5,12 @@
 只启动一个 HTTP 进程：`gpu_services.server`，默认监听 `9010`。它通过两个命名空间暴露能力：
 
 - `/api/sam31/...`：目标框提示的视频跟踪；
-- `/api/locateanything/...`：视频逐帧预标注，同时导出 YOLO TXT 与 Pascal VOC XML。
+- `/api/locateanything/jobs...`：视频逐帧预标注；
+- `/api/locateanything/image-jobs...`：服务器图片目录批量预标注。
 
 LocateAnything 结果 ZIP 中，YOLO 标注位于 `labels/`，Pascal VOC 标注位于 `annotations/`。两个目录按相同的视频名前缀和帧号逐帧对应。
+
+图片目录任务支持 JPG、JPEG、PNG、BMP、WebP 和 TIFF。结果保持输入目录的相对子目录结构，标注分别写入 `labels/` 与 `annotations/`；默认不重复复制原图，设置 `copy_images=true` 时才会复制到 `images/`。图片输入目录必须位于 `LOCANY_ALLOWED_ROOTS` 内，直接输出目录必须位于 `LOCANY_OUTPUT_ALLOWED_ROOTS` 内。服务会拒绝任何可能覆盖或嵌套进输入目录的输出布局。
 
 HTTP 服务不要求把两套模型运行时合并到一个 Python 环境。它运行在能加载 LocateAnything 的环境中；SAM3.1 作业由 `SAM31_PYTHON` 指向原有的 ComfyUI 环境后，以子进程方式运行。
 
@@ -67,6 +70,30 @@ SAM3.1 每个任务使用独立子进程，子进程结束时由操作系统释�
 curl http://127.0.0.1:9010/api/health
 curl http://127.0.0.1:9010/api/sam31/health
 curl http://127.0.0.1:9010/api/locateanything/health
+```
+
+提交一个图片目录任务：
+
+```bash
+curl -X POST http://127.0.0.1:9010/api/locateanything/image-jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "input_dir": "/data/images/task01",
+    "recursive": true,
+    "prompt": "person",
+    "categories": ["person"],
+    "class_map": {"person": 0},
+    "task": "ground_multi",
+    "copy_images": true,
+    "device": "cuda:0"
+  }'
+```
+
+轮询返回的 `job_id`：
+
+```bash
+curl http://127.0.0.1:9010/api/locateanything/image-jobs/JOB_ID
+curl -OJ http://127.0.0.1:9010/api/locateanything/image-jobs/JOB_ID/annotations-zip
 ```
 
 根健康检查会同时报告两个运行时的配置。LocateAnything 健康结果中的 `worker_available` 应为 `true`；它为 `false` 时，优先检查 `LOCATEANYTHING_ROOT` 是否指向包含 `locateanything_worker.py` 的目录。

@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from locany_batch_tool.server import (
-    JOBS, BatchReq, ConnectionReq, _check_direct_capabilities, _connect_sftp,
+    JOBS, BatchReq, ConnectionReq, _check_direct_capabilities, _check_task_api, _connect_sftp,
     _job_snapshot, _json_request, _run_batch, parse_cuda_devices,
 )
 from locany_batch_tool.postprocess import organize_prelabels
@@ -53,6 +53,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._load_settings()
         self._mode_changed()
+        self._task_kind_changed()
 
     def _build_ui(self) -> None:
         scroll = QScrollArea()
@@ -92,15 +93,26 @@ class MainWindow(QMainWindow):
         root.addWidget(connection)
 
         paths = QGroupBox("2. 视频与结果位置")
+        self.paths_group = paths
         form = QGridLayout(paths)
+        self.task_kind = QComboBox()
+        self.task_kind.addItem("视频预标注（单个视频或视频目录）", "video")
+        self.task_kind.addItem("图片目录预标注（一个图片目录）", "images")
+        self._last_task_kind = "video"
+        self.task_kind_note = QLabel()
+        self.task_kind_note.setWordWrap(True)
+        self.task_kind_note.setStyleSheet("color:#667085")
+        form.addWidget(QLabel("推理对象"),0,0);form.addWidget(self.task_kind,0,1,1,3)
+        form.addWidget(self.task_kind_note,1,1,1,3)
         self.input_path=QLineEdit(); self.input_path.setPlaceholderText("选择一个视频，或包含多个视频的目录")
         self.file_button=QPushButton("选择视频…"); self.file_button.clicked.connect(self._choose_video)
         self.input_dir_button=QPushButton("选择目录…"); self.input_dir_button.clicked.connect(self._choose_input_dir)
         self.output_label=QLabel("本地结果目录");self.output_path=QLineEdit();self.output_button=QPushButton("选择目录…");self.output_button.clicked.connect(self._choose_output_dir)
-        form.addWidget(QLabel("输入"),0,0);form.addWidget(self.input_path,0,1);form.addWidget(self.file_button,0,2);form.addWidget(self.input_dir_button,0,3)
-        form.addWidget(self.output_label,1,0);form.addWidget(self.output_path,1,1,1,2);form.addWidget(self.output_button,1,3)
+        self.input_label = QLabel("输入")
+        form.addWidget(self.input_label,2,0);form.addWidget(self.input_path,2,1);form.addWidget(self.file_button,2,2);form.addWidget(self.input_dir_button,2,3)
+        form.addWidget(self.output_label,3,0);form.addWidget(self.output_path,3,1,1,2);form.addWidget(self.output_button,3,3)
         self.recursive=QCheckBox("递归查找子目录");self.reuse=QCheckBox("复用远端已有的同一视频");self.reuse.setChecked(True)
-        form.addWidget(self.recursive,2,1);form.addWidget(self.reuse,2,2,1,2)
+        form.addWidget(self.recursive,4,1);form.addWidget(self.reuse,4,2,1,2)
         root.addWidget(paths)
 
         inference = QGroupBox("3. 推理与类别")
@@ -111,8 +123,10 @@ class MainWindow(QMainWindow):
         self.max_frames=QSpinBox();self.max_frames.setRange(0,100000000);self.max_frames.setSpecialValueText("全部")
         self.classes=QPlainTextEdit("0 person");self.classes.setMaximumHeight(100);self.classes.setPlaceholderText("每行填写：编号 类别名\n例如：0 person")
         grid2.addWidget(QLabel("Prompt"),0,0);grid2.addWidget(self.prompt,0,1);grid2.addWidget(QLabel("任务类型"),0,2);grid2.addWidget(self.task,0,3)
-        grid2.addWidget(QLabel("精度"),1,0);grid2.addWidget(self.dtype,1,1);grid2.addWidget(QLabel("帧间隔"),1,2);grid2.addWidget(self.frame_step,1,3)
-        grid2.addWidget(QLabel("最多处理帧数"),2,0);grid2.addWidget(self.max_frames,2,1)
+        self.frame_step_label = QLabel("帧间隔")
+        self.max_items_label = QLabel("最多处理帧数")
+        grid2.addWidget(QLabel("精度"),1,0);grid2.addWidget(self.dtype,1,1);grid2.addWidget(self.frame_step_label,1,2);grid2.addWidget(self.frame_step,1,3)
+        grid2.addWidget(self.max_items_label,2,0);grid2.addWidget(self.max_frames,2,1)
         grid2.addWidget(QLabel("类别映射"),3,0);grid2.addWidget(self.classes,3,1,1,3)
         root.addWidget(inference)
 
@@ -123,6 +137,7 @@ class MainWindow(QMainWindow):
         progress_layout.addWidget(self.progress);progress_layout.addWidget(self.status);progress_layout.addWidget(self.log);root.addWidget(progress_box)
 
         postprocess = QGroupBox("Windows 本地预标注目录后处理（可选）")
+        self.postprocess_group = postprocess
         post_layout = QGridLayout(postprocess)
         help_text = QLabel(
             "按视频名匹配预标注子目录，将视频复制进去，并把其中的 labels 目录改成视频同名目录。"
@@ -145,6 +160,7 @@ class MainWindow(QMainWindow):
         root.addStretch()
         scroll.setWidget(body);self.setCentralWidget(scroll)
         self.mode.currentIndexChanged.connect(self._mode_changed)
+        self.task_kind.currentIndexChanged.connect(self._task_kind_changed)
         self.setStyleSheet("QGroupBox{font-weight:600;border:1px solid #d0d5dd;border-radius:8px;margin-top:10px;padding:14px 10px 10px}QGroupBox::title{subcontrol-origin:margin;left:12px;padding:0 5px}QLineEdit,QComboBox,QSpinBox,QPlainTextEdit{padding:6px;border:1px solid #b8c0cc;border-radius:5px}QPushButton{padding:7px 14px}QProgressBar{height:20px;text-align:center}")
 
     def _choose_video(self) -> None:
@@ -169,16 +185,46 @@ class MainWindow(QMainWindow):
     def _mode_changed(self) -> None:
         sftp=self.mode.currentData()=="sftp";self.sftp_frame.setVisible(sftp);self.reuse.setVisible(sftp)
         self.output_label.setText("本地标注 ZIP 目录" if sftp else "GPU 服务器输出目录")
-        self.file_button.setVisible(sftp);self.input_dir_button.setVisible(sftp);self.output_button.setVisible(sftp)
+        is_video=self.task_kind.currentData()=="video"
+        self.file_button.setVisible(sftp and is_video);self.input_dir_button.setVisible(sftp);self.output_button.setVisible(sftp)
         if sftp:
-            self.input_path.setPlaceholderText("选择本机视频，或包含多个视频的本机目录")
-            self.output_path.setPlaceholderText("选择下载 YOLO ZIP 的本机目录")
+            self.input_path.setPlaceholderText("选择本机视频，或包含多个视频的本机目录" if is_video else "选择一个本机图片目录（不接受单张图片）")
+            self.output_path.setPlaceholderText("选择下载标注 ZIP 的本机目录")
         else:
-            self.input_path.setPlaceholderText("GPU 服务器上的 Linux 路径，例如 /data2/videos")
+            self.input_path.setPlaceholderText("GPU 服务器上的 Linux 视频路径，例如 /data2/videos" if is_video else "GPU 服务器上的 Linux 图片目录，例如 /data2/images")
             self.output_path.setPlaceholderText("GPU 服务器上的 Linux 输出路径，例如 /data2/labels")
 
+    def _task_kind_changed(self) -> None:
+        kind=str(self.task_kind.currentData() or "video")
+        previous=getattr(self,"_last_task_kind",kind)
+        if previous != kind:
+            self.settings.setValue(f"{previous}_input_path",self.input_path.text())
+            self.settings.setValue(f"{previous}_output_path",self.output_path.text())
+            self.input_path.setText(str(self.settings.value(f"{kind}_input_path", "")))
+            self.output_path.setText(str(self.settings.value(f"{kind}_output_path", "")))
+        self._last_task_kind=kind
+        is_video=kind=="video"
+        self.paths_group.setTitle("2. 视频与结果位置" if is_video else "2. 图片目录与结果位置")
+        self.input_label.setText("视频或视频目录" if is_video else "图片目录")
+        self.task_kind_note.setText(
+            "视频模式：目录中的每个视频是独立任务，可用多张 GPU 并行处理。"
+            if is_video else
+            "图片模式：整个图片目录是一个任务，只使用一张 GPU；输出仍包含 labels 与 annotations。"
+        )
+        self.recursive.setText("递归查找子目录中的视频" if is_video else "递归查找子目录中的图片")
+        self.reuse.setText("复用远端已有的同一视频" if is_video else "复用远端已上传的同名图片")
+        self.frame_step_label.setVisible(is_video);self.frame_step.setVisible(is_video)
+        self.max_items_label.setText("最多处理帧数" if is_video else "最多处理图片数")
+        self.postprocess_group.setVisible(is_video)
+        self.run_button.setText("开始批量视频预标注" if is_video else "开始图片目录预标注")
+        self.cuda.setToolTip(
+            "逗号分隔多张 GPU；每张卡同时运行一个视频任务。"
+            if is_video else "图片目录任务目前请选择一张 GPU，例如 0。"
+        )
+        self._mode_changed()
+
     def _connection(self) -> ConnectionReq:
-        return ConnectionReq(server_url=self.server_url.text().strip(),mode=str(self.mode.currentData()),sftp_host=self.sftp_host.text().strip(),sftp_port=self.sftp_port.value(),sftp_username=self.sftp_user.text().strip(),sftp_password=self.sftp_password.text(),sftp_key_path=self.sftp_key.text().strip(),sftp_remote_dir=self.remote_dir.text().strip())
+        return ConnectionReq(server_url=self.server_url.text().strip(),mode=str(self.mode.currentData()),sftp_host=self.sftp_host.text().strip(),sftp_port=self.sftp_port.value(),sftp_username=self.sftp_user.text().strip(),sftp_password=self.sftp_password.text(),sftp_key_path=self.sftp_key.text().strip(),sftp_remote_dir=self.remote_dir.text().strip(),task_kind=str(self.task_kind.currentData()))
 
     def _mapping(self) -> tuple[list[str],dict[str,int]]:
         categories=[];mapping={}
@@ -193,9 +239,13 @@ class MainWindow(QMainWindow):
 
     def _batch_request(self) -> BatchReq:
         categories,mapping=self._mapping();connection=self._connection()
-        if not self.input_path.text().strip():raise ValueError("请选择视频或视频目录")
+        kind=str(self.task_kind.currentData())
+        if not self.input_path.text().strip():raise ValueError("请选择视频或视频目录" if kind=="video" else "请选择图片目录")
         if not self.output_path.text().strip():raise ValueError("请选择或填写输出目录")
-        return BatchReq(**connection.model_dump(),input_path=self.input_path.text().strip(),output_path=self.output_path.text().strip(),cuda_devices=parse_cuda_devices(self.cuda.text()),dtype=self.dtype.currentText(),prompt=self.prompt.text().strip() or "person",categories=categories,class_map=mapping,task=self.task.currentText(),recursive=self.recursive.isChecked(),reuse_uploads=self.reuse.isChecked(),frame_step=self.frame_step.value(),max_frames=self.max_frames.value())
+        devices=parse_cuda_devices(self.cuda.text())
+        if kind=="images" and len(devices)!=1:raise ValueError("图片目录预标注目前只能选择一张 GPU，例如 0")
+        if kind=="images" and connection.mode=="sftp" and not Path(self.input_path.text().strip()).is_dir():raise ValueError("图片模式的本地输入必须是一个目录，不能选择单张图片")
+        return BatchReq(**connection.model_dump(),input_path=self.input_path.text().strip(),output_path=self.output_path.text().strip(),cuda_devices=devices,dtype=self.dtype.currentText(),prompt=self.prompt.text().strip() or "person",categories=categories,class_map=mapping,task=self.task.currentText(),recursive=self.recursive.isChecked(),reuse_uploads=self.reuse.isChecked(),frame_step=self.frame_step.value(),max_frames=self.max_frames.value(),max_images=self.max_frames.value())
 
     def _launch(self, worker: TaskWorker, on_success: Callable[[dict],None]) -> None:
         if self.thread is not None and self.thread.isRunning():
@@ -211,6 +261,7 @@ class MainWindow(QMainWindow):
             gpu=_json_request("GET",f"{req.server_url.rstrip('/')}/api/locateanything/health")
             result={"gpu":gpu}
             if req.mode=="sftp":
+                _check_task_api(req.server_url,req.task_kind)
                 client=_connect_sftp(req)
                 try:
                     sftp=client.open_sftp()
@@ -218,7 +269,7 @@ class MainWindow(QMainWindow):
                     finally:sftp.close()
                 finally:client.close()
             else:
-                _check_direct_capabilities(req.server_url,gpu);result["direct"]={"ok":True}
+                _check_direct_capabilities(req.server_url,gpu,req.task_kind);result["direct"]={"ok":True}
             return result
         self._launch(TaskWorker(action),self._connection_ok)
 
@@ -264,22 +315,29 @@ class MainWindow(QMainWindow):
     def _show_progress(self,job:dict) -> None:
         total=int(job.get("total",0));done=int(job.get("completed",0));self.progress.setRange(0,max(1,total));self.progress.setValue(done);self.status.setText(str(job.get("message","")))
         lines=[]
-        for item in job.get("items",[]):lines.append(f"[{item.get('status','')}] {str(item.get('video','')).replace(chr(92),'/').rsplit('/',1)[-1]} · {item.get('assigned_device') or item.get('requested_device','等待分配')}\n  {item.get('message','')}{chr(10)+'  → '+item['output'] if item.get('output') else ''}")
+        for item in job.get("items",[]):
+            source=item.get("video") or item.get("input") or ""
+            lines.append(f"[{item.get('status','')}] {str(source).replace(chr(92),'/').rsplit('/',1)[-1]} · {item.get('assigned_device') or item.get('requested_device','等待分配')}\n  {item.get('message','')}{chr(10)+'  → '+item['output'] if item.get('output') else ''}")
         self.log.setPlainText("\n".join(lines))
 
     def _connection_ok(self,result:dict) -> None:
         gpu=result["gpu"];extra="，SFTP 正常" if "sftp" in result else "，直连接口与输出目录正常";devices=",".join(gpu.get("devices",[])) or str(gpu.get("device","未知"));self.test_result.setText(f"连接成功：{devices}/{gpu.get('dtype')}{extra}");self.test_result.setStyleSheet("color:#16803c")
     def _batch_ok(self,result:dict) -> None:
-        self._show_progress(result);QMessageBox.information(self,"任务完成",f"已完成 {result.get('completed',0)} 个视频。")
+        kind=str(self.task_kind.currentData());unit="个视频" if kind=="video" else "个图片目录任务"
+        self._show_progress(result);QMessageBox.information(self,"任务完成",f"已完成 {result.get('completed',0)} {unit}。")
     def _failed(self,message:str) -> None:
         self.status.setText(message);self.test_result.setText("失败："+message);self.test_result.setStyleSheet("color:#b42318");QMessageBox.critical(self,"操作失败",message)
     def _thread_done(self) -> None:
         self.test_button.setEnabled(True);self.run_button.setEnabled(True);self.post_preview_button.setEnabled(True);self.post_run_button.setEnabled(True);self.worker=None;self.thread=None
 
     def _save_settings(self) -> None:
-        values={"server_url":self.server_url.text(),"mode":self.mode.currentData(),"cuda_devices":self.cuda.text(),"sftp_host":self.sftp_host.text(),"sftp_port":self.sftp_port.value(),"sftp_user":self.sftp_user.text(),"sftp_key":self.sftp_key.text(),"remote_dir":self.remote_dir.text(),"input_path":self.input_path.text(),"output_path":self.output_path.text(),"prompt":self.prompt.text(),"classes":self.classes.toPlainText(),"task":self.task.currentText(),"dtype":self.dtype.currentText(),"frame_step":self.frame_step.value(),"max_frames":self.max_frames.value(),"recursive":self.recursive.isChecked(),"reuse":self.reuse.isChecked(),"post_video_dir":self.post_video_dir.text(),"post_prelabel_dir":self.post_prelabel_dir.text()}
+        kind=str(self.task_kind.currentData())
+        values={"server_url":self.server_url.text(),"mode":self.mode.currentData(),"task_kind":kind,"cuda_devices":self.cuda.text(),"sftp_host":self.sftp_host.text(),"sftp_port":self.sftp_port.value(),"sftp_user":self.sftp_user.text(),"sftp_key":self.sftp_key.text(),"remote_dir":self.remote_dir.text(),"input_path":self.input_path.text(),"output_path":self.output_path.text(),f"{kind}_input_path":self.input_path.text(),f"{kind}_output_path":self.output_path.text(),"prompt":self.prompt.text(),"classes":self.classes.toPlainText(),"task":self.task.currentText(),"dtype":self.dtype.currentText(),"frame_step":self.frame_step.value(),"max_frames":self.max_frames.value(),"recursive":self.recursive.isChecked(),"reuse":self.reuse.isChecked(),"post_video_dir":self.post_video_dir.text(),"post_prelabel_dir":self.post_prelabel_dir.text()}
         for key,value in values.items():self.settings.setValue(key,value)
     def _load_settings(self) -> None:
+        task_kind=self.settings.value("task_kind","video")
+        task_kind_index=self.task_kind.findData(task_kind)
+        if task_kind_index>=0:self.task_kind.setCurrentIndex(task_kind_index)
         text_fields={"server_url":self.server_url,"cuda_devices":self.cuda,"sftp_host":self.sftp_host,"sftp_user":self.sftp_user,"sftp_key":self.sftp_key,"remote_dir":self.remote_dir,"input_path":self.input_path,"output_path":self.output_path,"prompt":self.prompt,"post_video_dir":self.post_video_dir,"post_prelabel_dir":self.post_prelabel_dir}
         for key,widget in text_fields.items():
             value=self.settings.value(key)
@@ -296,6 +354,12 @@ class MainWindow(QMainWindow):
                 index=widget.findData(value) if key=="mode" else widget.findText(str(value))
                 if index>=0:widget.setCurrentIndex(index)
         self.recursive.setChecked(self.settings.value("recursive",False,type=bool));self.reuse.setChecked(self.settings.value("reuse",True,type=bool))
+        kind=str(self.task_kind.currentData())
+        saved_input=self.settings.value(f"{kind}_input_path")
+        saved_output=self.settings.value(f"{kind}_output_path")
+        if saved_input is not None:self.input_path.setText(str(saved_input))
+        if saved_output is not None:self.output_path.setText(str(saved_output))
+        self._last_task_kind=kind
 
 
 def main() -> None:

@@ -125,6 +125,25 @@ class AnnotationState:
             del self.tracks[track_id].frames[k]
         return len(to_remove)
 
+    def split_track_after(self, track_id: int, frame_idx: int) -> Tuple[int, int]:
+        """Move annotations strictly after frame_idx into a new track.
+
+        The new track inherits the source track's class ID. Returns the new
+        track ID and number of moved frames.
+        """
+        if track_id not in self.tracks:
+            raise ValueError("Track not found")
+        source = self.tracks[track_id]
+        frame_ids = sorted(idx for idx in source.frames if idx > frame_idx)
+        if not frame_ids:
+            raise ValueError("No annotations after the selected frame")
+
+        new_track_id = self.add_track(source.class_id)
+        target = self.tracks[new_track_id]
+        for idx in frame_ids:
+            target.frames[idx] = source.frames.pop(idx)
+        return new_track_id, len(frame_ids)
+
     def delete_frames_between(self, track_id: int, frame_a: int, frame_b: int) -> int:
         """Delete all annotations between frame_a and frame_b, inclusive."""
         if track_id not in self.tracks:

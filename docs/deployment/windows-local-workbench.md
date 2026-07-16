@@ -63,4 +63,6 @@ $env:SAM31_SFTP_PASSWORD="<session-password>"
 
 必须人工检查生成的后续轨迹。SAM3.1 只是辅助编辑工具，不能代替人工审核结论。
 
+若一条轨迹在中途错误跟到了另一个目标，请定位到正确目标的最后一帧，点击 **将此后标注分离成新轨迹**。当前帧及此前标注会保留在原轨迹，之后的标注会移动到继承相同类别的新轨迹；界面随后自动切换并跳到新轨迹起点。
+
 若要把独立生成的 `tracking_results.json` 作为新轨迹加入当前工作区，可在标注器点击 **追加标注 JSON**。工作台会自动重编号新增轨迹，避免与现有 `track_id` 冲突，并写回当前工作区的 `tracking_results.json`。LocateAnything 预标注请使用独立的 `LocateAnythingBatchTool.exe`。

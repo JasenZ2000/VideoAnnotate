@@ -583,6 +583,24 @@ async def delete_before(req: DeleteRangeReq):
     return {"ok": True, "deleted": count}
 
 
+@app.post("/api/split-after")
+async def split_after(req: DeleteRangeReq):
+    try:
+        new_track_id, moved = STATE.split_track_after(req.track_id, req.frame_idx)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    new_track = STATE.tracks[new_track_id]
+    return {
+        "ok": True,
+        "source_track_id": req.track_id,
+        "new_track_id": new_track_id,
+        "moved": moved,
+        "start_frame": new_track.start_frame,
+        "end_frame": new_track.end_frame,
+        "class_id": new_track.class_id,
+    }
+
+
 @app.post("/api/delete-between")
 async def delete_between(req: DeleteBetweenReq):
     if req.track_id not in STATE.tracks:
@@ -1122,6 +1140,7 @@ async def run_pipeline_endpoint():
         ann_dir=label_dir,
         out_dir=_workspace,
         config=config,
+        render_videos=False,
     )
 
     # Reload results into annotator
@@ -1228,12 +1247,22 @@ async def render_clips_and_overview():
 
 @app.post("/api/save")
 async def save_project():
-    """Save annotation project to workspace."""
+    """Save both the editable project and the canonical results loaded on reopen."""
     if _workspace is None:
         raise HTTPException(400, "No workspace open")
-    path = str(_workspace / "annotation_project.json")
-    STATE.save_project(path)
-    return {"ok": True, "path": path}
+    project_path = _workspace / "annotation_project.json"
+    results_path = _workspace / "tracking_results.json"
+    STATE.save_project(str(project_path))
+    payload = STATE.export_tracking_results()
+    results_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    anomaly_path = _write_area_anomaly_json(_workspace)
+    return {
+        "ok": True,
+        "path": str(project_path),
+        "results_path": str(results_path),
+        "area_anomaly_path": str(anomaly_path),
+        "num_tracks": payload["metadata"]["num_tracks"],
+    }
 
 
 @app.post("/api/load")
@@ -1642,6 +1671,7 @@ async def run_pipeline_all_segments():
                 ann_dir=label_dir,
                 out_dir=seg_dir,
                 config=config,
+                render_videos=False,
             )
             # Count tracks from output
             results_json = seg_dir / "tracking_results.json"

@@ -1,6 +1,8 @@
 # LocateAnything 批量预标注工具
 
-该工具独立于 workflow platform，是一个 PySide6 Qt 桌面程序，专门完成视频批量预标注。
+该工具独立于 workflow platform，是一个 PySide6 Qt 桌面程序，可完成视频批量预标注或图片目录预标注。
+
+界面顶部的“推理对象”用于明确选择任务类型。视频与图片模式分别保存自己的输入、输出路径；切换到图片模式后，选择单个视频、帧间隔和视频目录后处理等控件会隐藏，避免两类任务混用。
 
 ## 启动
 
@@ -25,6 +27,8 @@ pip install -r requirements\locany-tool-windows.txt
 
 密码只随当前页面请求发送，不会写入浏览器存储。也可在项目根目录的 `.env.local` 中设置 `LOCANY_SFTP_PASSWORD`；该文件已被 Git 忽略。
 
+图片模式只接受一个本地图片目录。工具保持相对子目录结构上传支持的图片，并把整个目录作为一个 GPU 任务提交；完成后下载 `<图片目录名>_images.zip`，其中 YOLO TXT 位于 `labels/`，Pascal VOC XML 位于 `annotations/`。
+
 ## 直连模式
 
 直连模式表示视频与输出目录已经位于 GPU 服务器，不要求运行 Qt 工具的电脑挂载或访问这些文件。输入路径和输出路径均原样作为 Linux 路径发送给 GPU Services；目录枚举、视频读取和结果写入全部在服务器端完成，不执行 SFTP 或结果下载。
@@ -45,6 +49,8 @@ export LOCANY_OUTPUT_ALLOWED_ROOTS=/data/labels
 
 服务端会拒绝允许根目录之外的视频和输出位置。每个视频的 `labels/`、`annotations/`、元数据、原始回答和 ZIP 会写入输出目录下以视频名命名的子目录。
 
+图片模式下，输入必须是 GPU 服务器上的 Linux 图片目录，输出是该次目录任务的服务器端结果目录；路径不会在 Windows 本地解析或添加盘符。图片模式通过独立的 `/api/locateanything/image-jobs` 接口提交，连接测试也会提前确认该接口是否存在。
+
 ## 多 GPU 并行
 
 “CUDA 设备号”支持使用逗号填写多张卡，例如：
@@ -54,6 +60,8 @@ export LOCANY_OUTPUT_ALLOWED_ROOTS=/data/labels
 ```
 
 工具为每张卡启动一个任务线程，同时处理多个视频；某张卡完成一个视频后会继续领取下一个等待中的视频。单个视频仍只使用一张 GPU。GPU Services 端必须在 `LOCANY_DEVICES` 中启用相同设备，例如 `LOCANY_DEVICES=cuda:0,cuda:1,cuda:3`。
+
+图片目录当前作为一个整体任务执行，因此图片模式只能填写一张 GPU；界面会在提交前阻止多 GPU 配置。视频模式的多 GPU 并行行为不受影响。
 
 SFTP 模式下上传与推理任务也会并行；直连模式不涉及上传。进度列表会显示每个视频请求和实际分配的 CUDA 设备。只填写一个编号时行为与旧版本一致。
 

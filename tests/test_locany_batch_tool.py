@@ -11,6 +11,7 @@ from locany_batch_tool.server import (
     JOBS,
     BatchReq,
     _check_direct_capabilities,
+    _images,
     _selected_cuda_devices,
     parse_cuda_devices,
     _remote_videos,
@@ -49,6 +50,19 @@ class LocateAnythingBatchToolTests(TestCase):
             self.assertEqual([path.name for path in _videos(str(root), False)], ["a.mp4"])
             self.assertEqual([path.name for path in _videos(str(root), True)], ["a.mp4", "c.mov"])
 
+    def test_image_discovery_requires_directory_and_preserves_recursive_choice(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a.jpg").touch()
+            (root / "ignored.txt").touch()
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "b.PNG").touch()
+            self.assertEqual([path.name for path in _images(str(root), False)], ["a.jpg"])
+            self.assertEqual([path.name for path in _images(str(root), True)], ["a.jpg", "b.PNG"])
+            with self.assertRaisesRegex(RuntimeError, "must be a directory"):
+                _images(str(root / "a.jpg"), False)
+
     def test_direct_mode_keeps_gpu_server_posix_paths_unchanged(self) -> None:
         remote_path = "/data2/DET_Group/ZZS/data/embedded_cosmos/videos/sample.mp4"
         with patch("locany_batch_tool.server._json_request", return_value={"videos": [remote_path]}) as request:
@@ -63,14 +77,62 @@ class LocateAnythingBatchToolTests(TestCase):
 
     def test_direct_connection_rejects_old_gpu_service(self) -> None:
         with patch("locany_batch_tool.server._json_request", return_value={"paths": {}}):
-            with self.assertRaisesRegex(RuntimeError, "版本过旧"):
+            with self.assertRaisesRegex(RuntimeError, "too old"):
                 _check_direct_capabilities("http://gpu-server:10114", {})
 
     def test_direct_connection_requires_output_allowed_roots(self) -> None:
-        openapi = {"paths": {"/api/locateanything/videos": {}}}
+        openapi = {"paths": {"/api/locateanything/jobs": {}, "/api/locateanything/videos": {}}}
         with patch("locany_batch_tool.server._json_request", return_value=openapi):
             with self.assertRaisesRegex(RuntimeError, "LOCANY_OUTPUT_ALLOWED_ROOTS"):
                 _check_direct_capabilities("http://gpu-server:10114", {})
+
+    def test_direct_image_mode_requires_image_job_api(self) -> None:
+        openapi = {"paths": {"/api/locateanything/jobs": {}, "/api/locateanything/videos": {}}}
+        with patch("locany_batch_tool.server._json_request", return_value=openapi):
+            with self.assertRaisesRegex(RuntimeError, "image-jobs"):
+                _check_direct_capabilities("http://gpu-server:10114", {"output_allowed_roots": ["/data2"]}, "images")
+
+    def test_direct_image_directory_batch_uses_separate_api(self) -> None:
+        request = BatchReq(
+            server_url="http://gpu-server:10114", mode="direct", task_kind="images",
+            input_path="/data2/images", output_path="/data2/output",
+            cuda_devices=[1], recursive=True, max_images=25,
+        )
+        job_id = "direct-image-test"
+        JOBS[job_id] = {"id": job_id, "status": "queued", "message": "Queued"}
+        calls = []
+
+        def fake_request(method, url, payload=None, timeout=30):
+            calls.append((method, url, payload))
+            if url.endswith("/api/locateanything/health"):
+                return {"devices": ["cuda:0", "cuda:1"], "output_allowed_roots": ["/data2"]}
+            if url.endswith("/openapi.json"):
+                return {"paths": {"/api/locateanything/image-jobs": {}}}
+            if method == "POST":
+                self.assertEqual(payload["input_dir"], "/data2/images")
+                self.assertEqual(payload["output_dir"], "/data2/output")
+                self.assertEqual(payload["device"], "cuda:1")
+                self.assertEqual(payload["max_images"], 25)
+                return {"job_id": "image-job"}
+            return {"status": "done", "message": "Done", "direct_output_dir": "/data2/output"}
+
+        with patch("locany_batch_tool.server._json_request", side_effect=fake_request):
+            _run_batch(job_id, request)
+
+        self.assertEqual(JOBS[job_id]["status"], "done")
+        self.assertEqual(JOBS[job_id]["items"][0]["output"], "/data2/output")
+        self.assertTrue(any(url.endswith("/api/locateanything/image-jobs") for _, url, _ in calls))
+
+    def test_image_directory_batch_rejects_multiple_gpus(self) -> None:
+        request = BatchReq(
+            server_url="http://gpu-server:10114", mode="direct", task_kind="images",
+            input_path="/data2/images", output_path="/data2/output", cuda_devices=[0, 1],
+        )
+        job_id = "image-multi-gpu-test"
+        JOBS[job_id] = {"id": job_id, "status": "queued", "message": "Queued"}
+        _run_batch(job_id, request)
+        self.assertEqual(JOBS[job_id]["status"], "failed")
+        self.assertIn("exactly one CUDA device", JOBS[job_id]["message"])
 
     def test_direct_batch_accepts_remote_video_strings(self) -> None:
         remote_video = "/data2/videos/sample.mp4"

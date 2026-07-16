@@ -40,8 +40,14 @@ def clone_final_tracks(tracks: List[FinalTrack]) -> List[FinalTrack]:
     ]
 
 
-def run_pipeline(video_path: Path, ann_dir: Path, out_dir: Path, config: Dict[str, Any]) -> None:
-    # 顶层流程编排：解析标注、双向跟踪、轨迹融合、overview 渲染、clip 导出、结果落盘。
+def run_pipeline(
+    video_path: Path,
+    ann_dir: Path,
+    out_dir: Path,
+    config: Dict[str, Any],
+    render_videos: bool = True,
+) -> None:
+    # 顶层流程编排：解析标注、双向跟踪、轨迹融合和结果落盘；视频渲染可按调用场景关闭。
     ensure_dir(out_dir)
     clips_dir = out_dir / "clips"
     overview_video_path = out_dir / config["clips"]["overview_filename"]
@@ -112,43 +118,44 @@ def run_pipeline(video_path: Path, ann_dir: Path, out_dir: Path, config: Dict[st
         return
 
     output_tracks = clone_final_tracks(final_tracks)
-    clip_tracks = prepare_track_clips(
-        final_tracks=clone_final_tracks(final_tracks),
-        pad_frames=pad_frames,
-        frame_count=frame_count,
-        crop_margin=clips_cfg["crop_margin"],
-        crop_min_size=clips_cfg["crop_min_size"],
-    )
+    if render_videos:
+        clip_tracks = prepare_track_clips(
+            final_tracks=clone_final_tracks(final_tracks),
+            pad_frames=pad_frames,
+            frame_count=frame_count,
+            crop_margin=clips_cfg["crop_margin"],
+            crop_min_size=clips_cfg["crop_min_size"],
+        )
 
-    clip_track_by_id = {track.track_id: track for track in clip_tracks}
-    for output_track in output_tracks:
-        output_track.clip_size = clip_track_by_id[output_track.track_id].clip_size
+        clip_track_by_id = {track.track_id: track for track in clip_tracks}
+        for output_track in output_tracks:
+            output_track.clip_size = clip_track_by_id[output_track.track_id].clip_size
 
-    render_tracking_overview(
-        video_path=video_path,
-        output_path=overview_video_path,
-        final_tracks=output_tracks,
-        fps=fps,
-        frame_count=frame_count,
-        codec=clips_cfg["codec"],
-        box_thickness=clips_cfg["overview_box_thickness"],
-        font_scale=clips_cfg["overview_font_scale"],
-    )
+        render_tracking_overview(
+            video_path=video_path,
+            output_path=overview_video_path,
+            final_tracks=output_tracks,
+            fps=fps,
+            frame_count=frame_count,
+            codec=clips_cfg["codec"],
+            box_thickness=clips_cfg["overview_box_thickness"],
+            font_scale=clips_cfg["overview_font_scale"],
+        )
 
-    extract_track_clips(
-        video_path=video_path,
-        clips_dir=clips_dir,
-        final_tracks=clip_tracks,
-        fps=fps,
-        frame_count=frame_count,
-        codec=clips_cfg["codec"],
-        pad_frames=pad_frames,
-        box_thickness=clips_cfg["overview_box_thickness"],
-        font_scale=clips_cfg["overview_font_scale"],
-    )
+        extract_track_clips(
+            video_path=video_path,
+            clips_dir=clips_dir,
+            final_tracks=clip_tracks,
+            fps=fps,
+            frame_count=frame_count,
+            codec=clips_cfg["codec"],
+            pad_frames=pad_frames,
+            box_thickness=clips_cfg["overview_box_thickness"],
+            font_scale=clips_cfg["overview_font_scale"],
+        )
 
-    for output_track in output_tracks:
-        output_track.clip_path = clip_track_by_id[output_track.track_id].clip_path
+        for output_track in output_tracks:
+            output_track.clip_path = clip_track_by_id[output_track.track_id].clip_path
 
     json_path, csv_path = write_tracking_outputs(
         out_dir=out_dir,
@@ -179,10 +186,10 @@ def run_pipeline(video_path: Path, ann_dir: Path, out_dir: Path, config: Dict[st
             class_labels=exports_cfg.get("class_labels", {}),
         )
 
-    print(
-        f"Saved {len(output_tracks)} final tracks to {json_path.name} and {csv_path.name}. "
-        f"Clips written to {clips_dir}. Overview video: {overview_video_path.name}."
-    )
+    message = f"Saved {len(output_tracks)} final tracks to {json_path.name} and {csv_path.name}."
+    if render_videos:
+        message += f" Clips written to {clips_dir}. Overview video: {overview_video_path.name}."
+    print(message)
     if yolo_dir is not None:
         print(f"YOLO frame labels exported to {yolo_dir}.")
     if label_studio_path is not None:

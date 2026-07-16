@@ -33,6 +33,9 @@
 - `POST /api/locateanything/jobs`
 - `GET /api/locateanything/jobs/{job_id}`
 - `GET /api/locateanything/jobs/{job_id}/yolo-zip`
+- `POST /api/locateanything/image-jobs`：提交服务器图片目录批量标注任务
+- `GET /api/locateanything/image-jobs/{job_id}`：查询图片任务状态
+- `GET /api/locateanything/image-jobs/{job_id}/annotations-zip`：下载图片、YOLO TXT 与 VOC XML 结果
 
 两类任务服务会返回 `queued`、`running`、`done` 或 `failed` 状态。开始运行后，任务信息中的 `assigned_device` 表示实际分配的设备。客户端应按合理的固定间隔轮询，仅在状态变为 `done` 后获取结果文件。
 
