@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 
-SCHEMA_VERSION = 5
-PART_STATUSES = ("pending", "in_progress", "submitted", "rework", "completed")
+SCHEMA_VERSION = 6
+PART_STATUSES = ("pending", "in_progress", "paused", "submitted", "rework", "completed")
+TIME_DEVIATION_THRESHOLD = 0.5
 TASK_FIELDS = (
     "application_date",
     "applicant",
@@ -113,6 +114,7 @@ class PlatformDatabase:
                     estimated_hours TEXT NOT NULL DEFAULT '',
                     data_path TEXT NOT NULL DEFAULT '',
                     guide_path TEXT NOT NULL DEFAULT '',
+                    expected_part_seconds REAL NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -131,6 +133,10 @@ class PlatformDatabase:
                     work_seconds REAL NOT NULL DEFAULT 0,
                     submission_note TEXT NOT NULL DEFAULT '',
                     review_note TEXT NOT NULL DEFAULT '',
+                    time_review_status TEXT NOT NULL DEFAULT '',
+                    time_review_note TEXT NOT NULL DEFAULT '',
+                    time_review_actor TEXT NOT NULL DEFAULT '',
+                    time_reviewed_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(task_id, part_index)
@@ -176,6 +182,7 @@ class PlatformDatabase:
                 "estimated_hours": "TEXT NOT NULL DEFAULT ''",
                 "data_path": "TEXT NOT NULL DEFAULT ''",
                 "guide_path": "TEXT NOT NULL DEFAULT ''",
+                "expected_part_seconds": "REAL NOT NULL DEFAULT 0",
             }
             for column, definition in additions.items():
                 if column not in task_columns:
@@ -183,6 +190,15 @@ class PlatformDatabase:
             part_columns = {row["name"] for row in connection.execute("PRAGMA table_info(parts)")}
             if "work_path" not in part_columns:
                 connection.execute("ALTER TABLE parts ADD COLUMN work_path TEXT NOT NULL DEFAULT ''")
+            part_additions = {
+                "time_review_status": "TEXT NOT NULL DEFAULT ''",
+                "time_review_note": "TEXT NOT NULL DEFAULT ''",
+                "time_review_actor": "TEXT NOT NULL DEFAULT ''",
+                "time_reviewed_at": "TEXT",
+            }
+            for column, definition in part_additions.items():
+                if column not in part_columns:
+                    connection.execute(f"ALTER TABLE parts ADD COLUMN {column} {definition}")
             task_columns.update(additions)
             legacy_columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
             if "assignee" in legacy_columns:
@@ -327,7 +343,7 @@ class PlatformDatabase:
 
     def update_task(self, task_id: str, actor: str, changes: dict[str, str],
                     now: str) -> dict[str, Any]:
-        allowed = {"product_tag", "part_prefix", *TASK_FIELDS}
+        allowed = {"manager", "product_tag", "part_prefix", "expected_part_seconds", *TASK_FIELDS}
         unknown = set(changes) - allowed
         if unknown:
             raise ValueError(f"unsupported task fields: {', '.join(sorted(unknown))}")
@@ -340,6 +356,11 @@ class PlatformDatabase:
             if task["publisher"] != actor:
                 raise PermissionError("only publisher can edit task")
             values = {key: str(value).strip() for key, value in changes.items()}
+            expected_changed = (
+                "expected_part_seconds" in values
+                and float(values["expected_part_seconds"] or 0)
+                != float(task["expected_part_seconds"] or 0)
+            )
             project = values.get("project", task["project"])
             content = values.get("annotation_content", task["annotation_content"])
             values["name"] = f"{project or '未命名项目'} · {content or '标注任务'}"
@@ -348,6 +369,12 @@ class PlatformDatabase:
                 f"UPDATE tasks SET {','.join(assignments)},updated_at=? WHERE task_id=?",
                 [*values.values(), now, task_id],
             )
+            if expected_changed:
+                connection.execute(
+                    "UPDATE parts SET time_review_status='',time_review_note='',"
+                    "time_review_actor='',time_reviewed_at=NULL,updated_at=? WHERE task_id=?",
+                    (now, task_id),
+                )
         return self.get_task(task_id, now)
 
     def delete_task(self, task_id: str, actor: str, now: str) -> None:
@@ -402,7 +429,8 @@ class PlatformDatabase:
 
     def _task_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         result = {key: row[key] for key in (
-            "task_id", "name", "status", "publisher", "product_tag", "part_prefix",
+            "task_id", "name", "status", "publisher", "manager", "product_tag", "part_prefix",
+            "expected_part_seconds",
             *TASK_FIELDS, "created_at", "updated_at"
         )}
         return result
@@ -456,9 +484,9 @@ class PlatformDatabase:
             params.append(actor)
         with self.connection() as connection:
             rows = connection.execute(
-                f"SELECT p.*,(SELECT started_at FROM part_work_sessions s WHERE s.part_id=p.part_id "
+                f"SELECT p.*,t.expected_part_seconds,(SELECT started_at FROM part_work_sessions s WHERE s.part_id=p.part_id "
                 f"AND s.ended_at IS NULL ORDER BY session_id DESC LIMIT 1) active_started_at "
-                f"FROM parts p WHERE {where} ORDER BY p.part_index", params
+                f"FROM parts p JOIN tasks t ON t.task_id=p.task_id WHERE {where} ORDER BY p.part_index", params
             ).fetchall()
             result = []
             for row in rows:
@@ -466,6 +494,13 @@ class PlatformDatabase:
                 item["annotator"] = item.get("annotator") or ""
                 item["work_seconds"] = round(
                     float(item["work_seconds"]) + _elapsed_seconds(item["active_started_at"], now), 3
+                )
+                expected = float(item.get("expected_part_seconds") or 0)
+                item["time_deviation_ratio"] = round(
+                    (float(item["work_seconds"]) - expected) / expected, 4
+                ) if expected > 0 else None
+                item["has_time_deviation"] = bool(
+                    expected > 0 and abs(float(item["time_deviation_ratio"])) >= TIME_DEVIATION_THRESHOLD
                 )
                 item["comments"] = self._comments(connection, int(item["part_id"]))
                 result.append(item)
@@ -500,7 +535,7 @@ class PlatformDatabase:
             if task is None:
                 raise KeyError(task_id)
             active = connection.execute(
-                "SELECT 1 FROM parts WHERE task_id=? AND annotator=? AND status='in_progress'",
+                "SELECT 1 FROM parts WHERE task_id=? AND annotator=? AND status IN ('in_progress','paused')",
                 (task_id, actor),
             ).fetchone()
             if active:
@@ -522,6 +557,77 @@ class PlatformDatabase:
             part_id = int(part["part_id"])
         return next(item for item in self.list_parts(task_id, now, actor) if item["part_id"] == part_id)
 
+    def pause_part(self, task_id: str, part_id: int, actor: str, now: str) -> dict[str, Any]:
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT status,annotator FROM parts WHERE task_id=? AND part_id=?", (task_id, part_id)
+            ).fetchone()
+            if row is None:
+                raise KeyError(part_id)
+            if row["annotator"] != actor or row["status"] != "in_progress":
+                raise PermissionError("only active annotator can pause")
+            self._close_session(connection, part_id, now)
+            connection.execute(
+                "UPDATE parts SET status='paused',updated_at=? WHERE part_id=?", (now, part_id)
+            )
+            connection.execute(
+                "INSERT INTO part_comments(part_id,actor,kind,content,created_at) VALUES(?,?,?,?,?)",
+                (part_id, actor, "pause", "暂停计时", now),
+            )
+        return next(item for item in self.list_parts(task_id, now, actor) if item["part_id"] == part_id)
+
+    def resume_part(self, task_id: str, part_id: int, actor: str, now: str) -> dict[str, Any]:
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT status,annotator FROM parts WHERE task_id=? AND part_id=?", (task_id, part_id)
+            ).fetchone()
+            if row is None:
+                raise KeyError(part_id)
+            if row["annotator"] != actor or row["status"] != "paused":
+                raise PermissionError("only assigned annotator can resume")
+            active = connection.execute(
+                "SELECT 1 FROM parts WHERE task_id=? AND annotator=? AND status='in_progress' AND part_id!=?",
+                (task_id, actor, part_id),
+            ).fetchone()
+            if active:
+                raise ValueError("finish or pause the active part before resuming")
+            connection.execute(
+                "UPDATE parts SET status='in_progress',time_review_status='',time_review_note='',"
+                "time_review_actor='',time_reviewed_at=NULL,updated_at=? WHERE part_id=?",
+                (now, part_id),
+            )
+            self._open_session(connection, part_id, actor, now)
+            connection.execute(
+                "INSERT INTO part_comments(part_id,actor,kind,content,created_at) VALUES(?,?,?,?,?)",
+                (part_id, actor, "resume", "继续计时", now),
+            )
+        return next(item for item in self.list_parts(task_id, now, actor) if item["part_id"] == part_id)
+
+    def return_part(self, task_id: str, part_id: int, actor: str, note: str, now: str) -> dict[str, Any]:
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT status,annotator FROM parts WHERE task_id=? AND part_id=?", (task_id, part_id)
+            ).fetchone()
+            if row is None:
+                raise KeyError(part_id)
+            if row["annotator"] != actor or row["status"] not in {"in_progress", "paused"}:
+                raise PermissionError("only assigned annotator can return an active or paused part")
+            if row["status"] == "in_progress":
+                self._close_session(connection, part_id, now)
+            content = note.strip() or "标注者中途退还 Part"
+            connection.execute(
+                "INSERT INTO part_comments(part_id,actor,kind,content,created_at) VALUES(?,?,?,?,?)",
+                (part_id, actor, "return", content, now),
+            )
+            connection.execute(
+                "UPDATE parts SET status='pending',annotator=NULL,claimed_at=NULL,submitted_at=NULL,"
+                "reviewed_at=NULL,work_seconds=0,"
+                "submission_note='',review_note='',time_review_status='',time_review_note='',"
+                "time_review_actor='',time_reviewed_at=NULL,updated_at=? WHERE part_id=?",
+                (now, part_id),
+            )
+        return next(item for item in self.list_parts(task_id, now) if item["part_id"] == part_id)
+
     def start_rework(self, task_id: str, part_id: int, actor: str, now: str) -> dict[str, Any]:
         with self.transaction() as connection:
             row = connection.execute(
@@ -531,8 +637,11 @@ class PlatformDatabase:
                 raise KeyError(part_id)
             if row["annotator"] != actor or row["status"] != "rework":
                 raise PermissionError("only assigned annotator can start rework")
-            connection.execute("UPDATE parts SET status='in_progress',updated_at=? WHERE part_id=?",
-                               (now, part_id))
+            connection.execute(
+                "UPDATE parts SET status='in_progress',time_review_status='',time_review_note='',"
+                "time_review_actor='',time_reviewed_at=NULL,updated_at=? WHERE part_id=?",
+                (now, part_id),
+            )
             self._open_session(connection, part_id, actor, now)
         return next(item for item in self.list_parts(task_id, now, actor) if item["part_id"] == part_id)
 
@@ -547,7 +656,8 @@ class PlatformDatabase:
                 raise PermissionError("only active annotator can submit")
             self._close_session(connection, part_id, now)
             connection.execute(
-                "UPDATE parts SET status='submitted',submitted_at=?,submission_note=?,updated_at=? "
+                "UPDATE parts SET status='submitted',submitted_at=?,submission_note=?,"
+                "time_review_status='',time_review_note='',time_review_actor='',time_reviewed_at=NULL,updated_at=? "
                 "WHERE part_id=?", (now, note.strip(), now, part_id)
             )
             if note.strip():
@@ -609,22 +719,64 @@ class PlatformDatabase:
                                ("completed" if remaining == 0 else "in_progress", now, task_id))
         return next(item for item in self.list_parts(task_id, now) if item["part_id"] == part_id)
 
+    def review_part_time(self, task_id: str, part_id: int, actor: str, decision: str,
+                         note: str, now: str) -> dict[str, Any]:
+        if decision not in {"estimate_reasonable", "estimate_unreasonable"}:
+            raise ValueError("unsupported time review decision")
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT p.status,p.work_seconds,t.publisher,t.expected_part_seconds "
+                "FROM parts p JOIN tasks t ON t.task_id=p.task_id WHERE p.task_id=? AND p.part_id=?",
+                (task_id, part_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(part_id)
+            if row["publisher"] != actor:
+                raise PermissionError("only publisher can review time deviation")
+            expected = float(row["expected_part_seconds"] or 0)
+            if expected <= 0 or abs((float(row["work_seconds"]) - expected) / expected) < TIME_DEVIATION_THRESHOLD:
+                raise ValueError("part work time does not currently have a large deviation")
+            if row["status"] not in {"paused", "submitted", "rework", "completed"}:
+                raise ValueError("pause or submit the part before reviewing its time deviation")
+            connection.execute(
+                "UPDATE parts SET time_review_status=?,time_review_note=?,time_review_actor=?,"
+                "time_reviewed_at=?,updated_at=? WHERE part_id=?",
+                (decision, note.strip(), actor, now, now, part_id),
+            )
+            connection.execute(
+                "INSERT INTO part_comments(part_id,actor,kind,content,created_at) VALUES(?,?,?,?,?)",
+                (part_id, actor, f"time_{decision}", note.strip() or decision, now),
+            )
+        return next(item for item in self.list_parts(task_id, now) if item["part_id"] == part_id)
+
     def annotator_statistics(self, task_id: str, now: str) -> list[dict[str, Any]]:
         parts = self.list_parts(task_id, now)
         grouped: dict[str, dict[str, Any]] = {}
+        def item_for(actor: str) -> dict[str, Any]:
+            return grouped.setdefault(actor, {
+                "username": actor, "total": 0, "completed": 0, "submitted": 0,
+                "rework": 0, "paused": 0, "in_progress": 0, "work_seconds": 0.0,
+            })
         for part in parts:
             actor = part["annotator"]
             if not actor:
                 continue
-            item = grouped.setdefault(actor, {
-                "username": actor, "total": 0, "completed": 0, "submitted": 0,
-                "rework": 0, "in_progress": 0, "work_seconds": 0.0,
-            })
+            item = item_for(actor)
             item["total"] += 1
             if part["status"] in item:
                 item[part["status"]] += 1
-            item["work_seconds"] += float(part["work_seconds"])
         with self.connection() as connection:
+            sessions = connection.execute(
+                "SELECT s.annotator,s.started_at,s.ended_at,s.duration_seconds "
+                "FROM part_work_sessions s JOIN parts p ON p.part_id=s.part_id WHERE p.task_id=?",
+                (task_id,),
+            ).fetchall()
+            for session in sessions:
+                duration = (
+                    float(session["duration_seconds"] or 0)
+                    if session["ended_at"] else _elapsed_seconds(session["started_at"], now)
+                )
+                item_for(session["annotator"])["work_seconds"] += duration
             names = {row["username"]: row["display_name"] for row in connection.execute(
                 "SELECT username,display_name FROM users"
             )}

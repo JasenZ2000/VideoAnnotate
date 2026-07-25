@@ -82,7 +82,69 @@ class PlatformDatabaseTests(unittest.TestCase):
         parts = self.db.list_parts("task-1", "2026-07-15T10:00:00+08:00")
         self.assertEqual([part["name"] for part in parts], ["split_001", "group / split_002"])
         self.assertEqual(parts[1]["work_path"], r"\\server\data\group\split_002")
-        self.assertEqual(self.db.health()["schema_version"], 5)
+        self.assertEqual(self.db.health()["schema_version"], 6)
+
+    def test_part_can_pause_resume_and_return(self) -> None:
+        self.db.create_task(task(), 1, "2026-07-15T10:00:00+08:00")
+        claimed = self.db.claim_next_part(
+            "task-1", "worker", "2026-07-15T10:01:00+08:00"
+        )
+        paused = self.db.pause_part(
+            "task-1", claimed["part_id"], "worker", "2026-07-15T10:05:00+08:00"
+        )
+        self.assertEqual(paused["status"], "paused")
+        self.assertEqual(paused["work_seconds"], 240)
+        with self.assertRaisesRegex(ValueError, "active part"):
+            self.db.claim_next_part("task-1", "worker", "2026-07-15T10:06:00+08:00")
+
+        resumed = self.db.resume_part(
+            "task-1", claimed["part_id"], "worker", "2026-07-15T10:10:00+08:00"
+        )
+        self.assertEqual(resumed["status"], "in_progress")
+        returned = self.db.return_part(
+            "task-1", claimed["part_id"], "worker", "cannot continue",
+            "2026-07-15T10:12:00+08:00",
+        )
+        self.assertEqual(returned["status"], "pending")
+        self.assertEqual(returned["annotator"], "")
+        self.assertEqual(returned["work_seconds"], 0)
+        self.assertEqual(returned["comments"][-1]["kind"], "return")
+        returned_stats = self.db.annotator_statistics(
+            "task-1", "2026-07-15T10:12:00+08:00"
+        )
+        self.assertEqual(returned_stats[0]["work_seconds"], 360)
+        reassigned = self.db.claim_next_part(
+            "task-1", "worker-2", "2026-07-15T10:13:00+08:00"
+        )
+        self.assertEqual(reassigned["annotator"], "worker-2")
+
+    def test_expected_part_time_flags_deviation_and_publisher_reviews_it(self) -> None:
+        self.db.create_task(task(), 1, "2026-07-15T10:00:00+08:00")
+        updated = self.db.update_task(
+            "task-1", "publisher", {"manager": "observer", "expected_part_seconds": 120},
+            "2026-07-15T10:00:30+08:00",
+        )
+        self.assertEqual(updated["manager"], "observer")
+        self.assertEqual(updated["expected_part_seconds"], 120)
+        claimed = self.db.claim_next_part(
+            "task-1", "worker", "2026-07-15T10:01:00+08:00"
+        )
+        submitted = self.db.submit_part(
+            "task-1", claimed["part_id"], "worker", "done", "2026-07-15T10:07:00+08:00"
+        )
+        self.assertTrue(submitted["has_time_deviation"])
+        self.assertEqual(submitted["time_deviation_ratio"], 2.0)
+        with self.assertRaises(PermissionError):
+            self.db.review_part_time(
+                "task-1", claimed["part_id"], "observer", "estimate_unreasonable", "",
+                "2026-07-15T10:08:00+08:00",
+            )
+        reviewed = self.db.review_part_time(
+            "task-1", claimed["part_id"], "publisher", "estimate_unreasonable",
+            "estimate was too short", "2026-07-15T10:08:00+08:00",
+        )
+        self.assertEqual(reviewed["time_review_status"], "estimate_unreasonable")
+        self.assertEqual(reviewed["time_review_actor"], "publisher")
 
     def test_concurrent_claims_get_different_parts(self) -> None:
         self.db.create_task(task(), 2, "2026-07-15T10:00:00+08:00")

@@ -28,7 +28,7 @@ APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 PROJECT_ROOT = APP_DIR.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "platform_tasks"
-API_SCHEMA_VERSION = 8
+API_SCHEMA_VERSION = 9
 SESSION_COOKIE_NAME = "annotation_platform_session"
 SESSION_TTL_DAYS = int(os.environ.get("ANNOTATION_PLATFORM_SESSION_DAYS", "7"))
 PASSWORD_ITERATIONS = 200_000
@@ -98,8 +98,10 @@ class AddPartsReq(BaseModel):
 
 
 class UpdateTaskReq(BaseModel):
+    manager: Optional[str] = None
     product_tag: Optional[str] = None
     part_prefix: Optional[str] = None
+    expected_part_seconds: Optional[float] = None
     application_date: Optional[str] = None
     applicant: Optional[str] = None
     project: Optional[str] = None
@@ -123,6 +125,15 @@ class ReviewPartReq(BaseModel):
 
 class CommentReq(BaseModel):
     content: str
+
+
+class ReturnPartReq(BaseModel):
+    note: str = ""
+
+
+class TimeReviewReq(BaseModel):
+    decision: str
+    note: str = ""
 
 
 def now_iso() -> str:
@@ -407,6 +418,17 @@ async def list_users():
     return {"users": database().list_users()}
 
 
+@app.get("/api/user-options")
+async def list_user_options():
+    require_user()
+    return {
+        "users": [
+            {"username": item["username"], "display_name": item["display_name"]}
+            for item in database().list_users() if item["is_active"]
+        ]
+    }
+
+
 @app.post("/api/users")
 async def create_user(req: CreateUserReq):
     require_admin()
@@ -510,7 +532,9 @@ async def list_tasks():
     tasks = database().list_tasks(now_iso())
     for task in tasks:
         task["is_publisher"] = task["publisher"] == actor
+        task["is_manager"] = bool(task.get("manager")) and task["manager"] == actor and not task["is_publisher"]
         task["can_review"] = task["is_publisher"] or user.get("role") == "admin"
+        task["can_view_all"] = task["can_review"] or task["is_manager"]
         mine = database().list_parts(task["task_id"], now_iso(), actor)
         task["my_parts"] = len(mine)
         task["my_rework"] = sum(1 for part in mine if part["status"] == "rework")
@@ -527,15 +551,19 @@ async def get_task(task_id: str):
     except KeyError as exc:
         raise HTTPException(404, "任务不存在") from exc
     publisher = task["publisher"] == actor
+    manager = bool(task.get("manager")) and task["manager"] == actor and not publisher
     can_review = publisher or user.get("role") == "admin"
+    can_view_all = can_review or manager
     task["is_publisher"] = publisher
+    task["is_manager"] = manager
     task["can_review"] = can_review
+    task["can_view_all"] = can_view_all
     task["available_parts"] = task["part_summary"]["pending"]
-    if can_review:
+    if can_view_all:
         task["parts"] = database().list_parts(task_id, now_iso())
-    if publisher:
+    if publisher or manager:
         task["statistics"] = database().annotator_statistics(task_id, now_iso())
-    elif not can_review:
+    elif not can_view_all:
         task["parts"] = database().list_parts(task_id, now_iso(), actor)
     return task
 
@@ -551,6 +579,21 @@ async def update_task(task_id: str, req: UpdateTaskReq):
         raise HTTPException(400, "请至少修改一项任务信息")
     if "product_tag" in changes and not changes["product_tag"].strip():
         raise HTTPException(400, "产品大标签不能为空")
+    if "expected_part_seconds" in changes:
+        seconds = float(changes["expected_part_seconds"])
+        if seconds < 0 or seconds > 31 * 86400:
+            raise HTTPException(400, "每个 Part 预计耗时必须在 0 到 31 天之间")
+        changes["expected_part_seconds"] = seconds
+    if "manager" in changes:
+        manager = str(changes["manager"]).strip()
+        if manager:
+            try:
+                target = database().get_user(manager)
+            except KeyError as exc:
+                raise HTTPException(400, "指定的协同查看人不存在") from exc
+            if not target["is_active"]:
+                raise HTTPException(400, "指定的协同查看人已停用")
+        changes["manager"] = manager
     try:
         task = database().update_task(task_id, actor, changes, now_iso())
     except BaseException as exc:
@@ -600,6 +643,36 @@ async def start_rework(task_id: str, part_id: int):
     return {"part": part}
 
 
+@app.post("/api/tasks/{task_id}/parts/{part_id}/pause")
+async def pause_part(task_id: str, part_id: int):
+    actor = require_user()["username"]
+    try:
+        part = database().pause_part(task_id, part_id, actor, now_iso())
+    except BaseException as exc:
+        _raise_database_error(exc)
+    return {"part": part}
+
+
+@app.post("/api/tasks/{task_id}/parts/{part_id}/resume")
+async def resume_part(task_id: str, part_id: int):
+    actor = require_user()["username"]
+    try:
+        part = database().resume_part(task_id, part_id, actor, now_iso())
+    except BaseException as exc:
+        _raise_database_error(exc)
+    return {"part": part}
+
+
+@app.post("/api/tasks/{task_id}/parts/{part_id}/return")
+async def return_part(task_id: str, part_id: int, req: ReturnPartReq):
+    actor = require_user()["username"]
+    try:
+        part = database().return_part(task_id, part_id, actor, req.note, now_iso())
+    except BaseException as exc:
+        _raise_database_error(exc)
+    return {"part": part}
+
+
 @app.post("/api/tasks/{task_id}/parts/{part_id}/submit")
 async def submit_part(task_id: str, part_id: int, req: SubmitPartReq):
     actor = require_user()["username"]
@@ -628,6 +701,18 @@ async def review_part(task_id: str, part_id: int, req: ReviewPartReq):
         part = database().review_part(
             task_id, part_id, actor, req.action, req.note, now_iso(),
             is_admin=user.get("role") == "admin",
+        )
+    except BaseException as exc:
+        _raise_database_error(exc)
+    return {"part": part}
+
+
+@app.post("/api/tasks/{task_id}/parts/{part_id}/time-review")
+async def review_part_time(task_id: str, part_id: int, req: TimeReviewReq):
+    actor = require_user()["username"]
+    try:
+        part = database().review_part_time(
+            task_id, part_id, actor, req.decision, req.note, now_iso()
         )
     except BaseException as exc:
         _raise_database_error(exc)

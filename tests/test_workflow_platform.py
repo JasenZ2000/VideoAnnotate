@@ -223,9 +223,66 @@ class WorkflowPlatformTests(unittest.TestCase):
         )
         self.assertEqual(self.client.delete(f"/api/tasks/{task_id}").status_code, 403)
 
+    def test_publisher_can_assign_collaborative_viewer(self) -> None:
+        task_id = self._publish(TABLE.splitlines()[1], 2)["tasks"][0]["task_id"]
+        updated = self.client.patch(f"/api/tasks/{task_id}", json={
+            "manager": "worker", "expected_part_seconds": 600,
+        })
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual(updated.json()["task"]["manager"], "worker")
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={
+            "username": "worker", "password": "worker-pass",
+        })
+        detail = self.client.get(f"/api/tasks/{task_id}").json()
+        self.assertTrue(detail["is_manager"])
+        self.assertTrue(detail["can_view_all"])
+        self.assertFalse(detail["can_review"])
+        self.assertEqual(len(detail["parts"]), 2)
+        self.assertIn("statistics", detail)
+        denied = self.client.patch(f"/api/tasks/{task_id}", json={"project": "denied"})
+        self.assertEqual(denied.status_code, 403)
+
+    def test_worker_can_pause_resume_and_return_part(self) -> None:
+        task_id = self._publish(TABLE.splitlines()[1], 1)["tasks"][0]["task_id"]
+        self.assertEqual(self.client.patch(
+            f"/api/tasks/{task_id}", json={"expected_part_seconds": 1},
+        ).status_code, 200)
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={
+            "username": "worker", "password": "worker-pass",
+        })
+        claimed = self.client.post(f"/api/tasks/{task_id}/parts/claim-next").json()["part"]
+        part_id = claimed["part_id"]
+        paused = self.client.post(f"/api/tasks/{task_id}/parts/{part_id}/pause")
+        self.assertEqual(paused.status_code, 200, paused.text)
+        self.assertEqual(paused.json()["part"]["status"], "paused")
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={
+            "username": "publisher", "password": "publisher-pass",
+        })
+        time_review = self.client.post(
+            f"/api/tasks/{task_id}/parts/{part_id}/time-review",
+            json={"decision": "estimate_unreasonable", "note": "one second is too short"},
+        )
+        self.assertEqual(time_review.status_code, 200, time_review.text)
+        self.assertEqual(time_review.json()["part"]["time_review_status"], "estimate_unreasonable")
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={
+            "username": "worker", "password": "worker-pass",
+        })
+        resumed = self.client.post(f"/api/tasks/{task_id}/parts/{part_id}/resume")
+        self.assertEqual(resumed.json()["part"]["status"], "in_progress")
+        returned = self.client.post(
+            f"/api/tasks/{task_id}/parts/{part_id}/return", json={"note": "switch worker"},
+        )
+        self.assertEqual(returned.status_code, 200, returned.text)
+        self.assertEqual(returned.json()["part"]["status"], "pending")
+        self.assertEqual(returned.json()["part"]["annotator"], "")
+
     def test_health_and_authentication_contract(self) -> None:
         health = self.client.get("/api/health")
-        self.assertEqual(health.json()["api_schema_version"], 8)
+        self.assertEqual(health.json()["api_schema_version"], 9)
         self.client.post("/api/auth/logout")
         self.assertEqual(self.client.get("/api/tasks").status_code, 401)
 
