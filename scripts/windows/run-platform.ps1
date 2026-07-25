@@ -4,6 +4,11 @@ param(
     [int]$Port = 0,
     [string]$TasksDir = "",
     [string]$Database = "",
+    [string]$SslCertFile = "",
+    [string]$SslKeyFile = "",
+    [switch]$AutoHttps,
+    [string]$TlsHosts = "",
+    [string]$TlsCertDir = "",
     [string]$Python = "python",
     [switch]$Restart,
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -27,6 +32,15 @@ if (-not $TasksDir) {
 if (-not $Database) {
     $Database = if ($env:ANNOTATION_PLATFORM_DB) { $env:ANNOTATION_PLATFORM_DB } else { Join-Path $TasksDir "platform.sqlite3" }
 }
+if (-not $SslCertFile) { $SslCertFile = $env:ANNOTATION_PLATFORM_SSL_CERTFILE }
+if (-not $SslKeyFile) { $SslKeyFile = $env:ANNOTATION_PLATFORM_SSL_KEYFILE }
+if ($env:ANNOTATION_PLATFORM_AUTO_HTTPS -eq "1") { $AutoHttps = $true }
+if (-not $TlsHosts) { $TlsHosts = $env:ANNOTATION_PLATFORM_TLS_HOSTS }
+if (-not $TlsCertDir) { $TlsCertDir = $env:ANNOTATION_PLATFORM_TLS_CERT_DIR }
+if ([bool]$SslCertFile -ne [bool]$SslKeyFile) {
+    throw "SslCertFile and SslKeyFile must be provided together."
+}
+$scheme = if ($SslCertFile -or $AutoHttps) { "https" } else { "http" }
 function Get-PlatformListenerPids {
     $listenerPattern = "^\s*TCP\s+\S+:$Port\s+\S+\s+LISTENING\s+(\d+)\s*$"
     return @(
@@ -45,7 +59,7 @@ if ($listenerPids.Count -gt 0) {
 
     $healthIdentifiesPlatform = $false
     try {
-        $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 3
+        $health = Invoke-RestMethod -Uri "${scheme}://127.0.0.1:$Port/api/health" -TimeoutSec 3
         $healthIdentifiesPlatform = $health.service -eq "annotation-collaboration-platform"
     }
     catch {
@@ -76,15 +90,26 @@ if ($listenerPids.Count -gt 0) {
 
 New-Item -ItemType Directory -Force -Path $TasksDir | Out-Null
 
-Write-Host "Starting annotation platform at http://${HostName}:$Port"
+Write-Host "Starting annotation platform at ${scheme}://${HostName}:$Port"
 Write-Host "Tasks: $TasksDir"
 Write-Host "Database: $Database"
+
+$tlsArgs = @()
+if ($SslCertFile) {
+    $tlsArgs = @("--ssl-certfile", $SslCertFile, "--ssl-keyfile", $SslKeyFile)
+}
+elseif ($AutoHttps) {
+    $tlsArgs = @("--auto-https")
+    if ($TlsHosts) { $tlsArgs += @("--tls-hosts", $TlsHosts) }
+    if ($TlsCertDir) { $tlsArgs += @("--tls-cert-dir", $TlsCertDir) }
+}
 
 & $Python -m workflow_platform.server `
     --host $HostName `
     --port $Port `
     --tasks-dir $TasksDir `
     --database $Database `
+    @tlsArgs `
     @ServerArgs
 
 if ($LASTEXITCODE -ne 0) {

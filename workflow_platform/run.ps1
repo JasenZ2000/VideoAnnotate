@@ -4,6 +4,11 @@ param(
     [int]$Port = 0,
     [string]$TasksDir = "",
     [string]$Database = "",
+    [string]$SslCertFile = "",
+    [string]$SslKeyFile = "",
+    [switch]$AutoHttps,
+    [string]$TlsHosts = "",
+    [string]$TlsCertDir = "",
     [string]$Python = "",
     [switch]$Restart,
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -38,8 +43,15 @@ $arguments = @{
 }
 if ($TasksDir) { $arguments.TasksDir = $TasksDir }
 if ($Database) { $arguments.Database = $Database }
+if ($SslCertFile) { $arguments.SslCertFile = $SslCertFile }
+if ($SslKeyFile) { $arguments.SslKeyFile = $SslKeyFile }
+if ($AutoHttps) { $arguments.AutoHttps = $true }
+if ($TlsHosts) { $arguments.TlsHosts = $TlsHosts }
+if ($TlsCertDir) { $arguments.TlsCertDir = $TlsCertDir }
 if ($Restart) { $arguments.Restart = $true }
 if ($ServerArgs) { $arguments.ServerArgs = $ServerArgs }
 
-Write-Host "Workflow platform will listen on ${HostName}:$Port"
+$httpsEnabled = $AutoHttps -or $SslCertFile -or $env:ANNOTATION_PLATFORM_SSL_CERTFILE -or ($env:ANNOTATION_PLATFORM_AUTO_HTTPS -eq "1")
+$scheme = if ($httpsEnabled) { "https" } else { "http" }
+Write-Host "Workflow platform will listen on ${scheme}://${HostName}:$Port"
 & $launcher @arguments

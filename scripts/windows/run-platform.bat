@@ -1,15 +1,27 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 cd /d "%~dp0\..\.."
 
 if "%ANNOTATION_PLATFORM_HOST%"=="" set ANNOTATION_PLATFORM_HOST=0.0.0.0
 if "%ANNOTATION_PLATFORM_PORT%"=="" set ANNOTATION_PLATFORM_PORT=8088
 if "%ANNOTATION_PLATFORM_TASKS_DIR%"=="" set ANNOTATION_PLATFORM_TASKS_DIR=D:\annotation_tasks
 if "%ANNOTATION_PLATFORM_DB%"=="" set ANNOTATION_PLATFORM_DB=%ANNOTATION_PLATFORM_TASKS_DIR%\platform.sqlite3
+set "TLS_ARGS="
+set "PLATFORM_SCHEME=http"
+if not "%ANNOTATION_PLATFORM_SSL_CERTFILE%"=="" (
+  set "PLATFORM_SCHEME=https"
+  set "TLS_ARGS=--ssl-certfile "%ANNOTATION_PLATFORM_SSL_CERTFILE%" --ssl-keyfile "%ANNOTATION_PLATFORM_SSL_KEYFILE%""
+)
+if "%ANNOTATION_PLATFORM_SSL_CERTFILE%"=="" if "%ANNOTATION_PLATFORM_AUTO_HTTPS%"=="1" (
+  set "PLATFORM_SCHEME=https"
+  set "TLS_ARGS=--auto-https"
+  if not "%ANNOTATION_PLATFORM_TLS_HOSTS%"=="" set "TLS_ARGS=!TLS_ARGS! --tls-hosts "%ANNOTATION_PLATFORM_TLS_HOSTS%""
+  if not "%ANNOTATION_PLATFORM_TLS_CERT_DIR%"=="" set "TLS_ARGS=!TLS_ARGS! --tls-cert-dir "%ANNOTATION_PLATFORM_TLS_CERT_DIR%""
+)
 
-echo Starting annotation platform at http://%ANNOTATION_PLATFORM_HOST%:%ANNOTATION_PLATFORM_PORT%
+echo Starting annotation platform at %PLATFORM_SCHEME%://%ANNOTATION_PLATFORM_HOST%:%ANNOTATION_PLATFORM_PORT%
 python -m workflow_platform.server ^
   --host "%ANNOTATION_PLATFORM_HOST%" ^
   --port "%ANNOTATION_PLATFORM_PORT%" ^
   --tasks-dir "%ANNOTATION_PLATFORM_TASKS_DIR%" ^
-  --database "%ANNOTATION_PLATFORM_DB%" %*
+  --database "%ANNOTATION_PLATFORM_DB%" !TLS_ARGS! %*

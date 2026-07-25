@@ -10,8 +10,15 @@
 | `--port` | `ANNOTATION_PLATFORM_PORT` | 监听端口 |
 | `--tasks-dir` | `ANNOTATION_PLATFORM_TASKS_DIR` | 默认数据库目录 |
 | `--database` | `ANNOTATION_PLATFORM_DB` | SQLite 文件路径 |
+| `--ssl-certfile` | `ANNOTATION_PLATFORM_SSL_CERTFILE` | HTTPS 使用的 PEM 证书链 |
+| `--ssl-keyfile` | `ANNOTATION_PLATFORM_SSL_KEYFILE` | HTTPS 使用的 PEM 私钥 |
+| `--auto-https` | `ANNOTATION_PLATFORM_AUTO_HTTPS=1` | 自动生成并复用自签名证书 |
+| `--tls-hosts` | `ANNOTATION_PLATFORM_TLS_HOSTS` | 自动证书额外包含的逗号分隔域名/IP |
+| `--tls-cert-dir` | `ANNOTATION_PLATFORM_TLS_CERT_DIR` | 自动证书保存目录，默认是任务目录下的 `tls` |
 | - | `ANNOTATION_PLATFORM_SESSION_DAYS` | 登录会话有效天数 |
-| - | `ANNOTATION_PLATFORM_SECURE_COOKIE=1` | HTTPS 部署时启用 Secure Cookie |
+| - | `ANNOTATION_PLATFORM_SECURE_COOKIE=1` | TLS 在反向代理终止时手动启用 Secure Cookie；直接配置证书时会自动启用 |
+
+证书和私钥必须同时配置。直接由平台提供 HTTPS 时，会话 Cookie 自动增加 `Secure` 属性。显式 PEM 证书优先于自动证书，因此后续替换受信任证书不需要删除原来的自签名文件。
 
 SQLite 应放在服务器本地可靠磁盘，不建议放在文件锁支持不完整的网络共享目录。
 

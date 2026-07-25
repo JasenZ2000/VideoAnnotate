@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from workflow_platform.database import PlatformDatabase, TASK_FIELDS
+from workflow_platform.tls import discover_tls_hosts, ensure_self_signed_certificate, normalize_tls_hosts
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -45,6 +46,7 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 SETTINGS: dict[str, Any] = {
     "data_dir": Path(os.environ.get("ANNOTATION_PLATFORM_TASKS_DIR", DEFAULT_DATA_DIR)).resolve(),
     "database_path": os.environ.get("ANNOTATION_PLATFORM_DB", ""),
+    "secure_cookie": os.environ.get("ANNOTATION_PLATFORM_SECURE_COOKIE", "0") == "1",
 }
 _DATABASE: Optional[PlatformDatabase] = None
 _DATABASE_KEY = ""
@@ -364,7 +366,7 @@ def _set_session(response: Response, username: str) -> dict[str, Any]:
     database().touch_user_login(username, now)
     response.set_cookie(
         SESSION_COOKIE_NAME, raw, httponly=True, samesite="lax",
-        secure=os.environ.get("ANNOTATION_PLATFORM_SECURE_COOKIE", "0") == "1",
+        secure=bool(SETTINGS.get("secure_cookie")),
         max_age=SESSION_TTL_DAYS * 86400,
     )
     return public_user(database().get_user(username))
@@ -725,11 +727,64 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--port", type=int, default=int(os.environ.get("ANNOTATION_PLATFORM_PORT", "8000")))
     parser.add_argument("--tasks-dir", default=str(SETTINGS["data_dir"]))
     parser.add_argument("--database", default=str(database_path()))
+    parser.add_argument(
+        "--ssl-certfile", default=os.environ.get("ANNOTATION_PLATFORM_SSL_CERTFILE", ""),
+        help="PEM certificate chain used to serve HTTPS.",
+    )
+    parser.add_argument(
+        "--ssl-keyfile", default=os.environ.get("ANNOTATION_PLATFORM_SSL_KEYFILE", ""),
+        help="PEM private key used to serve HTTPS.",
+    )
+    parser.add_argument(
+        "--auto-https", action="store_true",
+        default=os.environ.get("ANNOTATION_PLATFORM_AUTO_HTTPS", "0") == "1",
+        help="Generate and reuse a self-signed certificate when explicit PEM files are absent.",
+    )
+    parser.add_argument(
+        "--tls-hosts", default=os.environ.get("ANNOTATION_PLATFORM_TLS_HOSTS", ""),
+        help="Comma-separated DNS names and IP addresses added to an auto-generated certificate.",
+    )
+    parser.add_argument(
+        "--tls-cert-dir", default=os.environ.get("ANNOTATION_PLATFORM_TLS_CERT_DIR", ""),
+        help="Directory for the auto-generated certificate; defaults to <tasks-dir>/tls.",
+    )
     args = parser.parse_args(argv)
+    if bool(args.ssl_certfile) != bool(args.ssl_keyfile):
+        parser.error("--ssl-certfile and --ssl-keyfile must be provided together")
+    ssl_certfile = str(Path(args.ssl_certfile).expanduser().resolve()) if args.ssl_certfile else None
+    ssl_keyfile = str(Path(args.ssl_keyfile).expanduser().resolve()) if args.ssl_keyfile else None
+    if args.auto_https and not ssl_certfile:
+        certificate_dir = (
+            Path(args.tls_cert_dir).expanduser().resolve()
+            if args.tls_cert_dir else Path(args.tasks_dir).expanduser().resolve() / "tls"
+        )
+        requested_hosts = normalize_tls_hosts(args.tls_hosts.split(","))
+        hosts = normalize_tls_hosts([*discover_tls_hosts(args.host), *requested_hosts])
+        try:
+            generated_cert, generated_key = ensure_self_signed_certificate(
+                certificate_dir / "selfsigned-cert.pem",
+                certificate_dir / "selfsigned-key.pem",
+                hosts,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        ssl_certfile, ssl_keyfile = str(generated_cert), str(generated_key)
+        print(f"Auto HTTPS certificate: {ssl_certfile}")
+        print(f"Auto HTTPS hosts: {', '.join(hosts)}")
+    if ssl_certfile and not Path(ssl_certfile).is_file():
+        parser.error(f"SSL certificate file does not exist: {ssl_certfile}")
+    if ssl_keyfile and not Path(ssl_keyfile).is_file():
+        parser.error(f"SSL private key file does not exist: {ssl_keyfile}")
     SETTINGS["data_dir"] = Path(args.tasks_dir).expanduser().resolve()
     SETTINGS["database_path"] = str(Path(args.database).expanduser().resolve())
+    SETTINGS["secure_cookie"] = bool(ssl_certfile) or (
+        os.environ.get("ANNOTATION_PLATFORM_SECURE_COOKIE", "0") == "1"
+    )
     database()
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(
+        app, host=args.host, port=args.port,
+        ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile,
+    )
 
 
 if __name__ == "__main__":

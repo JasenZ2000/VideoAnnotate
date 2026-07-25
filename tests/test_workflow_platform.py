@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -285,6 +286,50 @@ class WorkflowPlatformTests(unittest.TestCase):
         self.assertEqual(health.json()["api_schema_version"], 9)
         self.client.post("/api/auth/logout")
         self.assertEqual(self.client.get("/api/tasks").status_code, 401)
+
+    def test_frontend_has_long_path_wrapping_and_clipboard_fallback(self) -> None:
+        page = self.client.get("/")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("overflow-wrap:anywhere", page.text)
+        self.assertIn("window.isSecureContext&&navigator.clipboard", page.text)
+        self.assertIn("document.execCommand('copy')", page.text)
+
+    def test_main_enables_https_and_secure_cookie_with_pem_files(self) -> None:
+        cert = Path(self.temporary.name) / "server.crt"
+        key = Path(self.temporary.name) / "server.key"
+        cert.write_text("test certificate", encoding="utf-8")
+        key.write_text("test key", encoding="utf-8")
+        with patch.object(platform, "database"), patch.object(platform.uvicorn, "run") as run:
+            platform.main([
+                "--host", "0.0.0.0", "--port", "8443",
+                "--tasks-dir", self.temporary.name,
+                "--database", str(Path(self.temporary.name) / "tls.sqlite3"),
+                "--ssl-certfile", str(cert), "--ssl-keyfile", str(key),
+            ])
+        kwargs = run.call_args.kwargs
+        self.assertEqual(kwargs["ssl_certfile"], str(cert.resolve()))
+        self.assertEqual(kwargs["ssl_keyfile"], str(key.resolve()))
+        self.assertTrue(platform.SETTINGS["secure_cookie"])
+
+    def test_main_auto_https_generates_certificate_in_tasks_directory(self) -> None:
+        tasks_dir = Path(self.temporary.name) / "tasks"
+        with (
+            patch.object(platform, "database"),
+            patch.object(platform, "discover_tls_hosts", return_value=["localhost", "127.0.0.1"]),
+            patch.object(platform.uvicorn, "run") as run,
+        ):
+            platform.main([
+                "--host", "0.0.0.0", "--port", "8443",
+                "--tasks-dir", str(tasks_dir),
+                "--database", str(tasks_dir / "platform.sqlite3"),
+                "--auto-https", "--tls-hosts", "annotation-host,192.0.2.20",
+            ])
+        kwargs = run.call_args.kwargs
+        self.assertEqual(kwargs["ssl_certfile"], str((tasks_dir / "tls/selfsigned-cert.pem").resolve()))
+        self.assertEqual(kwargs["ssl_keyfile"], str((tasks_dir / "tls/selfsigned-key.pem").resolve()))
+        self.assertTrue(Path(kwargs["ssl_certfile"]).is_file())
+        self.assertTrue(Path(kwargs["ssl_keyfile"]).is_file())
+        self.assertTrue(platform.SETTINGS["secure_cookie"])
 
 
 if __name__ == "__main__":
