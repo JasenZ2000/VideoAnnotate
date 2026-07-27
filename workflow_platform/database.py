@@ -363,17 +363,38 @@ class PlatformDatabase:
             (task_id, actor, action, field_name, str(old_value), str(new_value), detail, now),
         )
 
+    @staticmethod
+    def _normalize_active_task_ranks(
+        connection: sqlite3.Connection,
+    ) -> list[tuple[str, int, int]]:
+        rows = connection.execute(
+            "SELECT task_id,rank FROM tasks "
+            "WHERE deleted=0 AND status!='completed' "
+            "ORDER BY rank ASC,updated_at DESC,task_id DESC"
+        ).fetchall()
+        changes: list[tuple[str, int, int]] = []
+        for expected_rank, row in enumerate(rows, 1):
+            old_rank = int(row["rank"])
+            if old_rank == expected_rank:
+                continue
+            connection.execute(
+                "UPDATE tasks SET rank=? WHERE task_id=?",
+                (expected_rank, row["task_id"]),
+            )
+            changes.append((row["task_id"], old_rank, expected_rank))
+        return changes
+
     def create_task(self, task: dict[str, Any], part_count: int, now: str,
                     part_specs: Optional[list[dict[str, str]]] = None) -> dict[str, Any]:
         effective_count = len(part_specs) if part_specs is not None else part_count
         if effective_count < 1 or effective_count > 10000:
             raise ValueError("part count must be between 1 and 10000")
         with self.transaction() as connection:
+            self._normalize_active_task_ranks(connection)
             rank = task.get("rank")
             if rank in {None, ""}:
                 rank = int(connection.execute(
-                    "SELECT COALESCE(MAX(rank),0)+1 FROM tasks "
-                    "WHERE deleted=0 AND status!='completed'"
+                    "SELECT COUNT(*)+1 FROM tasks WHERE deleted=0 AND status!='completed'"
                 ).fetchone()[0])
             priority = str(task.get("priority", "medium")).strip().lower() or "medium"
             if priority not in TASK_PRIORITIES:
@@ -392,6 +413,7 @@ class PlatformDatabase:
                 connection, task["task_id"], effective_count,
                 str(task.get("part_prefix", "")), now, part_specs=part_specs,
             )
+            self._normalize_active_task_ranks(connection)
         return self.get_task(str(task["task_id"]), now)
 
     def update_task(self, task_id: str, actor: str, changes: dict[str, str],
@@ -442,6 +464,7 @@ class PlatformDatabase:
             connection.execute(
                 "UPDATE tasks SET deleted=1,updated_at=? WHERE task_id=?", (now, task_id)
             )
+            self._normalize_active_task_ranks(connection)
 
     def update_task_ordering(self, task_id: str, actor: str, *, rank: Optional[int],
                              priority: Optional[str], now: str,
@@ -456,6 +479,7 @@ class PlatformDatabase:
         if clean_priority is not None and clean_priority not in TASK_PRIORITIES:
             raise ValueError("unsupported task priority")
         with self.transaction() as connection:
+            self._normalize_active_task_ranks(connection)
             task = connection.execute(
                 "SELECT status,rank,priority FROM tasks WHERE task_id=? AND deleted=0", (task_id,)
             ).fetchone()
@@ -463,19 +487,35 @@ class PlatformDatabase:
                 raise KeyError(task_id)
             if task["status"] == "completed" and rank is not None:
                 raise ValueError("completed task does not participate in ranking")
-            changes: list[tuple[str, Any, Any]] = []
-            if rank is not None and int(task["rank"]) != rank:
-                changes.append(("rank", int(task["rank"]), rank))
+            if rank is not None:
+                ranked = connection.execute(
+                    "SELECT task_id,rank FROM tasks "
+                    "WHERE deleted=0 AND status!='completed' ORDER BY rank ASC"
+                ).fetchall()
+                desired_rank = min(rank, len(ranked))
+                ordered_ids = [row["task_id"] for row in ranked if row["task_id"] != task_id]
+                ordered_ids.insert(desired_rank - 1, task_id)
+                old_ranks = {row["task_id"]: int(row["rank"]) for row in ranked}
+                for new_rank, ranked_task_id in enumerate(ordered_ids, 1):
+                    old_rank = old_ranks[ranked_task_id]
+                    if old_rank == new_rank:
+                        continue
+                    connection.execute(
+                        "UPDATE tasks SET rank=?,updated_at=? WHERE task_id=?",
+                        (new_rank, now, ranked_task_id),
+                    )
+                    self._insert_audit(
+                        connection, ranked_task_id, actor, "update_ordering", "rank",
+                        old_rank, new_rank, "", now,
+                    )
             if clean_priority is not None and task["priority"] != clean_priority:
-                changes.append(("priority", task["priority"], clean_priority))
-            for field_name, old_value, new_value in changes:
                 connection.execute(
-                    f"UPDATE tasks SET {field_name}=?,updated_at=? WHERE task_id=?",
-                    (new_value, now, task_id),
+                    "UPDATE tasks SET priority=?,updated_at=? WHERE task_id=?",
+                    (clean_priority, now, task_id),
                 )
                 self._insert_audit(
-                    connection, task_id, actor, "update_ordering", field_name,
-                    old_value, new_value, "", now,
+                    connection, task_id, actor, "update_ordering", "priority",
+                    task["priority"], clean_priority, "", now,
                 )
         return self.get_task(task_id, now)
 
@@ -504,16 +544,30 @@ class PlatformDatabase:
         if count < 1 or count > 10000:
             raise ValueError("part count must be between 1 and 10000")
         with self.transaction() as connection:
+            self._normalize_active_task_ranks(connection)
             task = connection.execute(
-                "SELECT publisher,part_prefix FROM tasks WHERE task_id=? AND deleted=0", (task_id,)
+                "SELECT publisher,part_prefix,status FROM tasks WHERE task_id=? AND deleted=0",
+                (task_id,),
             ).fetchone()
             if task is None:
                 raise KeyError(task_id)
             if task["publisher"] != actor:
                 raise PermissionError("only publisher can add parts")
             self._insert_parts(connection, task_id, count, task["part_prefix"], now)
-            connection.execute("UPDATE tasks SET status='in_progress',updated_at=? WHERE task_id=?",
-                               (now, task_id))
+            if task["status"] == "completed":
+                rank = int(connection.execute(
+                    "SELECT COUNT(*)+1 FROM tasks WHERE deleted=0 AND status!='completed'"
+                ).fetchone()[0])
+                connection.execute(
+                    "UPDATE tasks SET status='in_progress',rank=?,updated_at=? WHERE task_id=?",
+                    (rank, now, task_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE tasks SET status='in_progress',updated_at=? WHERE task_id=?",
+                    (now, task_id),
+                )
+            self._normalize_active_task_ranks(connection)
         return self.list_parts(task_id, now)
 
     def delete_part(self, task_id: str, part_id: int, actor: str, now: str) -> dict[str, Any]:
@@ -547,6 +601,7 @@ class PlatformDatabase:
             connection.execute(
                 "UPDATE tasks SET status=?,updated_at=? WHERE task_id=?", (status, now, task_id)
             )
+            self._normalize_active_task_ranks(connection)
         deleted.pop("publisher", None)
         deleted["annotator"] = deleted.get("annotator") or ""
         return deleted
@@ -560,13 +615,19 @@ class PlatformDatabase:
         return result
 
     def list_tasks(self, now: str) -> list[dict[str, Any]]:
+        query = (
+            "SELECT * FROM tasks WHERE deleted=0 "
+            "ORDER BY CASE WHEN status='completed' THEN 1 ELSE 0 END ASC, "
+            "CASE WHEN status!='completed' THEN rank END ASC, "
+            "updated_at DESC,task_id DESC"
+        )
         with self.connection() as connection:
-            rows = connection.execute(
-                "SELECT * FROM tasks WHERE deleted=0 "
-                "ORDER BY CASE WHEN status='completed' THEN 1 ELSE 0 END ASC, "
-                "CASE WHEN status!='completed' THEN rank END ASC, "
-                "updated_at DESC,task_id DESC"
-            ).fetchall()
+            rows = connection.execute(query).fetchall()
+        active_ranks = [int(row["rank"]) for row in rows if row["status"] != "completed"]
+        if active_ranks != list(range(1, len(active_ranks) + 1)):
+            with self.transaction() as connection:
+                self._normalize_active_task_ranks(connection)
+                rows = connection.execute(query).fetchall()
         tasks = []
         for row in rows:
             task = self._task_dict(row)
@@ -853,6 +914,7 @@ class PlatformDatabase:
             ).fetchone()[0])
             connection.execute("UPDATE tasks SET status=?,updated_at=? WHERE task_id=?",
                                ("completed" if remaining == 0 else "in_progress", now, task_id))
+            self._normalize_active_task_ranks(connection)
         return next(item for item in self.list_parts(task_id, now) if item["part_id"] == part_id)
 
     def review_part_time(self, task_id: str, part_id: int, actor: str, decision: str,

@@ -159,12 +159,17 @@ class PlatformDatabaseTests(unittest.TestCase):
             "task-1", "admin", rank=100, priority="urgent",
             now="2026-07-15T10:02:00+08:00", is_admin=True,
         )
-        self.assertEqual(updated["rank"], 100)
+        self.assertEqual(updated["rank"], 2)
         self.assertEqual(updated["priority"], "urgent")
-        self.assertEqual(self.db.list_tasks("2026-07-15T10:03:00+08:00")[0]["task_id"], "task-2")
+        ordered = self.db.list_tasks("2026-07-15T10:03:00+08:00")
+        self.assertEqual([item["task_id"] for item in ordered], ["task-2", "task-1"])
+        self.assertEqual([item["rank"] for item in ordered], [1, 2])
         logs = self.db.list_task_audit_logs("task-1")
         self.assertEqual({log["field_name"] for log in logs}, {"rank", "priority"})
         self.assertTrue(all(log["actor"] == "admin" for log in logs))
+        shifted_logs = self.db.list_task_audit_logs("task-2")
+        self.assertEqual(shifted_logs[0]["field_name"], "rank")
+        self.assertEqual(shifted_logs[0]["actor"], "admin")
         with self.assertRaisesRegex(ValueError, "out of range"):
             self.db.update_task_ordering(
                 "task-1", "admin", rank=0, priority=None,
@@ -190,13 +195,18 @@ class PlatformDatabaseTests(unittest.TestCase):
         created = self.db.create_task(
             task("task-new"), 1, "2026-07-15T10:04:30+08:00"
         )
-        self.assertEqual(created["rank"], 101)
+        self.assertEqual(created["rank"], 3)
+        with self.db.transaction() as connection:
+            connection.execute("UPDATE tasks SET rank=10 WHERE task_id='task-low'")
+            connection.execute("UPDATE tasks SET rank=20 WHERE task_id='task-high'")
+            connection.execute("UPDATE tasks SET rank=30 WHERE task_id='task-new'")
 
         ordered = self.db.list_tasks("2026-07-15T10:05:00+08:00")
         self.assertEqual(
             [item["task_id"] for item in ordered],
             ["task-low", "task-high", "task-new", "task-completed"],
         )
+        self.assertEqual([item["rank"] for item in ordered[:3]], [1, 2, 3])
         with self.assertRaisesRegex(ValueError, "does not participate"):
             self.db.update_task_ordering(
                 "task-completed", "admin", rank=2000, priority=None,
