@@ -283,14 +283,19 @@ class WorkflowPlatformTests(unittest.TestCase):
 
     def test_admin_orders_tasks_and_priority_change_is_audited(self) -> None:
         created = self._publish(TABLE, 1)["tasks"]
-        target_id = created[0]["task_id"]
+        other_id = created[0]["task_id"]
+        target_id = created[1]["task_id"]
+        moved_other = self.client.patch(
+            f"/api/tasks/{other_id}/ordering", json={"rank": 10}
+        )
+        self.assertEqual(moved_other.status_code, 200, moved_other.text)
         updated = self.client.patch(f"/api/tasks/{target_id}/ordering", json={
-            "rank": 999, "priority": "urgent",
+            "rank": 1, "priority": "urgent",
         })
         self.assertEqual(updated.status_code, 200, updated.text)
         tasks = self.client.get("/api/tasks").json()["tasks"]
         self.assertEqual(tasks[0]["task_id"], target_id)
-        self.assertEqual(tasks[0]["rank"], 999)
+        self.assertEqual(tasks[0]["rank"], 1)
         self.assertEqual(tasks[0]["priority"], "urgent")
         detail = self.client.get(f"/api/tasks/{target_id}").json()
         self.assertEqual(

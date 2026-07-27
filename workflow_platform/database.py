@@ -372,7 +372,8 @@ class PlatformDatabase:
             rank = task.get("rank")
             if rank in {None, ""}:
                 rank = int(connection.execute(
-                    "SELECT COALESCE(MAX(rank),0)+1 FROM tasks WHERE deleted=0"
+                    "SELECT COALESCE(MAX(rank),0)+1 FROM tasks "
+                    "WHERE deleted=0 AND status!='completed'"
                 ).fetchone()[0])
             priority = str(task.get("priority", "medium")).strip().lower() or "medium"
             if priority not in TASK_PRIORITIES:
@@ -449,7 +450,7 @@ class PlatformDatabase:
             raise PermissionError("only admin can update task ordering")
         if rank is None and priority is None:
             raise ValueError("rank or priority is required")
-        if rank is not None and (rank < -1_000_000_000 or rank > 1_000_000_000):
+        if rank is not None and (rank < 1 or rank > 1_000_000_000):
             raise ValueError("rank is out of range")
         clean_priority = priority.strip().lower() if priority is not None else None
         if clean_priority is not None and clean_priority not in TASK_PRIORITIES:
@@ -563,7 +564,7 @@ class PlatformDatabase:
             rows = connection.execute(
                 "SELECT * FROM tasks WHERE deleted=0 "
                 "ORDER BY CASE WHEN status='completed' THEN 1 ELSE 0 END ASC, "
-                "CASE WHEN status!='completed' THEN rank END DESC, "
+                "CASE WHEN status!='completed' THEN rank END ASC, "
                 "updated_at DESC,task_id DESC"
             ).fetchall()
         tasks = []
