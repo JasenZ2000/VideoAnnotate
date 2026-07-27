@@ -82,7 +82,7 @@ class PlatformDatabaseTests(unittest.TestCase):
         parts = self.db.list_parts("task-1", "2026-07-15T10:00:00+08:00")
         self.assertEqual([part["name"] for part in parts], ["split_001", "group / split_002"])
         self.assertEqual(parts[1]["work_path"], r"\\server\data\group\split_002")
-        self.assertEqual(self.db.health()["schema_version"], 6)
+        self.assertEqual(self.db.health()["schema_version"], 7)
 
     def test_part_can_pause_resume_and_return(self) -> None:
         self.db.create_task(task(), 1, "2026-07-15T10:00:00+08:00")
@@ -145,6 +145,51 @@ class PlatformDatabaseTests(unittest.TestCase):
         )
         self.assertEqual(reviewed["time_review_status"], "estimate_unreasonable")
         self.assertEqual(reviewed["time_review_actor"], "publisher")
+
+    def test_admin_updates_task_rank_and_priority_with_audit_logs(self) -> None:
+        first = self.db.create_task(task("task-1"), 1, "2026-07-15T10:00:00+08:00")
+        second = self.db.create_task(task("task-2"), 1, "2026-07-15T10:01:00+08:00")
+        self.assertGreater(second["rank"], first["rank"])
+        with self.assertRaises(PermissionError):
+            self.db.update_task_ordering(
+                "task-1", "worker", rank=100, priority="urgent",
+                now="2026-07-15T10:02:00+08:00",
+            )
+        updated = self.db.update_task_ordering(
+            "task-1", "admin", rank=100, priority="urgent",
+            now="2026-07-15T10:02:00+08:00", is_admin=True,
+        )
+        self.assertEqual(updated["rank"], 100)
+        self.assertEqual(updated["priority"], "urgent")
+        self.assertEqual(self.db.list_tasks("2026-07-15T10:03:00+08:00")[0]["task_id"], "task-1")
+        logs = self.db.list_task_audit_logs("task-1")
+        self.assertEqual({log["field_name"] for log in logs}, {"rank", "priority"})
+        self.assertTrue(all(log["actor"] == "admin" for log in logs))
+
+    def test_publisher_deletes_active_part_and_cascades_timing_session(self) -> None:
+        self.db.create_task(task(), 2, "2026-07-15T10:00:00+08:00")
+        claimed = self.db.claim_next_part(
+            "task-1", "worker", "2026-07-15T10:01:00+08:00"
+        )
+        with self.assertRaises(PermissionError):
+            self.db.delete_part(
+                "task-1", claimed["part_id"], "worker", "2026-07-15T10:02:00+08:00"
+            )
+        deleted = self.db.delete_part(
+            "task-1", claimed["part_id"], "publisher", "2026-07-15T10:02:00+08:00"
+        )
+        self.assertEqual(deleted["status"], "in_progress")
+        remaining = self.db.list_parts("task-1", "2026-07-15T10:03:00+08:00")
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["status"], "pending")
+        with self.db.connection() as connection:
+            sessions = connection.execute(
+                "SELECT COUNT(*) FROM part_work_sessions WHERE part_id=?", (claimed["part_id"],)
+            ).fetchone()[0]
+        self.assertEqual(sessions, 0)
+        log = self.db.list_task_audit_logs("task-1")[0]
+        self.assertEqual(log["action"], "delete_part")
+        self.assertEqual(log["actor"], "publisher")
 
     def test_concurrent_claims_get_different_parts(self) -> None:
         self.db.create_task(task(), 2, "2026-07-15T10:00:00+08:00")
@@ -233,6 +278,8 @@ class PlatformDatabaseTests(unittest.TestCase):
         loaded = upgraded.get_task("old", "2026-07-15T10:00:00+08:00")
         self.assertEqual(loaded["publisher"], "old-publisher")
         self.assertEqual(loaded["product_tag"], "")
+        self.assertEqual(loaded["priority"], "medium")
+        self.assertEqual(loaded["rank"], 1)
 
 
 if __name__ == "__main__":

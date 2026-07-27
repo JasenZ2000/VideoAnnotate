@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 PART_STATUSES = ("pending", "in_progress", "paused", "submitted", "rework", "completed")
 TIME_DEVIATION_THRESHOLD = 0.5
+TASK_PRIORITIES = ("low", "medium", "high", "urgent")
 TASK_FIELDS = (
     "application_date",
     "applicant",
@@ -115,6 +116,8 @@ class PlatformDatabase:
                     data_path TEXT NOT NULL DEFAULT '',
                     guide_path TEXT NOT NULL DEFAULT '',
                     expected_part_seconds REAL NOT NULL DEFAULT 0,
+                    priority TEXT NOT NULL DEFAULT 'medium',
+                    rank INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -164,9 +167,23 @@ class PlatformDatabase:
                 );
                 CREATE INDEX IF NOT EXISTS idx_part_comments_part
                     ON part_comments(part_id, comment_id);
+                CREATE TABLE IF NOT EXISTS task_audit_logs (
+                    audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+                    actor TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    field_name TEXT NOT NULL DEFAULT '',
+                    old_value TEXT NOT NULL DEFAULT '',
+                    new_value TEXT NOT NULL DEFAULT '',
+                    detail TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_task_audit_logs_task
+                    ON task_audit_logs(task_id, audit_id DESC);
                 """
             )
             task_columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
+            rank_added = "rank" not in task_columns
             additions = {
                 "publisher": "TEXT NOT NULL DEFAULT ''",
                 "manager": "TEXT NOT NULL DEFAULT ''",
@@ -183,10 +200,16 @@ class PlatformDatabase:
                 "data_path": "TEXT NOT NULL DEFAULT ''",
                 "guide_path": "TEXT NOT NULL DEFAULT ''",
                 "expected_part_seconds": "REAL NOT NULL DEFAULT 0",
+                "priority": "TEXT NOT NULL DEFAULT 'medium'",
+                "rank": "INTEGER NOT NULL DEFAULT 0",
             }
             for column, definition in additions.items():
                 if column not in task_columns:
                     connection.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_rank "
+                "ON tasks(deleted,rank DESC,updated_at DESC)"
+            )
             part_columns = {row["name"] for row in connection.execute("PRAGMA table_info(parts)")}
             if "work_path" not in part_columns:
                 connection.execute("ALTER TABLE parts ADD COLUMN work_path TEXT NOT NULL DEFAULT ''")
@@ -208,6 +231,14 @@ class PlatformDatabase:
             connection.execute(
                 "UPDATE tasks SET manager=publisher WHERE manager='' AND publisher!=''"
             )
+            if rank_added:
+                rows = connection.execute(
+                    "SELECT task_id FROM tasks WHERE deleted=0 ORDER BY updated_at,task_id"
+                ).fetchall()
+                for rank, row in enumerate(rows, 1):
+                    connection.execute(
+                        "UPDATE tasks SET rank=? WHERE task_id=?", (rank, row["task_id"])
+                    )
             connection.execute(
                 "INSERT INTO schema_info(key,value) VALUES('schema_version',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -322,15 +353,36 @@ class PlatformDatabase:
             connection.execute("DELETE FROM user_sessions WHERE token_hash=?", (token_hash,))
 
     # Tasks
+    @staticmethod
+    def _insert_audit(connection: sqlite3.Connection, task_id: str, actor: str,
+                      action: str, field_name: str, old_value: Any,
+                      new_value: Any, detail: str, now: str) -> None:
+        connection.execute(
+            "INSERT INTO task_audit_logs(task_id,actor,action,field_name,old_value,new_value,detail,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (task_id, actor, action, field_name, str(old_value), str(new_value), detail, now),
+        )
+
     def create_task(self, task: dict[str, Any], part_count: int, now: str,
                     part_specs: Optional[list[dict[str, str]]] = None) -> dict[str, Any]:
         effective_count = len(part_specs) if part_specs is not None else part_count
         if effective_count < 1 or effective_count > 10000:
             raise ValueError("part count must be between 1 and 10000")
-        columns = ["task_id", "name", "status", "publisher", "manager", "product_tag",
-                   "part_prefix", *TASK_FIELDS, "created_at", "updated_at"]
-        values = [task.get(column, "") for column in columns]
         with self.transaction() as connection:
+            rank = task.get("rank")
+            if rank in {None, ""}:
+                rank = int(connection.execute(
+                    "SELECT COALESCE(MAX(rank),0)+1 FROM tasks WHERE deleted=0"
+                ).fetchone()[0])
+            priority = str(task.get("priority", "medium")).strip().lower() or "medium"
+            if priority not in TASK_PRIORITIES:
+                raise ValueError("unsupported task priority")
+            columns = ["task_id", "name", "status", "publisher", "manager", "product_tag",
+                       "part_prefix", *TASK_FIELDS, "priority", "rank", "created_at", "updated_at"]
+            values = [
+                priority if column == "priority" else rank if column == "rank" else task.get(column, "")
+                for column in columns
+            ]
             connection.execute(
                 f"INSERT INTO tasks({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
                 values,
@@ -390,6 +442,40 @@ class PlatformDatabase:
                 "UPDATE tasks SET deleted=1,updated_at=? WHERE task_id=?", (now, task_id)
             )
 
+    def update_task_ordering(self, task_id: str, actor: str, *, rank: Optional[int],
+                             priority: Optional[str], now: str,
+                             is_admin: bool = False) -> dict[str, Any]:
+        if not is_admin:
+            raise PermissionError("only admin can update task ordering")
+        if rank is None and priority is None:
+            raise ValueError("rank or priority is required")
+        if rank is not None and (rank < -1_000_000_000 or rank > 1_000_000_000):
+            raise ValueError("rank is out of range")
+        clean_priority = priority.strip().lower() if priority is not None else None
+        if clean_priority is not None and clean_priority not in TASK_PRIORITIES:
+            raise ValueError("unsupported task priority")
+        with self.transaction() as connection:
+            task = connection.execute(
+                "SELECT rank,priority FROM tasks WHERE task_id=? AND deleted=0", (task_id,)
+            ).fetchone()
+            if task is None:
+                raise KeyError(task_id)
+            changes: list[tuple[str, Any, Any]] = []
+            if rank is not None and int(task["rank"]) != rank:
+                changes.append(("rank", int(task["rank"]), rank))
+            if clean_priority is not None and task["priority"] != clean_priority:
+                changes.append(("priority", task["priority"], clean_priority))
+            for field_name, old_value, new_value in changes:
+                connection.execute(
+                    f"UPDATE tasks SET {field_name}=?,updated_at=? WHERE task_id=?",
+                    (new_value, now, task_id),
+                )
+                self._insert_audit(
+                    connection, task_id, actor, "update_ordering", field_name,
+                    old_value, new_value, "", now,
+                )
+        return self.get_task(task_id, now)
+
     def _insert_parts(self, connection: sqlite3.Connection, task_id: str, count: int,
                       prefix: str, now: str,
                       part_specs: Optional[list[dict[str, str]]] = None) -> None:
@@ -427,10 +513,45 @@ class PlatformDatabase:
                                (now, task_id))
         return self.list_parts(task_id, now)
 
+    def delete_part(self, task_id: str, part_id: int, actor: str, now: str) -> dict[str, Any]:
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT p.part_id,p.name,p.status,p.annotator,t.publisher "
+                "FROM parts p JOIN tasks t ON t.task_id=p.task_id "
+                "WHERE p.task_id=? AND p.part_id=? AND t.deleted=0",
+                (task_id, part_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(part_id)
+            if row["publisher"] != actor:
+                raise PermissionError("only publisher can delete part")
+            deleted = dict(row)
+            detail = json.dumps({
+                "part_id": int(row["part_id"]), "name": row["name"],
+                "status": row["status"], "annotator": row["annotator"] or "",
+            }, ensure_ascii=False)
+            self._insert_audit(
+                connection, task_id, actor, "delete_part", "part", detail, "", detail, now
+            )
+            connection.execute("DELETE FROM parts WHERE part_id=?", (part_id,))
+            total = int(connection.execute(
+                "SELECT COUNT(*) FROM parts WHERE task_id=?", (task_id,)
+            ).fetchone()[0])
+            incomplete = int(connection.execute(
+                "SELECT COUNT(*) FROM parts WHERE task_id=? AND status!='completed'", (task_id,)
+            ).fetchone()[0])
+            status = "ready" if total == 0 else "completed" if incomplete == 0 else "in_progress"
+            connection.execute(
+                "UPDATE tasks SET status=?,updated_at=? WHERE task_id=?", (status, now, task_id)
+            )
+        deleted.pop("publisher", None)
+        deleted["annotator"] = deleted.get("annotator") or ""
+        return deleted
+
     def _task_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         result = {key: row[key] for key in (
             "task_id", "name", "status", "publisher", "manager", "product_tag", "part_prefix",
-            "expected_part_seconds",
+            "expected_part_seconds", "priority", "rank",
             *TASK_FIELDS, "created_at", "updated_at"
         )}
         return result
@@ -438,7 +559,7 @@ class PlatformDatabase:
     def list_tasks(self, now: str) -> list[dict[str, Any]]:
         with self.connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM tasks WHERE deleted=0 ORDER BY updated_at DESC,task_id DESC"
+                "SELECT * FROM tasks WHERE deleted=0 ORDER BY rank DESC,updated_at DESC,task_id DESC"
             ).fetchall()
         tasks = []
         for row in rows:
@@ -457,6 +578,15 @@ class PlatformDatabase:
         task = self._task_dict(row)
         task["part_summary"] = self.part_summary(task_id)
         return task
+
+    def list_task_audit_logs(self, task_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT audit_id,actor,action,field_name,old_value,new_value,detail,created_at "
+                "FROM task_audit_logs WHERE task_id=? ORDER BY audit_id DESC LIMIT ?",
+                (task_id, max(1, min(limit, 500))),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def part_summary(self, task_id: str) -> dict[str, int]:
         summary = {status: 0 for status in PART_STATUSES}

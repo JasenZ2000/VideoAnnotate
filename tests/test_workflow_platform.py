@@ -281,9 +281,65 @@ class WorkflowPlatformTests(unittest.TestCase):
         self.assertEqual(returned.json()["part"]["status"], "pending")
         self.assertEqual(returned.json()["part"]["annotator"], "")
 
+    def test_admin_orders_tasks_and_priority_change_is_audited(self) -> None:
+        created = self._publish(TABLE, 1)["tasks"]
+        target_id = created[0]["task_id"]
+        updated = self.client.patch(f"/api/tasks/{target_id}/ordering", json={
+            "rank": 999, "priority": "urgent",
+        })
+        self.assertEqual(updated.status_code, 200, updated.text)
+        tasks = self.client.get("/api/tasks").json()["tasks"]
+        self.assertEqual(tasks[0]["task_id"], target_id)
+        self.assertEqual(tasks[0]["rank"], 999)
+        self.assertEqual(tasks[0]["priority"], "urgent")
+        detail = self.client.get(f"/api/tasks/{target_id}").json()
+        self.assertEqual(
+            {log["field_name"] for log in detail["audit_logs"]}, {"rank", "priority"}
+        )
+        self.assertTrue(all(log["actor"] == "publisher" for log in detail["audit_logs"]))
+
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={
+            "username": "worker", "password": "worker-pass",
+        })
+        denied = self.client.patch(f"/api/tasks/{target_id}/ordering", json={"rank": 1000})
+        self.assertEqual(denied.status_code, 403)
+
+    def test_publisher_deletes_pending_and_active_parts(self) -> None:
+        task_id = self._publish(TABLE.splitlines()[1], 2)["tasks"][0]["task_id"]
+        detail = self.client.get(f"/api/tasks/{task_id}").json()
+        pending_id = detail["parts"][0]["part_id"]
+        deleted_pending = self.client.delete(f"/api/tasks/{task_id}/parts/{pending_id}")
+        self.assertEqual(deleted_pending.status_code, 200, deleted_pending.text)
+        self.assertEqual(deleted_pending.json()["summary"]["total"], 1)
+
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={
+            "username": "worker", "password": "worker-pass",
+        })
+        claimed = self.client.post(f"/api/tasks/{task_id}/parts/claim-next").json()["part"]
+        denied = self.client.delete(f"/api/tasks/{task_id}/parts/{claimed['part_id']}")
+        self.assertEqual(denied.status_code, 403)
+
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={
+            "username": "publisher", "password": "publisher-pass",
+        })
+        deleted_active = self.client.delete(
+            f"/api/tasks/{task_id}/parts/{claimed['part_id']}"
+        )
+        self.assertEqual(deleted_active.status_code, 200, deleted_active.text)
+        self.assertEqual(deleted_active.json()["summary"]["total"], 0)
+        final_detail = self.client.get(f"/api/tasks/{task_id}").json()
+        self.assertEqual(final_detail["parts"], [])
+        self.assertEqual(
+            [log["action"] for log in final_detail["audit_logs"]],
+            ["delete_part", "delete_part"],
+        )
+
     def test_health_and_authentication_contract(self) -> None:
         health = self.client.get("/api/health")
-        self.assertEqual(health.json()["api_schema_version"], 9)
+        self.assertEqual(health.json()["api_schema_version"], 10)
         self.client.post("/api/auth/logout")
         self.assertEqual(self.client.get("/api/tasks").status_code, 401)
 
@@ -293,6 +349,9 @@ class WorkflowPlatformTests(unittest.TestCase):
         self.assertIn("overflow-wrap:anywhere", page.text)
         self.assertIn("window.isSecureContext&&navigator.clipboard", page.text)
         self.assertIn("document.execCommand('copy')", page.text)
+        self.assertIn("priorityName", page.text)
+        self.assertIn("deletePart", page.text)
+        self.assertIn("任务操作日志", page.text)
 
     def test_main_enables_https_and_secure_cookie_with_pem_files(self) -> None:
         cert = Path(self.temporary.name) / "server.crt"

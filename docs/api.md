@@ -14,12 +14,14 @@
 - `GET /api/tasks/{task_id}`
 - `POST /api/tasks/{task_id}/parts`：发布者追加 Part
 - `PATCH /api/tasks/{task_id}`：发布者编辑任务信息
+- `PATCH /api/tasks/{task_id}/ordering`：管理员修改任务排名和优先级
 - `DELETE /api/tasks/{task_id}`：发布者删除任意状态的自有任务
 - `POST /api/tasks/{task_id}/parts/claim-next`：领取下一个 Part，发布者也可领取自己的任务
 - `POST /api/tasks/{task_id}/parts/{part_id}/start-rework`
 - `POST /api/tasks/{task_id}/parts/{part_id}/pause`
 - `POST /api/tasks/{task_id}/parts/{part_id}/resume`
 - `POST /api/tasks/{task_id}/parts/{part_id}/return`
+- `DELETE /api/tasks/{task_id}/parts/{part_id}`：发布者删除任意状态的 Part
 - `POST /api/tasks/{task_id}/parts/{part_id}/submit`
 - `POST /api/tasks/{task_id}/parts/{part_id}/comments`
 - `POST /api/tasks/{task_id}/parts/{part_id}/review`

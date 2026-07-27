@@ -29,7 +29,7 @@ APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 PROJECT_ROOT = APP_DIR.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "platform_tasks"
-API_SCHEMA_VERSION = 9
+API_SCHEMA_VERSION = 10
 SESSION_COOKIE_NAME = "annotation_platform_session"
 SESSION_TTL_DAYS = int(os.environ.get("ANNOTATION_PLATFORM_SESSION_DAYS", "7"))
 PASSWORD_ITERATIONS = 200_000
@@ -114,6 +114,11 @@ class UpdateTaskReq(BaseModel):
     estimated_hours: Optional[str] = None
     data_path: Optional[str] = None
     guide_path: Optional[str] = None
+
+
+class UpdateTaskOrderingReq(BaseModel):
+    rank: Optional[int] = None
+    priority: Optional[str] = None
 
 
 class SubmitPartReq(BaseModel):
@@ -537,6 +542,7 @@ async def list_tasks():
         task["is_manager"] = bool(task.get("manager")) and task["manager"] == actor and not task["is_publisher"]
         task["can_review"] = task["is_publisher"] or user.get("role") == "admin"
         task["can_view_all"] = task["can_review"] or task["is_manager"]
+        task["can_manage_ordering"] = user.get("role") == "admin"
         mine = database().list_parts(task["task_id"], now_iso(), actor)
         task["my_parts"] = len(mine)
         task["my_rework"] = sum(1 for part in mine if part["status"] == "rework")
@@ -560,6 +566,7 @@ async def get_task(task_id: str):
     task["is_manager"] = manager
     task["can_review"] = can_review
     task["can_view_all"] = can_view_all
+    task["can_manage_ordering"] = user.get("role") == "admin"
     task["available_parts"] = task["part_summary"]["pending"]
     if can_view_all:
         task["parts"] = database().list_parts(task_id, now_iso())
@@ -567,6 +574,7 @@ async def get_task(task_id: str):
         task["statistics"] = database().annotator_statistics(task_id, now_iso())
     elif not can_view_all:
         task["parts"] = database().list_parts(task_id, now_iso(), actor)
+    task["audit_logs"] = database().list_task_audit_logs(task_id)
     return task
 
 
@@ -613,6 +621,19 @@ async def delete_task(task_id: str):
     return {"ok": True}
 
 
+@app.patch("/api/tasks/{task_id}/ordering")
+async def update_task_ordering(task_id: str, req: UpdateTaskOrderingReq):
+    user = require_admin()
+    try:
+        task = database().update_task_ordering(
+            task_id, user["username"], rank=req.rank, priority=req.priority,
+            now=now_iso(), is_admin=True,
+        )
+    except BaseException as exc:
+        _raise_database_error(exc)
+    return {"task": task}
+
+
 @app.post("/api/tasks/{task_id}/parts")
 async def add_parts(task_id: str, req: AddPartsReq):
     actor = require_user()["username"]
@@ -621,6 +642,16 @@ async def add_parts(task_id: str, req: AddPartsReq):
     except BaseException as exc:
         _raise_database_error(exc)
     return {"parts": parts, "summary": database().part_summary(task_id)}
+
+
+@app.delete("/api/tasks/{task_id}/parts/{part_id}")
+async def delete_part(task_id: str, part_id: int):
+    actor = require_user()["username"]
+    try:
+        deleted = database().delete_part(task_id, part_id, actor, now_iso())
+    except BaseException as exc:
+        _raise_database_error(exc)
+    return {"deleted": deleted, "summary": database().part_summary(task_id)}
 
 
 @app.post("/api/tasks/{task_id}/parts/claim-next")
