@@ -351,6 +351,8 @@ class WorkflowPlatformTests(unittest.TestCase):
         self.assertIn("document.execCommand('copy')", page.text)
         self.assertIn("priorityName", page.text)
         self.assertIn("deletePart", page.text)
+        self.assertIn("completed=t.status==='completed'", page.text)
+        self.assertIn("ac!==bc", page.text)
         self.assertIn("任务操作日志", page.text)
 
     def test_main_enables_https_and_secure_cookie_with_pem_files(self) -> None:

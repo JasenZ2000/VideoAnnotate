@@ -166,6 +166,34 @@ class PlatformDatabaseTests(unittest.TestCase):
         self.assertEqual({log["field_name"] for log in logs}, {"rank", "priority"})
         self.assertTrue(all(log["actor"] == "admin" for log in logs))
 
+    def test_completed_tasks_are_below_ranked_tasks_and_cannot_be_ranked(self) -> None:
+        self.db.create_task(task("task-low"), 1, "2026-07-15T10:00:00+08:00")
+        self.db.create_task(task("task-high"), 1, "2026-07-15T10:01:00+08:00")
+        self.db.create_task(task("task-completed"), 1, "2026-07-15T10:02:00+08:00")
+        self.db.update_task_ordering(
+            "task-low", "admin", rank=10, priority=None,
+            now="2026-07-15T10:03:00+08:00", is_admin=True,
+        )
+        self.db.update_task_ordering(
+            "task-high", "admin", rank=100, priority=None,
+            now="2026-07-15T10:04:00+08:00", is_admin=True,
+        )
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE tasks SET status='completed',rank=1000 WHERE task_id='task-completed'"
+            )
+
+        ordered = self.db.list_tasks("2026-07-15T10:05:00+08:00")
+        self.assertEqual(
+            [item["task_id"] for item in ordered],
+            ["task-high", "task-low", "task-completed"],
+        )
+        with self.assertRaisesRegex(ValueError, "does not participate"):
+            self.db.update_task_ordering(
+                "task-completed", "admin", rank=2000, priority=None,
+                now="2026-07-15T10:06:00+08:00", is_admin=True,
+            )
+
     def test_publisher_deletes_active_part_and_cascades_timing_session(self) -> None:
         self.db.create_task(task(), 2, "2026-07-15T10:00:00+08:00")
         claimed = self.db.claim_next_part(

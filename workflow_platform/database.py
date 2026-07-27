@@ -456,10 +456,12 @@ class PlatformDatabase:
             raise ValueError("unsupported task priority")
         with self.transaction() as connection:
             task = connection.execute(
-                "SELECT rank,priority FROM tasks WHERE task_id=? AND deleted=0", (task_id,)
+                "SELECT status,rank,priority FROM tasks WHERE task_id=? AND deleted=0", (task_id,)
             ).fetchone()
             if task is None:
                 raise KeyError(task_id)
+            if task["status"] == "completed" and rank is not None:
+                raise ValueError("completed task does not participate in ranking")
             changes: list[tuple[str, Any, Any]] = []
             if rank is not None and int(task["rank"]) != rank:
                 changes.append(("rank", int(task["rank"]), rank))
@@ -559,7 +561,10 @@ class PlatformDatabase:
     def list_tasks(self, now: str) -> list[dict[str, Any]]:
         with self.connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM tasks WHERE deleted=0 ORDER BY rank DESC,updated_at DESC,task_id DESC"
+                "SELECT * FROM tasks WHERE deleted=0 "
+                "ORDER BY CASE WHEN status='completed' THEN 1 ELSE 0 END ASC, "
+                "CASE WHEN status!='completed' THEN rank END DESC, "
+                "updated_at DESC,task_id DESC"
             ).fetchall()
         tasks = []
         for row in rows:
