@@ -317,6 +317,74 @@ class PlatformDatabase:
                 connection.execute("DELETE FROM user_sessions WHERE username=?", (username,))
         return self.get_user(username)
 
+    def delete_user(self, username: str, actor: str, now: str) -> dict[str, int]:
+        with self.transaction() as connection:
+            target = connection.execute(
+                "SELECT username FROM users WHERE username=?", (username,)
+            ).fetchone()
+            if target is None:
+                raise KeyError(username)
+
+            published_tasks = connection.execute(
+                "SELECT task_id,manager FROM tasks WHERE publisher=?", (username,)
+            ).fetchall()
+            for task in published_tasks:
+                connection.execute(
+                    "UPDATE tasks SET publisher=?,manager=?,updated_at=? WHERE task_id=?",
+                    (
+                        actor,
+                        actor if task["manager"] == username else task["manager"],
+                        now,
+                        task["task_id"],
+                    ),
+                )
+                self._insert_audit(
+                    connection, task["task_id"], actor, "delete_user", "publisher",
+                    username, actor, "删除用户后自动转交任务", now,
+                )
+
+            managed_tasks = connection.execute(
+                "SELECT task_id,publisher FROM tasks WHERE manager=?", (username,)
+            ).fetchall()
+            for task in managed_tasks:
+                connection.execute(
+                    "UPDATE tasks SET manager=publisher,updated_at=? WHERE task_id=?",
+                    (now, task["task_id"]),
+                )
+                self._insert_audit(
+                    connection, task["task_id"], actor, "delete_user", "manager",
+                    username, task["publisher"], "删除用户后移除协同查看权限", now,
+                )
+
+            released_parts = connection.execute(
+                "SELECT part_id FROM parts WHERE annotator=? "
+                "AND status IN ('in_progress','paused','rework')",
+                (username,),
+            ).fetchall()
+            for part in released_parts:
+                connection.execute(
+                    "INSERT INTO part_comments(part_id,actor,kind,content,created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (part["part_id"], actor, "return", "用户被管理员删除，Part 自动退回", now),
+                )
+                connection.execute(
+                    "DELETE FROM part_work_sessions WHERE part_id=?", (part["part_id"],)
+                )
+                connection.execute(
+                    "UPDATE parts SET status='pending',annotator=NULL,claimed_at=NULL,"
+                    "submitted_at=NULL,reviewed_at=NULL,work_seconds=0,submission_note='',"
+                    "review_note='',time_review_status='',time_review_note='',time_review_actor='',"
+                    "time_reviewed_at=NULL,updated_at=? WHERE part_id=?",
+                    (now, part["part_id"]),
+                )
+
+            connection.execute("DELETE FROM users WHERE username=?", (username,))
+        return {
+            "transferred_tasks": len(published_tasks),
+            "removed_manager_assignments": len(managed_tasks),
+            "released_parts": len(released_parts),
+        }
+
     def touch_user_login(self, username: str, now: str) -> None:
         with self.transaction() as connection:
             connection.execute(
@@ -664,6 +732,7 @@ class PlatformDatabase:
         for row in rows:
             summary[row["status"]] = int(row["count"])
         summary["total"] = sum(summary.values())
+        summary["annotated"] = summary["submitted"] + summary["completed"]
         return summary
 
     # Parts and timing
@@ -891,13 +960,14 @@ class PlatformDatabase:
             raise ValueError("action must be approve or rework")
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT p.status,t.publisher FROM parts p JOIN tasks t ON t.task_id=p.task_id "
+                "SELECT p.status,t.publisher,t.manager FROM parts p "
+                "JOIN tasks t ON t.task_id=p.task_id "
                 "WHERE p.task_id=? AND p.part_id=?", (task_id, part_id)
             ).fetchone()
             if row is None:
                 raise KeyError(part_id)
-            if row["publisher"] != actor and not is_admin:
-                raise PermissionError("only publisher or admin can review")
+            if actor not in {row["publisher"], row["manager"]} and not is_admin:
+                raise PermissionError("only publisher, manager or admin can review")
             if row["status"] != "submitted":
                 raise ValueError("only submitted part can be reviewed")
             status = "completed" if action == "approve" else "rework"

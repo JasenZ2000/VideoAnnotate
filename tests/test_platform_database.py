@@ -53,6 +53,9 @@ class PlatformDatabaseTests(unittest.TestCase):
             "task-1", claimed["part_id"], "worker", "发现两张模糊图", "2026-07-15T10:11:00+08:00"
         )
         self.assertEqual(submitted["work_seconds"], 600)
+        submitted_summary = self.db.part_summary("task-1")
+        self.assertEqual(submitted_summary["annotated"], 1)
+        self.assertEqual(submitted_summary["completed"], 0)
         rework = self.db.review_part(
             "task-1", claimed["part_id"], "publisher", "rework", "补充漏框", "2026-07-15T10:12:00+08:00"
         )
@@ -67,6 +70,7 @@ class PlatformDatabaseTests(unittest.TestCase):
         self.assertEqual(approved["status"], "completed")
         self.assertEqual(approved["work_seconds"], 900)
         self.assertEqual(len(approved["comments"]), 4)
+        self.assertEqual(self.db.part_summary("task-1")["annotated"], 1)
         stats = self.db.annotator_statistics("task-1", "2026-07-15T10:20:00+08:00")
         self.assertEqual(stats[0]["completed"], 1)
         self.assertEqual(stats[0]["work_seconds"], 900)
@@ -266,7 +270,7 @@ class PlatformDatabaseTests(unittest.TestCase):
         self.db.submit_part(
             "task-1", claimed["part_id"], "worker", "已完成", "2026-07-15T10:02:00+08:00"
         )
-        with self.assertRaisesRegex(PermissionError, "publisher or admin"):
+        with self.assertRaisesRegex(PermissionError, "publisher, manager or admin"):
             self.db.review_part(
                 "task-1", claimed["part_id"], "other-user", "approve", "", "2026-07-15T10:03:00+08:00"
             )
@@ -306,6 +310,32 @@ class PlatformDatabaseTests(unittest.TestCase):
         )
         self.db.update_user("admin", password_hash="new", now="2026-07-15T12:00:00+08:00")
         self.assertIsNone(self.db.get_session_user("token", "2026-07-15T12:01:00+08:00"))
+
+    def test_delete_user_transfers_tasks_and_returns_active_parts(self) -> None:
+        self.db.create_user("admin", "admin-hash", "admin", "管理员", "2026-07-15T10:00:00+08:00")
+        self.db.create_user("publisher", "user-hash", "user", "待删除", "2026-07-15T10:00:00+08:00")
+        self.db.create_task(task(), 1, "2026-07-15T10:01:00+08:00")
+        claimed = self.db.claim_next_part(
+            "task-1", "publisher", "2026-07-15T10:02:00+08:00"
+        )
+
+        summary = self.db.delete_user(
+            "publisher", "admin", "2026-07-15T10:03:00+08:00"
+        )
+        self.assertEqual(summary["transferred_tasks"], 1)
+        self.assertEqual(summary["released_parts"], 1)
+        with self.assertRaises(KeyError):
+            self.db.get_user("publisher")
+        transferred = self.db.get_task("task-1", "2026-07-15T10:04:00+08:00")
+        self.assertEqual(transferred["publisher"], "admin")
+        self.assertEqual(transferred["manager"], "admin")
+        returned = self.db.list_parts("task-1", "2026-07-15T10:04:00+08:00")[0]
+        self.assertEqual(returned["part_id"], claimed["part_id"])
+        self.assertEqual(returned["status"], "pending")
+        self.assertEqual(returned["annotator"], "")
+        log = self.db.list_task_audit_logs("task-1")[0]
+        self.assertEqual(log["action"], "delete_user")
+        self.assertEqual(log["actor"], "admin")
 
     def test_legacy_task_table_is_upgraded_in_place(self) -> None:
         path = Path(self.temporary.name) / "legacy.sqlite3"

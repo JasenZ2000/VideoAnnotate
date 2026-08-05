@@ -238,9 +238,24 @@ class WorkflowPlatformTests(unittest.TestCase):
         detail = self.client.get(f"/api/tasks/{task_id}").json()
         self.assertTrue(detail["is_manager"])
         self.assertTrue(detail["can_view_all"])
-        self.assertFalse(detail["can_review"])
+        self.assertTrue(detail["can_review"])
         self.assertEqual(len(detail["parts"]), 2)
         self.assertIn("statistics", detail)
+        claimed = self.client.post(f"/api/tasks/{task_id}/parts/claim-next").json()["part"]
+        submitted = self.client.post(
+            f"/api/tasks/{task_id}/parts/{claimed['part_id']}/submit", json={"note": "完成"},
+        )
+        self.assertEqual(submitted.status_code, 200, submitted.text)
+        task_list = self.client.get("/api/tasks").json()["tasks"]
+        summary = next(item for item in task_list if item["task_id"] == task_id)["part_summary"]
+        self.assertEqual(summary["annotated"], 1)
+        self.assertEqual(summary["completed"], 0)
+        reviewed = self.client.post(
+            f"/api/tasks/{task_id}/parts/{claimed['part_id']}/review",
+            json={"action": "approve", "note": "协同审核通过"},
+        )
+        self.assertEqual(reviewed.status_code, 200, reviewed.text)
+        self.assertEqual(reviewed.json()["part"]["status"], "completed")
         denied = self.client.patch(f"/api/tasks/{task_id}", json={"project": "denied"})
         self.assertEqual(denied.status_code, 403)
 
@@ -344,9 +359,41 @@ class WorkflowPlatformTests(unittest.TestCase):
 
     def test_health_and_authentication_contract(self) -> None:
         health = self.client.get("/api/health")
-        self.assertEqual(health.json()["api_schema_version"], 10)
+        self.assertEqual(health.json()["api_schema_version"], 12)
         self.client.post("/api/auth/logout")
         self.assertEqual(self.client.get("/api/tasks").status_code, 401)
+
+    def test_admin_resets_and_deletes_user(self) -> None:
+        task_id = self._publish(TABLE.splitlines()[1], 1)["tasks"][0]["task_id"]
+        reset = self.client.patch("/api/users/worker", json={"password": "worker-new-pass"})
+        self.assertEqual(reset.status_code, 200, reset.text)
+
+        self.client.post("/api/auth/logout")
+        old_login = self.client.post("/api/auth/login", json={
+            "username": "worker", "password": "worker-pass",
+        })
+        self.assertEqual(old_login.status_code, 401)
+        new_login = self.client.post("/api/auth/login", json={
+            "username": "worker", "password": "worker-new-pass",
+        })
+        self.assertEqual(new_login.status_code, 200, new_login.text)
+        denied = self.client.delete("/api/users/publisher")
+        self.assertEqual(denied.status_code, 403)
+        claimed = self.client.post(f"/api/tasks/{task_id}/parts/claim-next")
+        self.assertEqual(claimed.status_code, 200, claimed.text)
+
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={
+            "username": "publisher", "password": "publisher-pass",
+        })
+        self_delete = self.client.delete("/api/users/publisher")
+        self.assertEqual(self_delete.status_code, 400)
+        deleted = self.client.delete("/api/users/worker")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(deleted.json()["summary"]["released_parts"], 1)
+        self.assertNotIn("worker", [u["username"] for u in self.client.get("/api/users").json()["users"]])
+        detail = self.client.get(f"/api/tasks/{task_id}").json()
+        self.assertEqual(detail["parts"][0]["status"], "pending")
 
     def test_frontend_has_long_path_wrapping_and_clipboard_fallback(self) -> None:
         page = self.client.get("/")
@@ -356,8 +403,12 @@ class WorkflowPlatformTests(unittest.TestCase):
         self.assertIn("document.execCommand('copy')", page.text)
         self.assertIn("priorityName", page.text)
         self.assertIn("deletePart", page.text)
+        self.assertIn("resetUserPassword", page.text)
+        self.assertIn("deleteManagedUser", page.text)
         self.assertIn("completed=t.status==='completed'", page.text)
         self.assertIn("ac!==bc", page.text)
+        self.assertIn("s.annotated", page.text)
+        self.assertIn("协同审核", page.text)
         self.assertIn("任务操作日志", page.text)
 
     def test_main_enables_https_and_secure_cookie_with_pem_files(self) -> None:

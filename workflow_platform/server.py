@@ -29,7 +29,7 @@ APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 PROJECT_ROOT = APP_DIR.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "platform_tasks"
-API_SCHEMA_VERSION = 10
+API_SCHEMA_VERSION = 12
 SESSION_COOKIE_NAME = "annotation_platform_session"
 SESSION_TTL_DAYS = int(os.environ.get("ANNOTATION_PLATFORM_SESSION_DAYS", "7"))
 PASSWORD_ITERATIONS = 200_000
@@ -470,6 +470,26 @@ async def update_user(username: str, req: UpdateUserReq):
     return {"user": user}
 
 
+@app.delete("/api/users/{username}")
+async def delete_user(username: str):
+    actor = require_admin()
+    target_username = normalize_username(username)
+    if target_username == actor["username"]:
+        raise HTTPException(400, "不能删除当前登录账号")
+    try:
+        target = database().get_user(target_username)
+    except KeyError as exc:
+        raise HTTPException(404, "用户不存在") from exc
+    if (
+        target["role"] == "admin"
+        and target["is_active"]
+        and database().active_admin_count() <= 1
+    ):
+        raise HTTPException(400, "不能删除最后一个管理员")
+    summary = database().delete_user(target_username, actor["username"], now_iso())
+    return {"ok": True, "summary": summary}
+
+
 @app.post("/api/tasks/preview")
 async def preview_tasks(req: PublishTasksReq):
     require_user()
@@ -540,7 +560,7 @@ async def list_tasks():
     for task in tasks:
         task["is_publisher"] = task["publisher"] == actor
         task["is_manager"] = bool(task.get("manager")) and task["manager"] == actor and not task["is_publisher"]
-        task["can_review"] = task["is_publisher"] or user.get("role") == "admin"
+        task["can_review"] = task["is_publisher"] or task["is_manager"] or user.get("role") == "admin"
         task["can_view_all"] = task["can_review"] or task["is_manager"]
         task["can_manage_ordering"] = user.get("role") == "admin"
         mine = database().list_parts(task["task_id"], now_iso(), actor)
@@ -560,7 +580,7 @@ async def get_task(task_id: str):
         raise HTTPException(404, "任务不存在") from exc
     publisher = task["publisher"] == actor
     manager = bool(task.get("manager")) and task["manager"] == actor and not publisher
-    can_review = publisher or user.get("role") == "admin"
+    can_review = publisher or manager or user.get("role") == "admin"
     can_view_all = can_review or manager
     task["is_publisher"] = publisher
     task["is_manager"] = manager

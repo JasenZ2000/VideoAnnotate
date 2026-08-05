@@ -7,7 +7,8 @@
 - `GET /api/health`
 - `GET /api/auth/me`
 - `POST /api/auth/bootstrap-admin|login|logout|change-password`
-- `GET|POST /api/users`、`PATCH /api/users/{username}`
+- `GET|POST /api/users`、`PATCH /api/users/{username}`：管理员创建用户、修改资料或重置密码
+- `DELETE /api/users/{username}`：管理员删除用户；任务自动转交，未提交的在手 Part 自动退回
 - `GET /api/user-options`：获取可指定为协同查看人的启用用户
 - `POST /api/tasks/preview`：解析粘贴的表格行
 - `GET|POST /api/tasks`
@@ -24,7 +25,7 @@
 - `DELETE /api/tasks/{task_id}/parts/{part_id}`：发布者删除任意状态的 Part
 - `POST /api/tasks/{task_id}/parts/{part_id}/submit`
 - `POST /api/tasks/{task_id}/parts/{part_id}/comments`
-- `POST /api/tasks/{task_id}/parts/{part_id}/review`
+- `POST /api/tasks/{task_id}/parts/{part_id}/review`：发布者、协同审核人或管理员审核 Part
 - `POST /api/tasks/{task_id}/parts/{part_id}/time-review`：发布者确认耗时偏差是实际异常还是预估不合理
 
 平台 API 不再包含视频上传、LocateAnything、跟踪、分段或标注导出功能。
