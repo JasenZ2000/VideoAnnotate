@@ -14,7 +14,7 @@ import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import cv2
 from fastapi import APIRouter, HTTPException, Query
@@ -89,6 +89,7 @@ class LocateAnythingImageDirectoryReq(LocateAnythingInferenceReq):
     recursive: bool = False
     max_images: int = Field(default=0, ge=0)
     copy_images: bool = False
+    overwrite: Literal["never", "replace"] = "replace"
 
 
 def _torch() -> Any:
@@ -212,6 +213,32 @@ def _list_image_files(input_dir: Path, recursive: bool, max_images: int = 0) -> 
     return items
 
 
+def _discover_image_directories(
+    root: Path, *, recursive: bool, include_root: bool,
+) -> list[dict[str, Any]]:
+    candidates: list[Path] = [root] if include_root else []
+    iterator = root.rglob("*") if recursive else root.iterdir()
+    candidates.extend(path for path in iterator if path.is_dir() and not path.is_symlink())
+    discovered: list[dict[str, Any]] = []
+    for directory in sorted(set(candidates), key=lambda path: path.as_posix().casefold()):
+        resolved = directory.resolve()
+        if not _is_relative_to(resolved, root):
+            continue
+        image_count = sum(
+            1 for path in resolved.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+        if image_count == 0:
+            continue
+        relative = resolved.relative_to(root)
+        discovered.append({
+            "path": str(resolved),
+            "relative_path": "." if not relative.parts else relative.as_posix(),
+            "image_count": image_count,
+        })
+    return discovered
+
+
 def _validate_image_output_layout(input_dir: Path, output_dir: Path, copy_images: bool) -> None:
     directory_names = ["labels", "annotations"]
     if copy_images:
@@ -224,7 +251,7 @@ def _validate_image_output_layout(input_dir: Path, output_dir: Path, copy_images
             )
 
 
-def _resolve_output_dir(raw_path: str) -> Path:
+def _resolve_output_candidate(raw_path: str) -> Path:
     path = Path(raw_path).expanduser().resolve()
     allowed_roots: list[Path] = SETTINGS.get("output_allowed_roots", [])
     if not allowed_roots:
@@ -232,8 +259,28 @@ def _resolve_output_dir(raw_path: str) -> Path:
     if not any(_is_relative_to(path, root) for root in allowed_roots):
         roots = ", ".join(str(root) for root in allowed_roots)
         raise RuntimeError(f"Output path is outside allowed roots: {roots}")
+    return path
+
+
+def _resolve_output_dir(raw_path: str) -> Path:
+    path = _resolve_output_candidate(raw_path)
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _directory_is_nonempty(path: Path) -> bool:
+    if path.exists() and not path.is_dir():
+        return True
+    return path.is_dir() and next(path.iterdir(), None) is not None
+
+
+def _count_output_files(root: Path, suffixes: set[str] | None = None) -> int:
+    if not root.is_dir():
+        return 0
+    return sum(
+        1 for path in root.rglob("*")
+        if path.is_file() and (suffixes is None or path.suffix.lower() in suffixes)
+    )
 
 
 def _ensure_worker(req: LocateAnythingInferenceReq, device: str) -> Any:
@@ -746,6 +793,15 @@ async def _run_image_job(
 def health_payload() -> dict[str, Any]:
     root_text = str(SETTINGS.get("external_root", "")).strip()
     worker_path = Path(root_text).expanduser() / "locateanything_worker.py" if root_text else None
+    worker_available = bool(worker_path and worker_path.is_file())
+    worker_importable = False
+    worker_import_error = ""
+    if worker_available:
+        try:
+            _worker_type()
+            worker_importable = True
+        except Exception as exc:
+            worker_import_error = str(exc)
     try:
         cuda_available = bool(_torch().cuda.is_available())
     except RuntimeError:
@@ -756,13 +812,16 @@ def health_payload() -> dict[str, Any]:
         "model": str(SETTINGS["model"]),
         "cache_dir": str(SETTINGS["cache_dir"]),
         "external_root": root_text,
-        "worker_available": bool(worker_path and worker_path.is_file()),
+        "worker_available": worker_available,
+        "worker_importable": worker_importable,
+        "worker_import_error": worker_import_error,
         "devices": list(SETTINGS["devices"]),
         "dtype": str(SETTINGS["default_dtype"]),
         "keep_model_loaded": bool(SETTINGS.get("keep_model_loaded", False)),
         "scheduler": "per-device-v1",
         "parallel_jobs": True,
         "image_directory_jobs": True,
+        "image_directory_discovery": True,
         "model_loaded": bool(WORKERS),
         "loaded_workers": [{"device": device, "dtype": dtype} for device, dtype in sorted(WORKERS)],
         "cuda_available": cuda_available,
@@ -792,6 +851,37 @@ async def list_videos(path: str = Query(...), recursive: bool = False) -> dict[s
     return {"ok": True, "input_path": str(source), "videos": [str(video) for video in videos]}
 
 
+@router.get("/image-directories")
+async def list_image_directories(
+    path: str = Query(...),
+    recursive: bool = True,
+    include_root: bool = False,
+    output_root: str = "",
+) -> dict[str, Any]:
+    source = _resolve_image_directory(path)
+    directories = _discover_image_directories(source, recursive=recursive, include_root=include_root)
+    resolved_output: Path | None = None
+    if output_root.strip():
+        resolved_output = _resolve_output_candidate(output_root)
+        if _is_relative_to(resolved_output, source) or _is_relative_to(source, resolved_output):
+            raise HTTPException(400, "Image batch output root must be separate from the input root")
+        for item in directories:
+            relative = Path() if item["relative_path"] == "." else Path(item["relative_path"])
+            destination = (resolved_output / relative / "locany_result").resolve()
+            item["output_dir"] = str(destination)
+            item["output_conflict"] = _directory_is_nonempty(destination)
+    return {
+        "ok": True,
+        "root": str(source),
+        "recursive": recursive,
+        "include_root": include_root,
+        "output_root": str(resolved_output) if resolved_output else "",
+        "directories": directories,
+        "directory_count": len(directories),
+        "total_images": sum(int(item["image_count"]) for item in directories),
+    }
+
+
 @router.post("/image-jobs")
 async def create_image_job(req: LocateAnythingImageDirectoryReq) -> dict[str, Any]:
     if not req.prompt.strip() and not req.question.strip() and not req.categories:
@@ -808,6 +898,8 @@ async def create_image_job(req: LocateAnythingImageDirectoryReq) -> dict[str, An
             _validate_image_output_layout(input_dir, output_dir, req.copy_images)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        if req.overwrite == "never" and _directory_is_nonempty(output_dir):
+            raise HTTPException(409, f"Image output directory is not empty: {output_dir}")
         req.output_dir = str(output_dir)
     job_id = uuid.uuid4().hex
     IMAGE_JOBS[job_id] = {
@@ -832,6 +924,60 @@ async def get_image_job(job_id: str) -> dict[str, Any]:
     public = dict(job)
     public.pop("result_zip_path", None)
     return public
+
+
+@router.get("/image-jobs/{job_id}/validate")
+async def validate_image_job(job_id: str) -> dict[str, Any]:
+    job = IMAGE_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Image job not found")
+    if job.get("status") != "done":
+        raise HTTPException(400, f"Job is not done: {job.get('status')}")
+    direct = str(job.get("direct_output_dir", "")).strip()
+    root = Path(direct) if direct else Path(SETTINGS["cache_dir"]) / job_id
+    metadata_path = root / "metadata.json"
+    errors: list[str] = []
+    metadata: dict[str, Any] = {}
+    if metadata_path.is_file():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append(f"Invalid metadata.json: {exc}")
+    else:
+        errors.append("Missing metadata.json")
+    expected = int(job.get("total_images", metadata.get("total_images", 0)) or 0)
+    labels = _count_output_files(root / "labels", {".txt"})
+    annotations = _count_output_files(root / "annotations", {".xml"})
+    copied_images = _count_output_files(root / "images", IMAGE_EXTENSIONS)
+    raw_path = root / "raw_answers.jsonl"
+    raw_answers = 0
+    if raw_path.is_file():
+        raw_answers = sum(1 for line in raw_path.read_text(encoding="utf-8-sig").splitlines() if line.strip())
+    else:
+        errors.append("Missing raw_answers.jsonl")
+    if expected <= 0:
+        errors.append("Expected image count is unavailable")
+    for name, actual in (("labels", labels), ("annotations", annotations), ("raw answers", raw_answers)):
+        if actual != expected:
+            errors.append(f"Expected {expected} {name}, found {actual}")
+    if metadata.get("copy_images") and copied_images != expected:
+        errors.append(f"Expected {expected} copied images, found {copied_images}")
+    archive = root / "locateanything_images.zip"
+    if not archive.is_file():
+        errors.append("Missing locateanything_images.zip")
+    return {
+        "ok": not errors,
+        "job_id": job_id,
+        "output_dir": str(root),
+        "expected_images": expected,
+        "processed_images": int(job.get("processed_images", 0) or 0),
+        "failed_images": int(job.get("failed_images", 0) or 0),
+        "labels": labels,
+        "annotations": annotations,
+        "raw_answers": raw_answers,
+        "copied_images": copied_images,
+        "errors": errors,
+    }
 
 
 @router.get("/image-jobs/{job_id}/annotations-zip")

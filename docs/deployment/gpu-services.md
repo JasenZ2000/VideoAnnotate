@@ -7,10 +7,13 @@
 - `/api/sam31/...`：目标框提示的视频跟踪；
 - `/api/locateanything/jobs...`：视频逐帧预标注；
 - `/api/locateanything/image-jobs...`：服务器图片目录批量预标注。
+- `/api/locateanything/image-directories`：发现远端根目录中直接包含图片的目录，供单卡顺序批处理客户端规划任务。
 
 LocateAnything 结果 ZIP 中，YOLO 标注位于 `labels/`，Pascal VOC 标注位于 `annotations/`。两个目录按相同的视频名前缀和帧号逐帧对应。
 
 图片目录任务支持 JPG、JPEG、PNG、BMP、WebP 和 TIFF。结果保持输入目录的相对子目录结构，标注分别写入 `labels/` 与 `annotations/`；默认不重复复制原图，设置 `copy_images=true` 时才会复制到 `images/`。图片输入目录必须位于 `LOCANY_ALLOWED_ROOTS` 内，直接输出目录必须位于 `LOCANY_OUTPUT_ALLOWED_ROOTS` 内。服务会拒绝任何可能覆盖或嵌套进输入目录的输出布局。
+
+图片任务支持 `overwrite=never|replace`。Agent 批处理默认使用 `never`，并通过 `/api/locateanything/image-jobs/{job_id}/validate` 校验每个结果目录的标签、XML、元数据、原始回答与 ZIP。
 
 HTTP 服务不要求把两套模型运行时合并到一个 Python 环境。它运行在能加载 LocateAnything 的环境中；SAM3.1 作业由 `SAM31_PYTHON` 指向原有的 ComfyUI 环境后，以子进程方式运行。
 
@@ -96,7 +99,7 @@ curl http://127.0.0.1:9010/api/locateanything/image-jobs/JOB_ID
 curl -OJ http://127.0.0.1:9010/api/locateanything/image-jobs/JOB_ID/annotations-zip
 ```
 
-根健康检查会同时报告两个运行时的配置。LocateAnything 健康结果中的 `worker_available` 应为 `true`；它为 `false` 时，优先检查 `LOCATEANYTHING_ROOT` 是否指向包含 `locateanything_worker.py` 的目录。
+根健康检查会同时报告两个运行时的配置。LocateAnything 健康结果中的 `worker_available` 和 `worker_importable` 均应为 `true`；前者为 `false` 时检查 `LOCATEANYTHING_ROOT` 是否包含 `locateanything_worker.py`，后者为 `false` 时根据 `worker_import_error` 修复运行环境依赖。PyTorch/SymPy 环境至少需要 `mpmath>=1.3`。
 
 ## 进程守护与更新
 
