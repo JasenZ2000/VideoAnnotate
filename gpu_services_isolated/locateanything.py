@@ -39,6 +39,28 @@ LocateAnythingVideoReq = _compat.LocateAnythingVideoReq
 LocateAnythingImageDirectoryReq = _compat.LocateAnythingImageDirectoryReq
 
 
+def _normalize_batch_settings() -> None:
+    """Add isolated-runtime defaults missing from older gpu_services versions."""
+    SETTINGS.setdefault("keep_model_loaded", os.environ.get("LOCANY_KEEP_MODEL_LOADED", "1") == "1")
+    SETTINGS.setdefault("batch_size", max(1, int(os.environ.get("LOCANY_BATCH_SIZE", "4"))))
+    SETTINGS.setdefault("batch_attn", os.environ.get("LOCANY_BATCH_ATTN", "la_flash"))
+    SETTINGS.setdefault("vision_attn", os.environ.get("LOCANY_VISION_ATTN", "auto"))
+    SETTINGS.setdefault("batch_scheduler", os.environ.get("LOCANY_BATCH_SCHEDULER", "pipeline"))
+    SETTINGS.setdefault("batch_group_size", max(0, int(os.environ.get("LOCANY_BATCH_GROUP_SIZE", "0"))))
+    SETTINGS.setdefault("strict_attn", os.environ.get("LOCANY_STRICT_ATTN", "1") == "1")
+    SETTINGS.setdefault("dense_backend", os.environ.get("LOCANY_DENSE_BACKEND", "sdpa"))
+    SETTINGS.setdefault(
+        "min_expected_fps",
+        max(0.0, float(os.environ.get("LOCANY_MIN_EXPECTED_FPS", "0.5"))),
+    )
+
+
+# The isolated service may be deployed beside an older gpu_services module.
+# Own every setting introduced by the batch runtime instead of assuming that
+# the compatibility pipeline already defines it.
+_normalize_batch_settings()
+
+
 class _NoParentCuda:
     """Prevent the HTTP parent from creating CUDA contexts on worker devices."""
 
@@ -186,6 +208,7 @@ def configure(
         allowed_roots=allowed_roots,
         output_allowed_roots=output_allowed_roots,
     )
+    _normalize_batch_settings()
 
 
 def preload_workers() -> list[dict[str, Any]]:
@@ -222,4 +245,3 @@ async def preload_worker_endpoint() -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(500, str(exc)) from exc
     return {"ok": True, "workers": workers}
-

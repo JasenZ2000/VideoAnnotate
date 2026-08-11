@@ -122,6 +122,18 @@ class IsolatedGpuServiceTests(unittest.TestCase):
             locateanything.SETTINGS.clear()
             locateanything.SETTINGS.update(original)
 
+    def test_worker_config_tolerates_legacy_settings_without_dense_backend(self) -> None:
+        original = dict(locateanything.SETTINGS)
+        try:
+            locateanything.SETTINGS.pop("dense_backend", None)
+            with patch.dict("os.environ", {"LOCANY_DENSE_BACKEND": "sdpa"}):
+                locateanything._normalize_batch_settings()
+            config = locateanything._worker_config("cuda:3", "bf16")
+            self.assertEqual(config.dense_backend, "sdpa")
+        finally:
+            locateanything.SETTINGS.clear()
+            locateanything.SETTINGS.update(original)
+
     def test_compatible_job_routes_and_worker_diagnostics_are_exposed(self) -> None:
         paths = TestClient(app).get("/openapi.json").json()["paths"]
         self.assertIn("/api/locateanything/jobs", paths)
