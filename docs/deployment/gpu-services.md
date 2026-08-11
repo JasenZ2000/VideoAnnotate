@@ -45,7 +45,14 @@ export LOCANY_ALLOWED_ROOTS=/data/annotation-transfer/locateanything/videos
 export LOCANY_OUTPUT_ALLOWED_ROOTS=/data/annotation-output/locateanything
 export LOCANY_DEVICES=cuda:0,cuda:1
 export LOCANY_DTYPE=bf16
-export LOCANY_KEEP_MODEL_LOADED=0
+export LOCANY_KEEP_MODEL_LOADED=1
+export LOCANY_BATCH_SIZE=4
+export LOCANY_BATCH_ATTN=la_flash
+export LOCANY_VISION_ATTN=auto
+export LOCANY_BATCH_SCHEDULER=pipeline
+export LOCANY_BATCH_GROUP_SIZE=0
+export LOCANY_STRICT_ATTN=1
+export LOCANY_MIN_EXPECTED_FPS=0.5
 
 export SAM31_COMFY_ROOT=/opt/ComfyUI
 export SAM31_CHECKPOINT=/models/sam3.1_multiplex_fp16.safetensors
@@ -63,7 +70,9 @@ export SAM31_DTYPE=fp16
 
 `LOCANY_DEVICES` 和 `SAM31_DEVICES` 使用逗号分隔设备，例如 `cuda:0,cuda:1`。两个运行时共享同一个设备池：同一张 GPU 同时只运行一个任务，不同 GPU 上的任务可以并行。请求不传 `device`（或传 `auto`）时会自动领取空闲 GPU；传 `cuda:N` 时会固定在该卡排队。请求指定的设备必须存在于对应的 `*_DEVICES` 列表中。
 
-LocateAnything 默认设置 `LOCANY_KEEP_MODEL_LOADED=0`，任务结束后会删除模型 worker、执行 Python GC，并清理对应设备的 CUDA 缓存，从而释放模型占用的显存。CUDA 上下文本身仍可能在 `nvidia-smi` 中保留少量显存，这是 PyTorch 进程级上下文，不是模型泄漏。若更看重连续任务的启动速度，可设为 `1`，代价是每张已使用 GPU 上会常驻一份模型。
+LocateAnything 默认固定使用 `batch-hybrid-4`：LLM 后端为 `la_flash`，调度器为 `pipeline`，并启用严格 attention 检查。服务默认设置 `LOCANY_KEEP_MODEL_LOADED=1`，使每张使用过的 GPU 常驻一份 worker，避免 Batch Tool 连续视频任务反复加载模型。显存必须让给其他服务时可以设为 `0`，任务结束后会删除 worker、执行 Python GC 并清理 CUDA 缓存。
+
+Batch Tool 不提供推理模式调整。它会在连接测试和任务提交前检查 `/api/locateanything/health`，只接受报告为 `runtime=batch`、`generation_mode=hybrid`、`batch_size=4` 的服务，避免误连仍在逐帧 slow 推理的旧版 GPU Services。
 
 SAM3.1 每个任务使用独立子进程，子进程结束时由操作系统释放该任务的全部 CUDA 资源；设备池用于避免多个 SAM3.1 或 LocateAnything 任务同时挤占同一张卡。
 

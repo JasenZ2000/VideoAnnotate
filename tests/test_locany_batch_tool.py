@@ -1,19 +1,30 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
+import json
+import xml.etree.ElementTree as ET
 from unittest import TestCase
 from unittest.mock import patch
+
+import numpy as np
+import cv2
 
 from fastapi.testclient import TestClient
 
 from gpu_services import locateanything
+from locany_batch_tool.frame_extract import extract_video_frames
+from locany_batch_tool.workflow_defaults import build_workflow_defaults, discover_workflow_workspaces
 from locany_batch_tool.server import (
     JOBS,
+    AdaptiveSampleReq,
     BatchReq,
+    MotFilterReq,
     _check_direct_capabilities,
     _images,
     _selected_cuda_devices,
     parse_cuda_devices,
+    run_adaptive_sample,
+    run_mot_filter,
     _remote_videos,
     _run_batch,
     _videos,
@@ -22,6 +33,190 @@ from locany_batch_tool.server import (
 
 
 class LocateAnythingBatchToolTests(TestCase):
+    def test_workflow_defaults_run_frame_mot_voc_and_sampling_without_path_edits(self) -> None:
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory) / "sample"
+            workspace.mkdir()
+            video = workspace / "sample.avi"
+            writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 10.0, (32, 24))
+            self.assertTrue(writer.isOpened())
+            for index in range(3):
+                writer.write(np.full((24, 32, 3), index * 50, dtype=np.uint8))
+            writer.release()
+            raw_labels = workspace / "sample"
+            raw_labels.mkdir()
+            for frame_id in range(1, 4):
+                (raw_labels / f"sample_{frame_id}.txt").write_text(
+                    "0 0.5 0.5 0.25 0.5 0.9\n", encoding="utf-8"
+                )
+            (workspace / "metadata.json").write_text(json.dumps({
+                "width": 32, "height": 24, "class_map": {"person": 0},
+            }), encoding="utf-8")
+
+            self.assertEqual(discover_workflow_workspaces(workspace.parent), [workspace.resolve()])
+            defaults = build_workflow_defaults(workspace)
+            frames = extract_video_frames(
+                defaults["video_path"], output_dir=defaults["frame_output_dir"]
+            )
+            mot = run_mot_filter(MotFilterReq(
+                input_dir=defaults["mot_input_dir"],
+                output_dir=defaults["mot_output_dir"],
+                metadata_path=defaults["metadata_path"],
+                voc_output_dir=defaults["mot_voc_output_dir"],
+                output_voc=True,
+                min_track_len=2,
+            ))
+            sampled = run_adaptive_sample(AdaptiveSampleReq(
+                dataset_dir=defaults["sample_dataset_dir"],
+                output_dir=defaults["sample_output_dir"],
+                mode="uniform",
+                intervals=(1, 1, 1, 1),
+            ))
+
+            self.assertEqual(frames["frames_written"], 3)
+            self.assertEqual(mot["voc_files"], 3)
+            self.assertEqual(sampled["metadata"]["selected_frames"], 3)
+            self.assertEqual(sorted(path.name for path in (workspace / "dataset" / "images").glob("*.jpg")), ["sample_1.jpg", "sample_2.jpg", "sample_3.jpg"])
+            self.assertTrue((workspace / "dataset" / "labels" / "sample_1.txt").is_file())
+            self.assertTrue((workspace / "dataset" / "annotations" / "sample_1.xml").is_file())
+            self.assertTrue((workspace / "dataset_sampled" / "images" / "sample_1.jpg").is_file())
+            self.assertTrue((workspace / "dataset_sampled" / "labels" / "sample_1.txt").is_file())
+            self.assertTrue((workspace / "dataset_sampled" / "annotations" / "sample_1.xml").is_file())
+
+    def test_frame_extract_writes_interval_frames_beside_video(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "sample.avi"
+            writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 10.0, (32, 24))
+            self.assertTrue(writer.isOpened())
+            for index in range(5):
+                writer.write(np.full((24, 32, 3), index * 40, dtype=np.uint8))
+            writer.release()
+
+            result = extract_video_frames(video, frame_interval=2)
+
+            self.assertEqual(result["frames_read"], 5)
+            self.assertEqual(result["frames_written"], 3)
+            self.assertEqual(Path(result["output_dir"]), root.resolve())
+            self.assertEqual(
+                sorted((path.name for path in root.glob("sample_*.jpg")), key=lambda name: int(Path(name).stem.rsplit("_", 1)[1])),
+                ["sample_1.jpg", "sample_3.jpg", "sample_5.jpg"],
+            )
+            with self.assertRaisesRegex(RuntimeError, "already exist"):
+                extract_video_frames(video, frame_interval=2)
+
+    def test_adaptive_sampling_copies_selected_triplets(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "dataset"
+            output = root / "sampled"
+            for folder in ("images", "labels", "annotations"):
+                (dataset / folder).mkdir(parents=True)
+            for frame_id in range(1, 6):
+                cv2.imwrite(str(dataset / "images" / f"sample_{frame_id}.jpg"), np.full((24, 32, 3), frame_id * 20, dtype=np.uint8))
+                (dataset / "labels" / f"sample_{frame_id}.txt").write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+                (dataset / "annotations" / f"sample_{frame_id}.xml").write_text("<annotation/>", encoding="utf-8")
+
+            result = run_adaptive_sample(AdaptiveSampleReq(
+                dataset_dir=str(dataset), output_dir=str(output), mode="uniform", intervals=(2, 2, 2, 2)
+            ))
+
+            self.assertEqual(result["metadata"]["selected_frames"], 3)
+            self.assertEqual(sorted(path.name for path in (output / "images").iterdir()), ["sample_1.jpg", "sample_3.jpg", "sample_5.jpg"])
+            self.assertEqual(sorted(path.name for path in (output / "labels").iterdir()), ["sample_1.txt", "sample_3.txt", "sample_5.txt"])
+            self.assertEqual(sorted(path.name for path in (output / "annotations").iterdir()), ["sample_1.xml", "sample_3.xml", "sample_5.xml"])
+            self.assertTrue((output / "sampling_report.json").is_file())
+
+    def test_adaptive_sampling_preview_does_not_create_output(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "dataset"
+            (dataset / "images").mkdir(parents=True)
+            cv2.imwrite(str(dataset / "images" / "sample_1.jpg"), np.zeros((24, 32, 3), dtype=np.uint8))
+            output = root / "output"
+            result = run_adaptive_sample(AdaptiveSampleReq(
+                dataset_dir=str(dataset), output_dir=str(output), mode="uniform", dry_run=True
+            ))
+            self.assertTrue(result["dry_run"])
+            self.assertFalse(output.exists())
+
+    def test_mot_filter_keeps_long_tracks_and_removes_isolated_detections(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "labels"
+            output = root / "filtered"
+            source.mkdir()
+            for frame_idx in range(12):
+                lines = [f"0 {0.3 + frame_idx * 0.002:.6f} 0.500000 0.100000 0.200000 0.900000"]
+                if frame_idx == 5:
+                    lines.append("0 0.850000 0.200000 0.050000 0.050000 0.950000")
+                # Match LocateAnything: one-based frame id without zero padding.
+                (source / f"sample_{frame_idx + 1}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            result = run_mot_filter(MotFilterReq(input_dir=str(source), output_dir=str(output)))
+
+            self.assertEqual(result["input_detections"], 13)
+            self.assertEqual(result["output_detections"], 12)
+            self.assertEqual(result["removed_detections"], 1)
+            self.assertEqual(result["min_track_len"], 10)
+            self.assertEqual(len((output / "sample_6.txt").read_text(encoding="utf-8").splitlines()), 1)
+            self.assertEqual(len((output / "sample_6.txt").read_text(encoding="utf-8").split()[0:]), 6)
+            self.assertEqual(
+                (output / "sample_1.txt").read_text(encoding="utf-8"),
+                (source / "sample_1.txt").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                {path.name for path in output.glob("*.txt")},
+                {path.name for path in source.glob("*.txt")},
+            )
+
+    def test_mot_filter_optionally_writes_matching_voc_xml_from_metadata(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "labels"
+            output = root / "labels_filtered"
+            source.mkdir()
+            (root / "metadata.json").write_text(json.dumps({
+                "width": 640,
+                "height": 480,
+                "class_map": {"person": 0},
+            }), encoding="utf-8")
+            for frame_id in range(1, 4):
+                lines = [f"0 {0.4 + frame_id * 0.001:.6f} 0.5 0.2 0.4 0.9"]
+                if frame_id == 2:
+                    lines.append("0 0.9 0.1 0.05 0.05 0.8")
+                (source / f"sample_{frame_id}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            result = run_mot_filter(MotFilterReq(
+                input_dir=str(source),
+                output_dir=str(output),
+                min_track_len=2,
+                output_voc=True,
+            ))
+
+            annotations = root / "annotations_filtered"
+            self.assertEqual(result["voc_output_dir"], str(annotations.resolve()))
+            self.assertEqual(result["voc_files"], 3)
+            xml_path = annotations / "sample_2.xml"
+            xml = ET.parse(xml_path).getroot()
+            self.assertEqual(xml.findtext("filename"), "sample_2.jpg")
+            self.assertEqual(xml.findtext("size/width"), "640")
+            self.assertEqual(xml.findtext("size/height"), "480")
+            self.assertEqual([item.findtext("name") for item in xml.findall("object")], ["person"])
+            self.assertEqual(len((output / "sample_2.txt").read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_mot_filter_rejects_output_with_existing_txt_files(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "labels"
+            output = root / "filtered"
+            source.mkdir()
+            output.mkdir()
+            (source / "sample_0.txt").write_text("0 0.5 0.5 0.1 0.1\n", encoding="utf-8")
+            (output / "old.txt").write_text("stale\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "already contains TXT"):
+                run_mot_filter(MotFilterReq(input_dir=str(source), output_dir=str(output), min_track_len=1))
+
     def test_cuda_device_list_parser_and_legacy_single_device(self) -> None:
         self.assertEqual(parse_cuda_devices("0, cuda:2，2,5"), [0, 2, 5])
         with self.assertRaisesRegex(ValueError, "无效"):
@@ -38,6 +233,16 @@ class LocateAnythingBatchToolTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["service"], "locateanything-batch-tool")
         self.assertIn("LocateAnything 批量预标注", client.get("/").text)
+        self.assertIn("MOT 轨迹过滤", client.get("/").text)
+        self.assertIn("/api/mot-filter", {route.path for route in app.routes})
+        self.assertIn("自适应筛帧", client.get("/").text)
+        self.assertIn("/api/adaptive-sample", {route.path for route in app.routes})
+        self.assertNotIn("/api/deduplicate-dataset", {route.path for route in app.routes})
+        self.assertIn("本地视频抽帧", client.get("/").text)
+        self.assertIn("/api/extract-frames", {route.path for route in app.routes})
+        self.assertIn("GPU 预标注", client.get("/").text)
+        self.assertIn("标注处理", client.get("/").text)
+        self.assertIn("数据集工具", client.get("/").text)
 
     def test_video_discovery_filters_extensions(self) -> None:
         with TemporaryDirectory() as directory:
@@ -105,7 +310,12 @@ class LocateAnythingBatchToolTests(TestCase):
         def fake_request(method, url, payload=None, timeout=30):
             calls.append((method, url, payload))
             if url.endswith("/api/locateanything/health"):
-                return {"devices": ["cuda:0", "cuda:1"], "output_allowed_roots": ["/data2"]}
+                return {
+                    "devices": ["cuda:0", "cuda:1"], "output_allowed_roots": ["/data2"],
+                    "runtime": "batch", "generation_mode": "hybrid", "batch_size": 4,
+                    "batch_runtime_supported": True, "batch_utils_available": True,
+                    "kernel_utils_available": True,
+                }
             if url.endswith("/openapi.json"):
                 return {"paths": {"/api/locateanything/image-jobs": {}}}
             if method == "POST":
@@ -113,6 +323,7 @@ class LocateAnythingBatchToolTests(TestCase):
                 self.assertEqual(payload["output_dir"], "/data2/output")
                 self.assertEqual(payload["device"], "cuda:1")
                 self.assertEqual(payload["max_images"], 25)
+                self.assertNotIn("generation_mode", payload)
                 return {"job_id": "image-job"}
             return {"status": "done", "message": "Done", "direct_output_dir": "/data2/output"}
 
@@ -147,9 +358,15 @@ class LocateAnythingBatchToolTests(TestCase):
 
         def fake_request(method, url, payload=None, timeout=30):
             if url.endswith("/api/locateanything/health"):
-                return {"devices": ["cuda:0", "cuda:1"], "parallel_jobs": True}
+                return {
+                    "devices": ["cuda:0", "cuda:1"], "parallel_jobs": True,
+                    "runtime": "batch", "generation_mode": "hybrid", "batch_size": 4,
+                    "batch_runtime_supported": True, "batch_utils_available": True,
+                    "kernel_utils_available": True,
+                }
             if method == "POST":
                 self.assertEqual(payload["video_path"], remote_video)
+                self.assertNotIn("generation_mode", payload)
                 return {"job_id": "remote-job"}
             return {"status": "done", "message": "Done", "direct_output_dir": "/data2/labels/sample"}
 
@@ -176,7 +393,12 @@ class LocateAnythingBatchToolTests(TestCase):
 
         def fake_request(method, url, payload=None, timeout=30):
             if url.endswith("/api/locateanything/health"):
-                return {"devices": ["cuda:0", "cuda:1"], "parallel_jobs": True}
+                return {
+                    "devices": ["cuda:0", "cuda:1"], "parallel_jobs": True,
+                    "runtime": "batch", "generation_mode": "hybrid", "batch_size": 4,
+                    "batch_runtime_supported": True, "batch_utils_available": True,
+                    "kernel_utils_available": True,
+                }
             if method == "POST":
                 with payload_lock:
                     payloads.append(dict(payload))
@@ -215,7 +437,12 @@ class LocateAnythingBatchToolTests(TestCase):
         JOBS[job_id] = {"id": job_id, "status": "queued", "message": "Queued"}
         with patch("locany_batch_tool.server._remote_videos", return_value=["/data2/videos/v.mp4"]), patch(
             "locany_batch_tool.server._json_request",
-            return_value={"devices": ["cuda:0", "cuda:1"], "parallel_jobs": True},
+            return_value={
+                "devices": ["cuda:0", "cuda:1"], "parallel_jobs": True,
+                "runtime": "batch", "generation_mode": "hybrid", "batch_size": 4,
+                "batch_runtime_supported": True, "batch_utils_available": True,
+                "kernel_utils_available": True,
+            },
         ):
             _run_batch(job_id, request)
         self.assertEqual(JOBS[job_id]["status"], "failed")

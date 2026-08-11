@@ -10,12 +10,14 @@
     label{display:block;font-size:13px;color:#526170;margin-bottom:5px}input,select,textarea{width:100%;padding:9px 10px;border:1px solid #c8d1db;border-radius:7px;background:#fff}textarea{min-height:76px;resize:vertical}
     .row{display:flex;gap:10px;align-items:center;margin-top:15px}.row input[type=checkbox]{width:auto}.row label{margin:0}button{border:0;border-radius:7px;padding:10px 17px;background:#1769e0;color:white;cursor:pointer}button.secondary{background:#526170}button:disabled{opacity:.5;cursor:wait}
     pre{white-space:pre-wrap;overflow:auto;background:#111827;color:#d9e6f2;padding:13px;border-radius:8px;min-height:64px}.hidden{display:none}.item{padding:9px 0;border-bottom:1px solid #edf1f5}.ok{color:#16794b}.bad{color:#b42318}
+    .tabs{display:flex;gap:8px;margin:20px 0 8px;border-bottom:1px solid #d4dce5;padding-bottom:8px}.tabs button{background:#e7edf5;color:#344054}.tabs button.active{background:#1769e0;color:#fff}
     @media(max-width:700px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}}
   </style>
 </head>
 <body><main class="page">
   <h1>LocateAnything 批量预标注</h1><div class="sub">独立完成连接测试、批量推理和 YOLO 标注输出</div>
-  <section class="card"><h2>1. 连接与传输</h2><div class="grid">
+  <nav class="tabs"><button data-tab="gpu" onclick="showToolTab('gpu',this)">GPU 预标注</button><button data-tab="annotation" onclick="showToolTab('annotation',this)">标注处理</button><button data-tab="dataset" onclick="showToolTab('dataset',this)">数据集工具</button></nav>
+  <section class="card tool-tab tab-gpu"><h2>1. 连接与传输</h2><div class="grid">
     <div class="wide"><label>GPU Services URL</label><input id="server_url" value="http://192.168.21.226:10114"></div>
     <div><label>模式</label><select id="mode" onchange="toggleMode()"><option value="sftp">SFTP 上传并下载 ZIP</option><option value="direct">共享文件系统直连</option></select></div>
     <div><label>CUDA 设备号（逗号分隔，多卡并行）</label><input id="cuda_devices" value="0" placeholder="例如 0,1,3"></div>
@@ -24,7 +26,7 @@
     <div><label>用户名</label><input id="sftp_username" value="hx"></div><div><label>密码（仅本次运行）</label><input id="sftp_password" type="password"></div>
     <div><label>SSH 私钥（可选）</label><input id="sftp_key_path"></div><div><label>远端缓存目录</label><input id="sftp_remote_dir" value="/data2/DET_Group/ZZS/locateAnything/eagle/Embodied/fast_tmp"></div>
   </div><div class="row"><button class="secondary" onclick="testConnection()">测试 GPU 与 SFTP</button><span id="testStatus"></span></div></section>
-  <section class="card"><h2>2. 输入与输出</h2><div class="grid">
+  <section class="card tool-tab tab-gpu"><h2>2. 输入与输出</h2><div class="grid">
     <div class="wide"><label>视频文件或视频目录</label><input id="input_path" placeholder="D:\videos 或 /data/videos"></div>
     <div class="wide"><label id="outputLabel">本地 ZIP 输出目录</label><input id="output_path" placeholder="D:\labels"></div>
     <div><label>Prompt</label><input id="prompt" value="person"></div><div><label>任务类型</label><select id="task"><option value="ground_multi">ground_multi</option><option value="detect">detect</option><option value="ground_single">ground_single</option></select></div>
@@ -32,18 +34,68 @@
     <div><label>帧间隔</label><input id="frame_step" type="number" min="1" value="1"></div><div><label>最多处理帧数（0=全部）</label><input id="max_frames" type="number" min="0" value="0"></div>
   </div><div class="row"><input id="recursive" type="checkbox"><label for="recursive">递归查找子目录</label><input id="reuse_uploads" type="checkbox" checked><label for="reuse_uploads">复用同大小远端视频</label></div>
   <div class="row"><button id="run" onclick="startBatch()">开始批量预标注</button></div></section>
-  <section class="card"><h2>3. 进度</h2><pre id="status">等待任务</pre><div id="items"></div></section>
+  <section class="card tool-tab tab-gpu"><h2>3. 进度</h2><pre id="status">等待任务</pre><div id="items"></div></section>
+  <section class="card tool-tab tab-dataset"><h2>本地视频抽帧</h2>
+    <div class="sub">按帧间隔抽取 JPG。单独使用时默认写入视频同目录；流程模式输出到 dataset/images。第 0 帧命名为 视频名_1.jpg。</div>
+    <div class="grid" style="margin-top:13px">
+      <div class="wide"><label>视频文件</label><input id="extract_video_path" placeholder="D:\videos\sample.mp4"></div>
+      <div class="wide"><label>图片输出目录（留空则与视频同目录）</label><input id="extract_output_dir" placeholder="D:\workspace\dataset\images"></div>
+      <div><label>帧间隔</label><input id="extract_interval" type="number" min="1" value="1"></div>
+      <div class="row"><input id="extract_overwrite" type="checkbox"><label for="extract_overwrite">允许覆盖同名图片</label></div>
+    </div>
+    <div class="row"><button id="extract_run" onclick="startFrameExtract()">开始抽帧</button></div>
+    <pre id="extract_status">等待任务</pre>
+  </section>
+  <section class="card tool-tab tab-annotation"><h2>本地处理流程默认路径</h2>
+    <div class="sub">选择处理后的单个视频工作区，一键填充抽帧、MOT、VOC 和自适应筛帧路径。</div>
+    <div class="grid" style="margin-top:13px"><div class="wide"><label>当前流程工作区</label><input id="workflow_workspace" placeholder="D:\prelabels\video_name"></div></div>
+    <div class="row"><button onclick="applyWorkflowDefaults()">一键填充默认路径</button></div><pre id="workflow_status">尚未选择工作区</pre>
+  </section>
+  <section class="card tool-tab tab-annotation"><h2>MOT 轨迹过滤（YOLO TXT → YOLO TXT）</h2>
+    <div class="sub">支持 LocateAnything 的 视频名_1.txt（1-based、不补零）以及 视频名_000001.txt。输出保留原文件名，不包含目标 ID。</div>
+    <div class="grid" style="margin-top:13px">
+      <div class="wide"><label>输入 TXT 目录</label><input id="mot_input_dir" placeholder="D:\labels\video"></div>
+      <div class="wide"><label>输出新目录</label><input id="mot_output_dir" placeholder="D:\labels\video_filtered"></div>
+      <div><label>跟踪方法</label><select id="mot_tracking_method"><option>sparse_track</option><option>iou_kalman</option><option>bytetrack</option><option>oc_sort</option><option>bot_sort</option><option>hybrid_sort</option><option>deep_oc_sort</option><option>cbiou</option></select></div>
+      <div><label>匹配 IoU</label><input id="mot_iou_match" type="number" min="0" max="1" step="0.05" value="0.3"></div>
+      <div><label>最大丢失帧</label><input id="mot_max_missed" type="number" min="0" value="15"></div>
+      <div><label>最短轨迹帧数</label><input id="mot_min_track_len" type="number" min="1" value="10"></div>
+      <div><label>双向融合方法</label><select id="mot_fusion_method"><option>bidirectional_iou_all_pairs</option><option>bidirectional_iou</option><option>forward_only</option><option>backward_only</option><option>bidirectional_iou_forward_primary</option><option>bidirectional_iou_forward_unique</option><option>bidirectional_iou_nms</option></select></div>
+      <div><label>融合 IoU</label><input id="mot_iou_fuse" type="number" min="0" max="1" step="0.05" value="0.5"></div>
+      <div class="wide row"><input id="mot_output_voc" type="checkbox"><label for="mot_output_voc">同时输出 Pascal VOC XML</label></div>
+      <div class="wide"><label>VOC XML 输出目录（留空则自动生成 annotations_filtered）</label><input id="mot_voc_output_dir" placeholder="D:\annotations_filtered"></div>
+      <div class="wide"><label>metadata.json（留空则自动读取 TXT 上一级）</label><input id="mot_metadata_path" placeholder="D:\result\metadata.json"></div>
+    </div>
+    <div class="row"><button id="mot_run" onclick="startMotFilter()">开始 MOT 过滤</button></div>
+    <pre id="mot_status">等待任务</pre>
+  </section>
+  <section class="card tool-tab tab-dataset"><h2>自适应筛帧</h2>
+    <div class="sub">根据 MOT 轨迹变化和画面 pHash 动态调整保留间隔，同步复制同名 images、labels、annotations。auto 模式有 labels 时组合两种指标，否则使用 pHash。</div>
+    <div class="grid" style="margin-top:13px">
+      <div class="wide"><label>数据集目录</label><input id="sample_dataset_dir" placeholder="D:\dataset（包含 images，可选 labels/annotations）"></div>
+      <div class="wide"><label>输出新目录</label><input id="sample_output_dir" placeholder="D:\dataset_sampled"></div>
+      <div><label>采样模式</label><select id="sample_mode"><option value="auto">自动（推荐）</option><option value="combined_weighted">MOT + pHash 加权</option><option value="motion">仅 MOT 轨迹</option><option value="phash">仅画面 pHash</option><option value="uniform">固定间隔</option></select></div>
+      <div><label>保留密度</label><select id="sample_intervals"><option value="10,5,3,1">保守（10 / 5 / 3 / 1）</option><option value="20,10,5,2" selected>均衡（20 / 10 / 5 / 2）</option><option value="30,15,7,3">稀疏（30 / 15 / 7 / 3）</option></select></div>
+    </div>
+    <div class="row"><button class="secondary" id="sample_preview" onclick="startAdaptiveSample(true)">预览筛帧结果</button><button id="sample_run" onclick="startAdaptiveSample(false)">执行筛帧复制</button></div>
+    <pre id="sample_status">等待任务</pre>
+  </section>
 </main><script>
 const $=id=>document.getElementById(id);let timer=null;
+function showToolTab(name,button){document.querySelectorAll('.tool-tab').forEach(x=>x.classList.toggle('hidden',!x.classList.contains(`tab-${name}`)));document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('active',x===button));localStorage.setItem('locanyActiveTab',name)}
 function toggleMode(){const direct=$('mode').value==='direct';$('sftp').classList.toggle('hidden',direct);$('outputLabel').textContent=direct?'GPU 服务器输出目录':'本地 ZIP 输出目录';$('testStatus').textContent='';}
 function connection(){return{server_url:$('server_url').value.trim(),mode:$('mode').value,sftp_host:$('sftp_host').value.trim(),sftp_port:+$('sftp_port').value||22,sftp_username:$('sftp_username').value.trim(),sftp_password:$('sftp_password').value,sftp_key_path:$('sftp_key_path').value.trim(),sftp_remote_dir:$('sftp_remote_dir').value.trim()}}
-function saveForm(){const data={...connection(),input_path:$('input_path').value,output_path:$('output_path').value,cuda_devices:$('cuda_devices').value,prompt:$('prompt').value,classes:$('classes').value,task:$('task').value,frame_step:$('frame_step').value,max_frames:$('max_frames').value,recursive:$('recursive').checked,reuse_uploads:$('reuse_uploads').checked};delete data.sftp_password;localStorage.setItem('locanyBatchSettings',JSON.stringify(data))}
+function saveForm(){const data={...connection(),input_path:$('input_path').value,output_path:$('output_path').value,cuda_devices:$('cuda_devices').value,prompt:$('prompt').value,classes:$('classes').value,task:$('task').value,frame_step:$('frame_step').value,max_frames:$('max_frames').value,recursive:$('recursive').checked,reuse_uploads:$('reuse_uploads').checked,workflow_workspace:$('workflow_workspace').value,extract_video_path:$('extract_video_path').value,extract_output_dir:$('extract_output_dir').value,extract_interval:$('extract_interval').value,extract_overwrite:$('extract_overwrite').checked,sample_dataset_dir:$('sample_dataset_dir').value,sample_output_dir:$('sample_output_dir').value,sample_mode:$('sample_mode').value,sample_intervals:$('sample_intervals').value};delete data.sftp_password;localStorage.setItem('locanyBatchSettings',JSON.stringify(data))}
 function loadForm(){try{const data=JSON.parse(localStorage.getItem('locanyBatchSettings')||'{}');if(data.cuda_devices===undefined&&data.cuda_device!==undefined)data.cuda_devices=String(data.cuda_device);for(const[k,v]of Object.entries(data)){const el=$(k);if(!el)continue;if(el.type==='checkbox')el.checked=!!v;else el.value=v}}catch{}}
 function cudaDevices(){const values=[],text=$('cuda_devices').value.replaceAll('，',',');for(const raw of text.split(',')){const value=raw.trim().toLowerCase().replace(/^cuda:/,'');if(!value)continue;if(!/^\d+$/.test(value))throw new Error(`无效的 CUDA 设备号：${raw.trim()}`);const id=+value;if(!values.includes(id))values.push(id)}if(!values.length)throw new Error('请至少填写一个 CUDA 设备号，例如 0 或 0,1');return values}
 function mapping(){const class_map={},categories=[];for(const raw of $('classes').value.split(/\r?\n/)){const line=raw.trim();if(!line)continue;const m=line.match(/^(\d+)\s+(.+)$/);if(!m)throw new Error(`类别映射格式错误: ${line}`);class_map[m[2].trim()]=+m[1];categories.push(m[2].trim())}if(!categories.length)throw new Error('至少填写一个类别');return{class_map,categories}}
 async function request(url,opts={}){const res=await fetch(url,{headers:{'Content-Type':'application/json'},...opts});const data=await res.json();if(!res.ok)throw new Error(data.detail||JSON.stringify(data));return data}
-async function testConnection(){saveForm();const el=$('testStatus');el.textContent='测试中…';el.className='';try{const data=await request('/api/test',{method:'POST',body:JSON.stringify(connection())});const devices=(data.gpu.devices||[data.gpu.device]).filter(Boolean).join(',');el.textContent=`成功：GPU ${devices}/${data.gpu.dtype}${data.sftp?'，SFTP 目录可访问':''}`;el.className='ok'}catch(e){el.textContent=e.message;el.className='bad'}}
+async function testConnection(){saveForm();const el=$('testStatus');el.textContent='测试中…';el.className='';try{const data=await request('/api/test',{method:'POST',body:JSON.stringify(connection())});const devices=(data.gpu.devices||[data.gpu.device]).filter(Boolean).join(',');const profile=`${data.gpu.runtime}-${data.gpu.generation_mode}-${data.gpu.batch_size}`;el.textContent=`成功：GPU ${devices}/${data.gpu.dtype} · ${profile}${data.sftp?'，SFTP 目录可访问':''}`;el.className='ok'}catch(e){el.textContent=e.message;el.className='bad'}}
 async function startBatch(){try{saveForm();const payload={...connection(),...mapping(),input_path:$('input_path').value.trim(),output_path:$('output_path').value.trim(),cuda_devices:cudaDevices(),dtype:'bf16',prompt:$('prompt').value.trim()||'person',task:$('task').value,recursive:$('recursive').checked,reuse_uploads:$('reuse_uploads').checked,frame_step:+$('frame_step').value||1,max_frames:+$('max_frames').value||0};if(!payload.input_path||!payload.output_path)throw new Error('请填写输入和输出路径');$('run').disabled=true;const data=await request('/api/jobs',{method:'POST',body:JSON.stringify(payload)});poll(data.job_id)}catch(e){$('status').textContent=e.message;$('run').disabled=false}}
 async function poll(id){clearTimeout(timer);try{const job=await request(`/api/jobs/${id}`);$('status').textContent=`${job.status}  ${job.completed}/${job.total}\n${job.message}`;$('items').innerHTML=(job.items||[]).map(x=>`<div class="item ${x.status==='done'?'ok':x.status==='failed'?'bad':''}">${x.video} · ${x.assigned_device||x.requested_device||'等待分配'}<br>${x.status} ${x.message||''}${x.output?`<br>→ ${x.output}`:''}</div>`).join('');if(['queued','running'].includes(job.status))timer=setTimeout(()=>poll(id),1500);else $('run').disabled=false}catch(e){$('status').textContent=e.message;$('run').disabled=false}}
-loadForm();toggleMode();
+async function applyWorkflowDefaults(){try{const workspace=$('workflow_workspace').value.trim();if(!workspace)throw new Error('请填写单个视频工作区');const result=await request('/api/workflow-defaults',{method:'POST',body:JSON.stringify({workspace_dir:workspace})});$('extract_video_path').value=result.video_path;$('extract_output_dir').value=result.frame_output_dir;$('mot_input_dir').value=result.mot_input_dir;$('mot_output_dir').value=result.mot_output_dir;$('mot_output_voc').checked=true;$('mot_voc_output_dir').value=result.mot_voc_output_dir;$('mot_metadata_path').value=result.metadata_path;$('sample_dataset_dir').value=result.sample_dataset_dir;$('sample_output_dir').value=result.sample_output_dir;$('workflow_status').textContent='已填充：抽帧 → dataset/images，MOT → dataset/labels + annotations，自适应筛帧 → dataset_sampled';saveForm()}catch(e){$('workflow_status').textContent=e.message}}
+async function startFrameExtract(){const button=$('extract_run');try{saveForm();const payload={video_path:$('extract_video_path').value.trim(),output_dir:$('extract_output_dir').value.trim(),frame_interval:+$('extract_interval').value||1,overwrite:$('extract_overwrite').checked};if(!payload.video_path)throw new Error('请填写需要抽帧的视频路径');button.disabled=true;$('extract_status').textContent='正在读取视频并抽帧…';const result=await request('/api/extract-frames',{method:'POST',body:JSON.stringify(payload)});$('extract_status').textContent=`抽帧完成\n读取帧数：${result.frames_read}\n写出图片：${result.frames_written}\n输出目录：${result.output_dir}\n首张：${result.first_output}\n末张：${result.last_output}`;}catch(e){$('extract_status').textContent=e.message}finally{button.disabled=false}}
+async function startMotFilter(){const button=$('mot_run');try{const payload={input_dir:$('mot_input_dir').value.trim(),output_dir:$('mot_output_dir').value.trim(),tracking_method:$('mot_tracking_method').value,iou_match:+$('mot_iou_match').value,max_missed:+$('mot_max_missed').value,fusion_method:$('mot_fusion_method').value,iou_fuse:+$('mot_iou_fuse').value,min_track_len:+$('mot_min_track_len').value,output_voc:$('mot_output_voc').checked,voc_output_dir:$('mot_voc_output_dir').value.trim(),metadata_path:$('mot_metadata_path').value.trim()};if(!payload.input_dir||!payload.output_dir)throw new Error('请填写输入 TXT 目录和输出新目录');button.disabled=true;$('mot_status').textContent='正在执行 MOT 跟踪与过滤…';const result=await request('/api/mot-filter',{method:'POST',body:JSON.stringify(payload)});$('mot_status').textContent=`过滤完成\n输入检测框：${result.input_detections}\n保留检测框：${result.output_detections}\n删除检测框：${result.removed_detections}\n保留轨迹：${result.tracks_kept}\nTXT 输出：${result.output_dir}${result.voc_output_dir?`\nVOC XML：${result.voc_files} 个\nXML 输出：${result.voc_output_dir}`:''}`;}catch(e){$('mot_status').textContent=e.message}finally{button.disabled=false}}
+async function startAdaptiveSample(dryRun){const buttons=[$('sample_preview'),$('sample_run')];try{const payload={dataset_dir:$('sample_dataset_dir').value.trim(),output_dir:$('sample_output_dir').value.trim(),mode:$('sample_mode').value,intervals:$('sample_intervals').value.split(',').map(Number),dry_run:dryRun};if(!payload.dataset_dir)throw new Error('请填写数据集目录');if(!dryRun&&!payload.output_dir)throw new Error('请填写输出新目录');saveForm();buttons.forEach(x=>x.disabled=true);$('sample_status').textContent='正在分析 MOT 轨迹与画面变化…';const result=await request('/api/adaptive-sample',{method:'POST',body:JSON.stringify(payload)});const m=result.metadata;$('sample_status').textContent=`${dryRun?'预览':'筛帧'}完成\n总帧数：${m.total_frames}\n保留：${m.selected_frames}（${m.selected_percent}%）\n模式：${m.requested_mode} → ${m.effective_mode}\n平均间隔：${m.mean_gap}\n最大间隔：${m.max_gap}${result.output_dir&&!dryRun?`\n输出：${result.output_dir}`:''}${result.warnings.length?`\n警告：${result.warnings.length} 条`:''}`;}catch(e){$('sample_status').textContent=e.message}finally{buttons.forEach(x=>x.disabled=false)}}
+loadForm();toggleMode();const savedTab=localStorage.getItem('locanyActiveTab')||'gpu';const activeButton=document.querySelector(`.tabs button[data-tab="${savedTab}"]`)||document.querySelector('.tabs button');showToolTab(activeButton.dataset.tab,activeButton);
 </script></body></html>

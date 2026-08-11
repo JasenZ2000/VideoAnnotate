@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import copy
 import hashlib
 import json
@@ -75,6 +76,109 @@ class BatchReq(ConnectionReq):
     max_frames: int = 0
     max_images: int = 0
     copy_images: bool = False
+
+
+class MotFilterReq(BaseModel):
+    input_dir: str
+    output_dir: str
+    tracking_method: str = "sparse_track"
+    iou_match: float = Field(default=0.3, ge=0.0, le=1.0)
+    max_missed: int = Field(default=15, ge=0)
+    fusion_method: str = "bidirectional_iou_all_pairs"
+    iou_fuse: float = Field(default=0.5, ge=0.0, le=1.0)
+    min_track_len: int = Field(default=10, ge=1)
+    output_voc: bool = False
+    voc_output_dir: str = ""
+    metadata_path: str = ""
+
+
+class AdaptiveSampleReq(BaseModel):
+    dataset_dir: str
+    output_dir: str = ""
+    mode: str = "auto"
+    intervals: tuple[int, int, int, int] = (20, 10, 5, 2)
+    window_frames: int = Field(default=60, gt=1)
+    stride_frames: int = Field(default=15, gt=0)
+    threshold_quantiles: tuple[float, float, float] = (0.50, 0.75, 0.90)
+    motion_fusion_weight: float = Field(default=0.60, ge=0.0, le=1.0)
+    dry_run: bool = False
+
+
+class FrameExtractReq(BaseModel):
+    video_path: str
+    output_dir: str = ""
+    frame_interval: int = Field(default=1, ge=1)
+    jpeg_quality: int = Field(default=95, ge=1, le=100)
+    overwrite: bool = False
+
+
+class WorkflowDefaultsReq(BaseModel):
+    workspace_dir: str
+
+
+def run_mot_filter(req: MotFilterReq) -> dict[str, Any]:
+    from utils.mot_pipeline.config import DEFAULT_CONFIG, deep_update
+    from utils.mot_pipeline.yolo_filter import filter_yolo_annotations
+
+    config = deep_update(DEFAULT_CONFIG, {
+        "tracking": {
+            "method": req.tracking_method,
+            "iou_match": req.iou_match,
+            "max_missed": req.max_missed,
+        },
+        "fusion": {
+            "method": req.fusion_method,
+            "iou_fuse": req.iou_fuse,
+            "min_track_len": req.min_track_len,
+        },
+    })
+    return filter_yolo_annotations(
+        req.input_dir,
+        req.output_dir,
+        config,
+        output_voc=req.output_voc,
+        voc_output_dir=req.voc_output_dir or None,
+        metadata_path=req.metadata_path or None,
+    )
+
+
+def run_adaptive_sample(req: AdaptiveSampleReq) -> dict[str, object]:
+    from utils.adaptive_frame_sampler import AdaptiveSamplingConfig, sample_dataset
+
+    config = AdaptiveSamplingConfig(
+        mode=req.mode,
+        intervals=req.intervals,
+        window_frames=req.window_frames,
+        stride_frames=req.stride_frames,
+        threshold_quantiles=req.threshold_quantiles,
+        motion_fusion_weight=req.motion_fusion_weight,
+    )
+    cache_path = Path(req.dataset_dir).expanduser().resolve() / ".adaptive_phash_cache.npz"
+    return sample_dataset(
+        dataset_dir=req.dataset_dir,
+        output_dir=req.output_dir or None,
+        config=config,
+        dry_run=req.dry_run,
+        phash_cache_path=cache_path,
+    )
+
+
+def run_frame_extract(req: FrameExtractReq) -> dict[str, object]:
+    from locany_batch_tool.frame_extract import extract_video_frames
+
+    return extract_video_frames(
+        video_path=req.video_path,
+        frame_interval=req.frame_interval,
+        output_dir=req.output_dir or None,
+        jpeg_quality=req.jpeg_quality,
+        overwrite=req.overwrite,
+    )
+
+
+def run_workflow_defaults(req: WorkflowDefaultsReq) -> dict[str, str]:
+    from locany_batch_tool.workflow_defaults import build_workflow_defaults
+
+    return build_workflow_defaults(req.workspace_dir)
 
 
 def parse_cuda_devices(value: str) -> list[int]:
@@ -209,6 +313,29 @@ def _check_task_api(server_url: str, task_kind: str = "video") -> None:
         raise RuntimeError(
             f"GPU Services is too old for this mode: missing {required_path}. "
             "Update the server repository and restart GPU Services."
+        )
+
+
+def _check_inference_profile(health: dict[str, Any]) -> None:
+    actual = (
+        health.get("runtime"),
+        health.get("generation_mode"),
+        health.get("batch_size"),
+    )
+    if actual != ("batch", "hybrid", 4):
+        raise RuntimeError(
+            "GPU Services must run the batch-hybrid-4 LocateAnything profile; "
+            f"reported runtime={actual[0]!r}, generation_mode={actual[1]!r}, "
+            f"batch_size={actual[2]!r}. Update and restart gpu_services."
+        )
+    if health.get("batch_runtime_supported") is not True:
+        raise RuntimeError(
+            "GPU Services LocateAnything worker does not support batch runtime. "
+            "Deploy the updated locateanything_worker.py and restart gpu_services."
+        )
+    if health.get("batch_utils_available") is not True or health.get("kernel_utils_available") is not True:
+        raise RuntimeError(
+            "GPU Services model directory must contain batch_utils and kernel_utils for batch-hybrid-4."
         )
 
 
@@ -365,6 +492,7 @@ def _run_image_batch(job_id: str, req: BatchReq) -> None:
     device = devices[0]
     base = req.server_url.rstrip("/")
     health = _json_request("GET", f"{base}/api/locateanything/health")
+    _check_inference_profile(health)
     enabled = [str(value) for value in health.get("devices", [])]
     if enabled and f"cuda:{device}" not in enabled:
         raise RuntimeError(f"GPU Services has not enabled cuda:{device}; available devices: {', '.join(enabled)}")
@@ -461,6 +589,7 @@ def _run_batch(job_id: str, req: BatchReq) -> None:
                 "请更新服务器仓库并重启 gpu_services；旧服务会显示 "
                 "'Waiting for previous LocateAnything job' 并强制串行。"
             )
+        _check_inference_profile(health)
         enabled = [str(device) for device in health.get("devices", [])]
         if enabled:
             requested = [f"cuda:{device}" for device in devices]
@@ -538,6 +667,7 @@ async def health() -> dict[str, Any]:
 async def test_connection(req: ConnectionReq) -> dict[str, Any]:
     try:
         gpu = _json_request("GET", f"{req.server_url.rstrip('/')}/api/locateanything/health")
+        _check_inference_profile(gpu)
         result: dict[str, Any] = {"ok": True, "gpu": gpu}
         if req.mode == "sftp":
             _check_task_api(req.server_url, req.task_kind)
@@ -565,6 +695,38 @@ async def create_batch(req: BatchReq) -> dict[str, Any]:
     JOB_LOCKS[job_id] = threading.RLock()
     threading.Thread(target=_run_batch, args=(job_id, req), daemon=True).start()
     return {"ok": True, "job_id": job_id}
+
+
+@app.post("/api/mot-filter")
+async def mot_filter(req: MotFilterReq) -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(run_mot_filter, req)
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/adaptive-sample")
+async def adaptive_sample(req: AdaptiveSampleReq) -> dict[str, object]:
+    try:
+        return await asyncio.to_thread(run_adaptive_sample, req)
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/extract-frames")
+async def extract_frames(req: FrameExtractReq) -> dict[str, object]:
+    try:
+        return await asyncio.to_thread(run_frame_extract, req)
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/workflow-defaults")
+async def workflow_defaults(req: WorkflowDefaultsReq) -> dict[str, str]:
+    try:
+        return await asyncio.to_thread(run_workflow_defaults, req)
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.get("/api/jobs/{job_id}")

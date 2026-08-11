@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import importlib
+import inspect
 import json
 import os
 import re
@@ -42,7 +43,14 @@ SETTINGS: dict[str, Any] = {
     "external_root": DEFAULT_EXTERNAL_ROOT,
     "devices": parse_devices(os.environ.get("LOCANY_DEVICES", os.environ.get("LOCANY_DEVICE", "cuda"))),
     "default_dtype": os.environ.get("LOCANY_DTYPE", "bf16"),
-    "keep_model_loaded": os.environ.get("LOCANY_KEEP_MODEL_LOADED", "0") == "1",
+    "keep_model_loaded": os.environ.get("LOCANY_KEEP_MODEL_LOADED", "1") == "1",
+    "batch_size": max(1, int(os.environ.get("LOCANY_BATCH_SIZE", "4"))),
+    "batch_attn": os.environ.get("LOCANY_BATCH_ATTN", "la_flash"),
+    "vision_attn": os.environ.get("LOCANY_VISION_ATTN", "auto"),
+    "batch_scheduler": os.environ.get("LOCANY_BATCH_SCHEDULER", "pipeline"),
+    "batch_group_size": max(0, int(os.environ.get("LOCANY_BATCH_GROUP_SIZE", "0"))),
+    "strict_attn": os.environ.get("LOCANY_STRICT_ATTN", "1") == "1",
+    "min_expected_fps": max(0.0, float(os.environ.get("LOCANY_MIN_EXPECTED_FPS", "0.5"))),
     "allowed_roots": [
         Path(item).expanduser().resolve()
         for item in os.environ.get("LOCANY_ALLOWED_ROOTS", "").split(",")
@@ -66,7 +74,7 @@ class LocateAnythingInferenceReq(BaseModel):
     score: float = 1.0
     resize_long_edge: int = 1024
     resize_scale: float = 1.0
-    generation_mode: str = "slow"
+    generation_mode: Literal["hybrid"] = "hybrid"
     max_new_tokens: int = 512
     temperature: float = 0.0
     use_cache: bool = True
@@ -288,11 +296,22 @@ def _ensure_worker(req: LocateAnythingInferenceReq, device: str) -> Any:
     key = (device, dtype_name)
     with WORKERS_LOCK:
         if key not in WORKERS:
+            model_path = Path(str(SETTINGS["model"])).expanduser()
+            if model_path.is_dir() and str(model_path.resolve()) not in sys.path:
+                # The released worker imports batch_utils/kernel_utils as
+                # top-level packages shipped inside the local model folder.
+                sys.path.insert(0, str(model_path.resolve()))
             worker_type = _worker_type()
             WORKERS[key] = worker_type(
                 str(SETTINGS["model"]),
                 device=device,
                 dtype=_parse_dtype(dtype_name),
+                use_batch_runtime=True,
+                attn=str(SETTINGS["batch_attn"]),
+                vision_attn=str(SETTINGS["vision_attn"]),
+                scheduler=str(SETTINGS["batch_scheduler"]),
+                group_size=int(SETTINGS["batch_group_size"]),
+                strict_attn=bool(SETTINGS["strict_attn"]),
             )
     return WORKERS[key]
 
@@ -336,6 +355,93 @@ def _run_model(worker: Any, image: Image.Image, req: LocateAnythingInferenceReq)
     if req.task == "ground_multi":
         return worker.ground_multi(image, req.prompt, **common)
     raise RuntimeError(f"Unsupported task: {req.task}")
+
+
+def _question_for_request(req: LocateAnythingInferenceReq) -> str:
+    if req.question:
+        return req.question
+    if req.task == "detect":
+        categories = [item.strip() for item in req.categories if item.strip()] or [req.prompt]
+        return f"Locate all the instances that matches the following description: {'</c>'.join(categories)}."
+    if req.task == "ground_single":
+        return f"Locate a single instance that matches the following description: {req.prompt}."
+    if req.task == "ground_multi":
+        return f"Locate all the instances that match the following description: {req.prompt}."
+    raise RuntimeError(f"Unsupported task: {req.task}")
+
+
+def _run_model_batch(
+    worker: Any,
+    images: list[Image.Image],
+    req: LocateAnythingInferenceReq,
+) -> list[dict[str, Any]]:
+    """Run the service's fixed batch-hybrid inference path."""
+    question = _question_for_request(req)
+    results = worker.predict_batch(
+        [(image, question) for image in images],
+        generation_mode="hybrid",
+        max_new_tokens=req.max_new_tokens,
+        temperature=req.temperature,
+        verbose=False,
+    )
+    if len(results) != len(images):
+        raise RuntimeError(
+            f"Batch runtime returned {len(results)} answers for {len(images)} inputs"
+        )
+    return results
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "cuda out of memory" in text or "cuda error: out of memory" in text
+
+
+def _run_model_batch_resilient(
+    worker: Any,
+    images: list[Image.Image],
+    req: LocateAnythingInferenceReq,
+    *,
+    device: str,
+    job: dict[str, Any],
+) -> list[dict[str, Any] | BaseException]:
+    """Preserve row order, halving failed batches down to isolated rows."""
+    try:
+        results = _run_model_batch(worker, images, req)
+        job.setdefault("batch_sizes_used", []).append(len(images))
+        return results
+    except Exception as exc:
+        if _is_cuda_oom(exc):
+            job.setdefault("oom_retries", []).append(
+                {"failed_batch_size": len(images), "error": str(exc)}
+            )
+            if device.startswith("cuda"):
+                torch = _torch()
+            else:
+                torch = None
+            if torch is not None and torch.cuda.is_available():
+                with torch.cuda.device(device):
+                    torch.cuda.empty_cache()
+        if len(images) == 1:
+            return [exc]
+        middle = len(images) // 2
+        return _run_model_batch_resilient(
+            worker, images[:middle], req, device=device, job=job
+        ) + _run_model_batch_resilient(
+            worker, images[middle:], req, device=device, job=job
+        )
+
+
+def _record_throughput_warning(job: dict[str, Any], completed: int, elapsed: float) -> None:
+    threshold = float(SETTINGS.get("min_expected_fps", 0.0))
+    minimum_sample = max(8, int(SETTINGS["batch_size"]) * 2)
+    throughput = completed / max(0.001, elapsed)
+    if threshold > 0 and completed >= minimum_sample and throughput < threshold:
+        job["performance_warning"] = (
+            f"Throughput {throughput:.3f} fps is below the configured {threshold:.3f} fps floor; "
+            "check failed rows, attention backend, GPU utilization, and model/runtime paths."
+        )
+    elif completed >= minimum_sample:
+        job.pop("performance_warning", None)
 
 
 def _normalize_label(label: str) -> str:
@@ -511,12 +617,87 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
             "class_id": req.class_id, "score": req.score, "width": width, "height": height,
             "fps": fps, "frame_count": frame_count, "start_frame": start_frame, "end_frame": end_frame,
             "frame_step": frame_step, "frame_offset": req.frame_offset, "file_prefix": prefix,
+            "runtime": "batch", "generation_mode": "hybrid",
+            "batch_size": int(SETTINGS["batch_size"]),
+            "batch_attn": str(SETTINGS["batch_attn"]),
+            "vision_attn": str(SETTINGS["vision_attn"]),
+            "batch_scheduler": str(SETTINGS["batch_scheduler"]),
         }
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         class_map = _normalized_class_map(req)
         processed = failed = 0
         started = time.perf_counter()
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        selected_total = (max(0, end_frame - start_frame) + frame_step - 1) // frame_step
+        pending: list[dict[str, Any]] = []
+
+        def flush_pending() -> None:
+            nonlocal processed, failed
+            if not pending:
+                return
+            results = _run_model_batch_resilient(
+                worker,
+                [item["inference_image"] for item in pending],
+                req,
+                device=device,
+                job=job,
+            )
+            if device.startswith("cuda") and torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            for item, result_or_error in zip(pending, results):
+                txt_path = item["txt_path"]
+                xml_path = item["xml_path"]
+                if isinstance(result_or_error, BaseException):
+                    failed += 1
+                    _write_text_atomic(txt_path, "")
+                    _write_voc_xml(xml_path, item["image_filename"], width, height, [])
+                    raw_row = {
+                        "frame_idx": item["frame_idx"], "frame_id": item["frame_id"],
+                        "txt": txt_path.name, "xml": xml_path.name,
+                        "error": str(result_or_error),
+                    }
+                else:
+                    answer = str(result_or_error.get("answer", ""))
+                    lines, boxes = [], []
+                    for extracted in _extract_items(answer, width, height):
+                        box = [float(value) for value in extracted["bbox_xyxy"]]
+                        mapped_class_id = _class_id_for_item(extracted, req, class_map)
+                        line = _box_to_yolo_line(box, width, height, mapped_class_id, req.score)
+                        if line is not None:
+                            lines.append(line)
+                            boxes.append({
+                                "label": extracted.get("label") or req.prompt or "object",
+                                "class_id": mapped_class_id,
+                                "bbox_xyxy": box,
+                            })
+                    _write_text_atomic(txt_path, "\n".join(lines) + ("\n" if lines else ""))
+                    _write_voc_xml(xml_path, item["image_filename"], width, height, boxes)
+                    raw_row = {
+                        "frame_idx": item["frame_idx"], "frame_id": item["frame_id"],
+                        "txt": txt_path.name, "xml": xml_path.name,
+                        "answer": answer, "num_boxes": len(lines), "boxes": boxes,
+                        "inference_image_size": list(item["inference_image"].size),
+                        "inference_resize_ratio": item["resize_ratio"],
+                    }
+                    processed += 1
+                with open(raw_path, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(raw_row, ensure_ascii=False) + "\n")
+            pending.clear()
+            completed = processed + failed
+            elapsed = max(0.001, time.perf_counter() - started)
+            _record_throughput_warning(job, completed, elapsed)
+            job.update({
+                "message": (
+                    f"Batch hybrid {int(SETTINGS['batch_size'])}: {completed}/{selected_total} frames "
+                    f"({completed / elapsed:.3f} fps, {failed} failed)"
+                ),
+                "processed_frames": processed,
+                "failed_frames": failed,
+                "attempted_frames": completed,
+                "frames_per_second": completed / elapsed,
+                "successful_frames_per_second": processed / elapsed,
+            })
 
         for frame_idx in range(start_frame, end_frame):
             ok, frame = cap.read()
@@ -536,33 +717,15 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
                 inference_image, resize_ratio = _resize_for_inference(
                     original, req.resize_long_edge, req.resize_scale
                 )
-                result = _run_model(worker, inference_image, req)
-                if device.startswith("cuda") and torch.cuda.is_available():
-                    torch.cuda.synchronize(device)
-                answer = str(result.get("answer", ""))
-                lines, boxes = [], []
-                for item in _extract_items(answer, width, height):
-                    box = [float(value) for value in item["bbox_xyxy"]]
-                    mapped_class_id = _class_id_for_item(item, req, class_map)
-                    line = _box_to_yolo_line(box, width, height, mapped_class_id, req.score)
-                    if line is not None:
-                        lines.append(line)
-                        boxes.append({
-                            "label": item.get("label") or req.prompt or "object",
-                            "class_id": mapped_class_id,
-                            "bbox_xyxy": box,
-                        })
-                _write_text_atomic(txt_path, "\n".join(lines) + ("\n" if lines else ""))
-                _write_voc_xml(xml_path, image_filename, width, height, boxes)
-                with open(raw_path, "a", encoding="utf-8") as handle:
-                    handle.write(json.dumps({
-                        "frame_idx": frame_idx, "frame_id": frame_id,
-                        "txt": txt_path.name, "xml": xml_path.name,
-                        "answer": answer, "num_boxes": len(lines), "boxes": boxes,
-                        "inference_image_size": [inference_image.width, inference_image.height],
-                        "inference_resize_ratio": resize_ratio,
-                    }, ensure_ascii=False) + "\n")
-                processed += 1
+                pending.append({
+                    "frame_idx": frame_idx, "frame_id": frame_id,
+                    "txt_path": txt_path, "xml_path": xml_path,
+                    "image_filename": image_filename,
+                    "inference_image": inference_image,
+                    "resize_ratio": resize_ratio,
+                })
+                if len(pending) >= int(SETTINGS["batch_size"]):
+                    flush_pending()
             except Exception as exc:
                 failed += 1
                 _write_text_atomic(txt_path, "")
@@ -575,10 +738,7 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
                 if device.startswith("cuda") and torch.cuda.is_available():
                     with torch.cuda.device(device):
                         torch.cuda.empty_cache()
-            if processed and processed % 10 == 0:
-                elapsed = max(0.001, time.perf_counter() - started)
-                job["message"] = f"Processed {processed} frames ({processed / elapsed:.3f} fps)"
-                job["processed_frames"], job["failed_frames"] = processed, failed
+        flush_pending()
 
         _write_zip(out_dir, zip_path)
         direct_output_dir = None
@@ -592,12 +752,17 @@ def _run_job_sync(job_id: str, req: LocateAnythingVideoReq, video_path: Path) ->
                     shutil.copytree(source, destination)
                 elif source.exists():
                     shutil.copy2(source, destination)
+        final_message = f"Done: processed {processed} frames, failed {failed}"
+        if job.get("performance_warning"):
+            final_message += f"; WARNING: {job['performance_warning']}"
         job.update({
-            "status": "done", "message": f"Done: processed {processed} frames, failed {failed}",
+            "status": "done", "message": final_message,
             "processed_frames": processed, "failed_frames": failed, "result_zip_path": str(zip_path),
             "labels_dir": str(labels_dir), "annotations_dir": str(annotations_dir),
             "metadata_path": str(metadata_path),
             "direct_output_dir": str(direct_output_dir) if direct_output_dir else "",
+            "runtime": "batch", "generation_mode": "hybrid",
+            "batch_size": int(SETTINGS["batch_size"]),
         })
     except Exception as exc:
         job["status"] = "failed"
@@ -665,11 +830,94 @@ def _run_image_job_sync(
             "score": req.score,
             "total_images": len(image_items),
             "image_extensions": sorted(IMAGE_EXTENSIONS),
+            "runtime": "batch",
+            "generation_mode": "hybrid",
+            "batch_size": int(SETTINGS["batch_size"]),
+            "batch_attn": str(SETTINGS["batch_attn"]),
+            "vision_attn": str(SETTINGS["vision_attn"]),
+            "batch_scheduler": str(SETTINGS["batch_scheduler"]),
         }
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 
         processed = failed = 0
         started = time.perf_counter()
+        pending: list[dict[str, Any]] = []
+
+        def flush_pending() -> None:
+            nonlocal processed, failed
+            if not pending:
+                return
+            results = _run_model_batch_resilient(
+                worker,
+                [item["inference_image"] for item in pending],
+                req,
+                device=device,
+                job=job,
+            )
+            if device.startswith("cuda") and torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            for item, result_or_error in zip(pending, results):
+                txt_path = item["txt_path"]
+                xml_path = item["xml_path"]
+                relative_path = item["relative_path"]
+                width, height = item["image_size"]
+                if isinstance(result_or_error, BaseException):
+                    failed += 1
+                    _write_text_atomic(txt_path, "")
+                    _write_voc_xml(xml_path, relative_path.as_posix(), width, height, [])
+                    raw_row = {
+                        "image": relative_path.as_posix(),
+                        "txt": item["txt_relative"].as_posix(),
+                        "xml": item["xml_relative"].as_posix(),
+                        "error": str(result_or_error),
+                    }
+                else:
+                    answer = str(result_or_error.get("answer", ""))
+                    lines, boxes = [], []
+                    for extracted in _extract_items(answer, width, height):
+                        box = [float(value) for value in extracted["bbox_xyxy"]]
+                        mapped_class_id = _class_id_for_item(extracted, req, class_map)
+                        line = _box_to_yolo_line(box, width, height, mapped_class_id, req.score)
+                        if line is not None:
+                            lines.append(line)
+                            boxes.append({
+                                "label": extracted.get("label") or req.prompt or "object",
+                                "class_id": mapped_class_id,
+                                "bbox_xyxy": box,
+                            })
+                    _write_text_atomic(txt_path, "\n".join(lines) + ("\n" if lines else ""))
+                    _write_voc_xml(xml_path, relative_path.as_posix(), width, height, boxes)
+                    raw_row = {
+                        "image": relative_path.as_posix(),
+                        "txt": item["txt_relative"].as_posix(),
+                        "xml": item["xml_relative"].as_posix(),
+                        "answer": answer,
+                        "num_boxes": len(lines),
+                        "boxes": boxes,
+                        "image_size": [width, height],
+                        "inference_image_size": list(item["inference_image"].size),
+                        "inference_resize_ratio": item["resize_ratio"],
+                    }
+                    processed += 1
+                with open(raw_path, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(raw_row, ensure_ascii=False) + "\n")
+            pending.clear()
+            completed = processed + failed
+            elapsed = max(0.001, time.perf_counter() - started)
+            _record_throughput_warning(job, completed, elapsed)
+            job.update({
+                "message": (
+                    f"Batch hybrid {int(SETTINGS['batch_size'])}: "
+                    f"{completed}/{len(image_items)} images "
+                    f"({completed / elapsed:.3f} images/s, {failed} failed)"
+                ),
+                "processed_images": processed,
+                "failed_images": failed,
+                "attempted_images": completed,
+                "images_per_second": completed / elapsed,
+                "successful_images_per_second": processed / elapsed,
+            })
+
         for image_path, relative_path in image_items:
             txt_relative = relative_path.with_suffix(".txt")
             xml_relative = relative_path.with_suffix(".xml")
@@ -687,37 +935,18 @@ def _run_image_job_sync(
                 inference_image, resize_ratio = _resize_for_inference(
                     original, req.resize_long_edge, req.resize_scale
                 )
-                result = _run_model(worker, inference_image, req)
-                if device.startswith("cuda") and torch.cuda.is_available():
-                    torch.cuda.synchronize(device)
-                answer = str(result.get("answer", ""))
-                lines, boxes = [], []
-                for item in _extract_items(answer, width, height):
-                    box = [float(value) for value in item["bbox_xyxy"]]
-                    mapped_class_id = _class_id_for_item(item, req, class_map)
-                    line = _box_to_yolo_line(box, width, height, mapped_class_id, req.score)
-                    if line is not None:
-                        lines.append(line)
-                        boxes.append({
-                            "label": item.get("label") or req.prompt or "object",
-                            "class_id": mapped_class_id,
-                            "bbox_xyxy": box,
-                        })
-                _write_text_atomic(txt_path, "\n".join(lines) + ("\n" if lines else ""))
-                _write_voc_xml(xml_path, relative_path.as_posix(), width, height, boxes)
-                with open(raw_path, "a", encoding="utf-8") as handle:
-                    handle.write(json.dumps({
-                        "image": relative_path.as_posix(),
-                        "txt": txt_relative.as_posix(),
-                        "xml": xml_relative.as_posix(),
-                        "answer": answer,
-                        "num_boxes": len(lines),
-                        "boxes": boxes,
-                        "image_size": [width, height],
-                        "inference_image_size": [inference_image.width, inference_image.height],
-                        "inference_resize_ratio": resize_ratio,
-                    }, ensure_ascii=False) + "\n")
-                processed += 1
+                pending.append({
+                    "relative_path": relative_path,
+                    "txt_relative": txt_relative,
+                    "xml_relative": xml_relative,
+                    "txt_path": txt_path,
+                    "xml_path": xml_path,
+                    "image_size": (width, height),
+                    "inference_image": inference_image,
+                    "resize_ratio": resize_ratio,
+                })
+                if len(pending) >= int(SETTINGS["batch_size"]):
+                    flush_pending()
             except Exception as exc:
                 failed += 1
                 _write_text_atomic(txt_path, "")
@@ -732,14 +961,7 @@ def _run_image_job_sync(
                 if device.startswith("cuda") and torch.cuda.is_available():
                     with torch.cuda.device(device):
                         torch.cuda.empty_cache()
-            completed = processed + failed
-            elapsed = max(0.001, time.perf_counter() - started)
-            job.update({
-                "message": f"Processed {completed}/{len(image_items)} images ({completed / elapsed:.3f} images/s)",
-                "current_image": relative_path.as_posix(),
-                "processed_images": processed,
-                "failed_images": failed,
-            })
+        flush_pending()
 
         _write_zip(out_dir, zip_path)
         direct_output_dir = None
@@ -756,9 +978,12 @@ def _run_image_job_sync(
                     shutil.copytree(source, destination)
                 elif source.exists():
                     shutil.copy2(source, destination)
+        final_message = f"Done: processed {processed} images, failed {failed}"
+        if job.get("performance_warning"):
+            final_message += f"; WARNING: {job['performance_warning']}"
         job.update({
             "status": "done",
-            "message": f"Done: processed {processed} images, failed {failed}",
+            "message": final_message,
             "processed_images": processed,
             "failed_images": failed,
             "result_zip_path": str(zip_path),
@@ -767,6 +992,9 @@ def _run_image_job_sync(
             "annotations_dir": str(annotations_dir),
             "metadata_path": str(metadata_path),
             "direct_output_dir": str(direct_output_dir) if direct_output_dir else "",
+            "runtime": "batch",
+            "generation_mode": "hybrid",
+            "batch_size": int(SETTINGS["batch_size"]),
         })
     except Exception as exc:
         job["status"] = "failed"
@@ -796,12 +1024,20 @@ def health_payload() -> dict[str, Any]:
     worker_available = bool(worker_path and worker_path.is_file())
     worker_importable = False
     worker_import_error = ""
+    batch_runtime_supported = False
     if worker_available:
         try:
-            _worker_type()
+            worker_type = _worker_type()
             worker_importable = True
+            parameters = inspect.signature(worker_type.__init__).parameters
+            batch_runtime_supported = all(
+                name in parameters
+                for name in ("use_batch_runtime", "attn", "vision_attn", "scheduler", "group_size")
+            )
         except Exception as exc:
             worker_import_error = str(exc)
+    model_path = Path(str(SETTINGS["model"])).expanduser()
+    local_model = model_path.is_dir()
     try:
         cuda_available = bool(_torch().cuda.is_available())
     except RuntimeError:
@@ -815,9 +1051,21 @@ def health_payload() -> dict[str, Any]:
         "worker_available": worker_available,
         "worker_importable": worker_importable,
         "worker_import_error": worker_import_error,
+        "batch_runtime_supported": batch_runtime_supported,
+        "batch_utils_available": bool(local_model and (model_path / "batch_utils").is_dir()),
+        "kernel_utils_available": bool(local_model and (model_path / "kernel_utils").is_dir()),
         "devices": list(SETTINGS["devices"]),
         "dtype": str(SETTINGS["default_dtype"]),
         "keep_model_loaded": bool(SETTINGS.get("keep_model_loaded", False)),
+        "runtime": "batch",
+        "generation_mode": "hybrid",
+        "batch_size": int(SETTINGS["batch_size"]),
+        "batch_attn": str(SETTINGS["batch_attn"]),
+        "vision_attn": str(SETTINGS["vision_attn"]),
+        "batch_scheduler": str(SETTINGS["batch_scheduler"]),
+        "batch_group_size": int(SETTINGS["batch_group_size"]),
+        "strict_attn": bool(SETTINGS["strict_attn"]),
+        "min_expected_fps": float(SETTINGS["min_expected_fps"]),
         "scheduler": "per-device-v1",
         "parallel_jobs": True,
         "image_directory_jobs": True,

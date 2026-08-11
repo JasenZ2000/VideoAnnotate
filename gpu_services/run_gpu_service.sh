@@ -16,7 +16,7 @@ export GPU_SERVICE_PORT="${GPU_SERVICE_PORT:-10114}"
 
 # LocateAnything runs in this process. This external directory must contain
 # locateanything_worker.py and its model dependencies must exist in this Python environment.
-export LOCATEANYTHING_ROOT="${LOCATEANYTHING_ROOT:-/data2/DET_Group/ZZS/locateAnything/eagle/Embodied}"
+export LOCATEANYTHING_ROOT="${LOCATEANYTHING_ROOT:-/data2/DET_Group/ZZS/locateAnything/eagle_new/Embodied}"
 export LOCANY_MODEL="${LOCANY_MODEL:-/data2/DET_Group/ZZS/locateAnything/eagle/Embodied/pretrain/LocateAnything-3B}"
 export LOCANY_CACHE_DIR="${LOCANY_CACHE_DIR:-/data2/DET_Group/ZZS/locateAnything/eagle/Embodied/fast_tmp}"
 export LOCANY_ALLOWED_ROOTS="${LOCANY_ALLOWED_ROOTS:-/data2/DET_Group}"
@@ -25,9 +25,16 @@ export LOCANY_OUTPUT_ALLOWED_ROOTS="${LOCANY_OUTPUT_ALLOWED_ROOTS:-/data2/DET_Gr
 # A request without device (or with device="auto") is assigned to the next free GPU.
 export LOCANY_DEVICES="cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7"
 export LOCANY_DTYPE="${LOCANY_DTYPE:-bf16}"
-# 0 unloads the model after every job so model VRAM is returned. Set 1 to trade
-# persistent VRAM usage for faster startup of subsequent jobs.
-export LOCANY_KEEP_MODEL_LOADED="${LOCANY_KEEP_MODEL_LOADED:-0}"
+# LocateAnything service inference is fixed to batch hybrid. The Batch Tool
+# intentionally does not expose these implementation details to operators.
+export LOCANY_KEEP_MODEL_LOADED="${LOCANY_KEEP_MODEL_LOADED:-1}"
+export LOCANY_BATCH_SIZE="${LOCANY_BATCH_SIZE:-4}"
+export LOCANY_BATCH_ATTN="${LOCANY_BATCH_ATTN:-la_flash}"
+export LOCANY_VISION_ATTN="${LOCANY_VISION_ATTN:-auto}"
+export LOCANY_BATCH_SCHEDULER="${LOCANY_BATCH_SCHEDULER:-pipeline}"
+export LOCANY_BATCH_GROUP_SIZE="${LOCANY_BATCH_GROUP_SIZE:-0}"
+export LOCANY_STRICT_ATTN="${LOCANY_STRICT_ATTN:-1}"
+export LOCANY_MIN_EXPECTED_FPS="${LOCANY_MIN_EXPECTED_FPS:-0.5}"
 
 # SAM3.1 remains in its existing ComfyUI environment. The unified service starts
 # its runner through SAM31_PYTHON, so this does not have to be the current Python.
@@ -53,6 +60,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 echo "Starting unified GPU service at http://${GPU_SERVICE_HOST}:${GPU_SERVICE_PORT}"
 echo "LocateAnything root: $LOCATEANYTHING_ROOT"
 echo "LocateAnything devices: $LOCANY_DEVICES (keep model loaded: $LOCANY_KEEP_MODEL_LOADED)"
+echo "LocateAnything inference: batch-hybrid-${LOCANY_BATCH_SIZE} ($LOCANY_BATCH_ATTN, vision: $LOCANY_VISION_ATTN)"
 echo "SAM3.1 runner Python: $SAM31_PYTHON"
 echo "SAM3.1 runner: $SAM31_RUNNER"
 echo "SAM3.1 devices: $SAM31_DEVICES"

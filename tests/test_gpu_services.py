@@ -49,6 +49,75 @@ class GpuServicesTests(unittest.TestCase):
         self.assertTrue(payload["locateanything"]["image_directory_jobs"])
         self.assertTrue(payload["locateanything"]["image_directory_discovery"])
         self.assertEqual(payload["locateanything"]["scheduler"], "per-device-v1")
+        self.assertEqual(payload["locateanything"]["runtime"], "batch")
+        self.assertEqual(payload["locateanything"]["generation_mode"], "hybrid")
+        self.assertEqual(payload["locateanything"]["batch_size"], 4)
+
+    def test_locateanything_request_defaults_to_hybrid_only(self) -> None:
+        request = locateanything.LocateAnythingInferenceReq()
+        self.assertEqual(request.generation_mode, "hybrid")
+        with self.assertRaises(ValueError):
+            locateanything.LocateAnythingInferenceReq(generation_mode="slow")
+
+    def test_locateanything_worker_uses_batch_runtime_defaults(self) -> None:
+        calls = []
+
+        class FakeWorker:
+            def __init__(self, *args, **kwargs):
+                calls.append((args, kwargs))
+
+        original_workers = dict(locateanything.WORKERS)
+        locateanything.WORKERS.clear()
+        try:
+            with patch.object(locateanything, "_worker_type", return_value=FakeWorker), patch.object(
+                locateanything, "_parse_dtype", return_value="bf16"
+            ):
+                locateanything._ensure_worker(locateanything.LocateAnythingInferenceReq(), "cuda:0")
+        finally:
+            locateanything.WORKERS.clear()
+            locateanything.WORKERS.update(original_workers)
+        self.assertTrue(calls[0][1]["use_batch_runtime"])
+        self.assertEqual(calls[0][1]["attn"], "la_flash")
+        self.assertEqual(calls[0][1]["scheduler"], "pipeline")
+        self.assertTrue(calls[0][1]["strict_attn"])
+
+    def test_run_model_batch_uses_hybrid_and_preserves_batch_size(self) -> None:
+        calls = []
+
+        class FakeWorker:
+            def predict_batch(self, pairs, **kwargs):
+                calls.append((pairs, kwargs))
+                return [{"answer": str(index)} for index in range(len(pairs))]
+
+        images = [Image.new("RGB", (8, 8)) for _ in range(4)]
+        request = locateanything.LocateAnythingInferenceReq(prompt="person</c>car")
+        results = locateanything._run_model_batch(FakeWorker(), images, request)
+        self.assertEqual(len(results), 4)
+        self.assertEqual(calls[0][1]["generation_mode"], "hybrid")
+        self.assertEqual(
+            calls[0][0][0][1],
+            "Locate all the instances that match the following description: person</c>car.",
+        )
+
+    def test_batch_oom_is_retried_as_smaller_batches(self) -> None:
+        attempts = []
+
+        def fake_batch(_worker, images, _request):
+            attempts.append(len(images))
+            if len(images) > 2:
+                raise RuntimeError("CUDA out of memory")
+            return [{"answer": "ok"} for _ in images]
+
+        job = {}
+        images = [Image.new("RGB", (8, 8)) for _ in range(4)]
+        with patch.object(locateanything, "_run_model_batch", side_effect=fake_batch):
+            results = locateanything._run_model_batch_resilient(
+                object(), images, locateanything.LocateAnythingInferenceReq(),
+                device="cpu", job=job,
+            )
+        self.assertEqual(attempts, [4, 2, 2])
+        self.assertEqual(len(results), 4)
+        self.assertEqual(job["oom_retries"][0]["failed_batch_size"], 4)
 
     def test_multiple_gpu_configuration_is_reported(self) -> None:
         original_locany = list(locateanything.SETTINGS["devices"])
@@ -307,13 +376,16 @@ class GpuServicesTests(unittest.TestCase):
                     patch.object(locateanything, "_torch", return_value=FakeTorch()),
                     patch.object(
                         locateanything,
-                        "_run_model",
-                        return_value={
-                            "answer": (
-                                "<ref>person</ref><box><100><200><500><800></box>"
-                                "<ref>car</ref><box><550><300><900><700></box>"
-                            )
-                        },
+                        "_run_model_batch",
+                        side_effect=lambda _worker, images, _request: [
+                            {
+                                "answer": (
+                                    "<ref>person</ref><box><100><200><500><800></box>"
+                                    "<ref>car</ref><box><550><300><900><700></box>"
+                                )
+                            }
+                            for _ in images
+                        ],
                     ),
                 ):
                     locateanything._run_image_job_sync(job_id, request, input_dir.resolve(), items)
