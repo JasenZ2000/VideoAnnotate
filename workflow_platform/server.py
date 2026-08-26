@@ -29,7 +29,7 @@ APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 PROJECT_ROOT = APP_DIR.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "platform_tasks"
-API_SCHEMA_VERSION = 12
+API_SCHEMA_VERSION = 13
 SESSION_COOKIE_NAME = "annotation_platform_session"
 SESSION_TTL_DAYS = int(os.environ.get("ANNOTATION_PLATFORM_SESSION_DAYS", "7"))
 PASSWORD_ITERATIONS = 200_000
@@ -545,11 +545,13 @@ async def publish_tasks(req: PublishTasksReq):
                 "updated_at": now,
             }
             created.append(database().create_task(
-                task, req.part_count, now, part_specs=part_specs,
+                task, req.part_count, now, part_specs=part_specs, return_details=False,
             ))
     except BaseException as exc:
         _raise_database_error(exc)
-    return {"tasks": created, "count": len(created)}
+    return {"tasks": [{key: item[key] for key in
+                        ("task_id", "name", "project", "annotation_content", "part_prefix")}
+                      for item in created], "count": len(created)}
 
 
 @app.get("/api/tasks")
@@ -563,15 +565,16 @@ async def list_tasks():
         task["can_review"] = task["is_publisher"] or task["is_manager"] or user.get("role") == "admin"
         task["can_view_all"] = task["can_review"] or task["is_manager"]
         task["can_manage_ordering"] = user.get("role") == "admin"
-        mine = database().list_parts(task["task_id"], now_iso(), actor)
-        task["my_parts"] = len(mine)
-        task["my_rework"] = sum(1 for part in mine if part["status"] == "rework")
-        task["my_active"] = sum(1 for part in mine if part["status"] == "in_progress")
+        mine = database().actor_part_summary(task["task_id"], actor)
+        task["my_parts"] = mine["total"]
+        task["my_rework"] = mine["rework"]
+        task["my_active"] = mine["in_progress"]
     return {"tasks": tasks}
 
 
 @app.get("/api/tasks/{task_id}")
-async def get_task(task_id: str):
+async def get_task(task_id: str, part_status: str = "", part_query: str = "",
+                   part_page: int = 1, part_page_size: int = 50):
     user = require_user()
     actor = user["username"]
     try:
@@ -589,7 +592,15 @@ async def get_task(task_id: str):
     task["can_manage_ordering"] = user.get("role") == "admin"
     task["available_parts"] = task["part_summary"]["pending"]
     if can_view_all:
-        task["parts"] = database().list_parts(task_id, now_iso())
+        try:
+            parts_page = database().list_parts_page(
+                task_id, now_iso(), status=part_status, query=part_query,
+                page=part_page, page_size=part_page_size,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        task["parts"] = parts_page.pop("items")
+        task["parts_page"] = parts_page
     if publisher or manager:
         task["statistics"] = database().annotator_statistics(task_id, now_iso())
     elif not can_view_all:
@@ -658,10 +669,10 @@ async def update_task_ordering(task_id: str, req: UpdateTaskOrderingReq):
 async def add_parts(task_id: str, req: AddPartsReq):
     actor = require_user()["username"]
     try:
-        parts = database().add_parts(task_id, req.count, actor, now_iso())
+        database().add_parts(task_id, req.count, actor, now_iso(), return_parts=False)
     except BaseException as exc:
         _raise_database_error(exc)
-    return {"parts": parts, "summary": database().part_summary(task_id)}
+    return {"added": req.count, "summary": database().part_summary(task_id)}
 
 
 @app.delete("/api/tasks/{task_id}/parts/{part_id}")

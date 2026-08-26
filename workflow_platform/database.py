@@ -453,7 +453,8 @@ class PlatformDatabase:
         return changes
 
     def create_task(self, task: dict[str, Any], part_count: int, now: str,
-                    part_specs: Optional[list[dict[str, str]]] = None) -> dict[str, Any]:
+                    part_specs: Optional[list[dict[str, str]]] = None,
+                    *, return_details: bool = True) -> dict[str, Any]:
         effective_count = len(part_specs) if part_specs is not None else part_count
         if effective_count < 1 or effective_count > 10000:
             raise ValueError("part count must be between 1 and 10000")
@@ -482,7 +483,10 @@ class PlatformDatabase:
                 str(task.get("part_prefix", "")), now, part_specs=part_specs,
             )
             self._normalize_active_task_ranks(connection)
-        return self.get_task(str(task["task_id"]), now)
+        if return_details:
+            return self.get_task(str(task["task_id"]), now)
+        return {key: task.get(key, "") for key in
+                ("task_id", "name", "project", "annotation_content", "part_prefix")}
 
     def update_task(self, task_id: str, actor: str, changes: dict[str, str],
                     now: str) -> dict[str, Any]:
@@ -596,19 +600,21 @@ class PlatformDatabase:
         start = int(row[0]) + 1
         clean = prefix.strip()
         separator = "" if not clean or clean.endswith(("_", "-", " ")) else "_"
+        values = []
         for offset, index in enumerate(range(start, start + count)):
             spec = part_specs[offset] if part_specs is not None else None
             name = str(spec.get("name", "")).strip() if spec else ""
             if not name:
                 name = f"{clean}{separator}part_{index:03d}"
             work_path = str(spec.get("work_path", "")).strip() if spec else ""
-            connection.execute(
-                "INSERT INTO parts(task_id,part_index,name,work_path,status,created_at,updated_at) "
-                "VALUES(?,?,?,?,'pending',?,?)",
-                (task_id, index, name, work_path, now, now),
-            )
+            values.append((task_id, index, name, work_path, now, now))
+        connection.executemany(
+            "INSERT INTO parts(task_id,part_index,name,work_path,status,created_at,updated_at) "
+            "VALUES(?,?,?,?,'pending',?,?)", values,
+        )
 
-    def add_parts(self, task_id: str, count: int, actor: str, now: str) -> list[dict[str, Any]]:
+    def add_parts(self, task_id: str, count: int, actor: str, now: str, *,
+                  return_parts: bool = True) -> list[dict[str, Any]]:
         if count < 1 or count > 10000:
             raise ValueError("part count must be between 1 and 10000")
         with self.transaction() as connection:
@@ -636,7 +642,7 @@ class PlatformDatabase:
                     (now, task_id),
                 )
             self._normalize_active_task_ranks(connection)
-        return self.list_parts(task_id, now)
+        return self.list_parts(task_id, now) if return_parts else []
 
     def delete_part(self, task_id: str, part_id: int, actor: str, now: str) -> dict[str, Any]:
         with self.transaction() as connection:
@@ -735,6 +741,20 @@ class PlatformDatabase:
         summary["annotated"] = summary["submitted"] + summary["completed"]
         return summary
 
+    def actor_part_summary(self, task_id: str, actor: str) -> dict[str, int]:
+        summary = {"total": 0, "rework": 0, "in_progress": 0}
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT status,COUNT(*) count FROM parts "
+                "WHERE task_id=? AND annotator=? GROUP BY status", (task_id, actor)
+            ).fetchall()
+        for row in rows:
+            count = int(row["count"])
+            summary["total"] += count
+            if row["status"] in summary:
+                summary[row["status"]] = count
+        return summary
+
     # Parts and timing
     def _comments(self, connection: sqlite3.Connection, part_id: int) -> list[dict[str, Any]]:
         return [dict(row) for row in connection.execute(
@@ -771,6 +791,47 @@ class PlatformDatabase:
                 item["comments"] = self._comments(connection, int(item["part_id"]))
                 result.append(item)
         return result
+
+    def list_parts_page(self, task_id: str, now: str, *, status: str = "",
+                        query: str = "", page: int = 1, page_size: int = 50) -> dict[str, Any]:
+        if status and status not in PART_STATUSES:
+            raise ValueError("unsupported part status")
+        page_size = max(1, min(int(page_size), 100))
+        page = max(1, int(page))
+        conditions = ["p.task_id=?"]
+        params: list[Any] = [task_id]
+        if status:
+            conditions.append("p.status=?")
+            params.append(status)
+        clean_query = query.strip()
+        if clean_query:
+            conditions.append("(p.name LIKE ? OR p.work_path LIKE ? OR COALESCE(p.annotator,'') LIKE ?)")
+            pattern = f"%{clean_query}%"
+            params.extend([pattern, pattern, pattern])
+        where = " AND ".join(conditions)
+        with self.connection() as connection:
+            total = int(connection.execute(f"SELECT COUNT(*) FROM parts p WHERE {where}", params).fetchone()[0])
+            pages = max(1, (total + page_size - 1) // page_size)
+            page = min(page, pages)
+            rows = connection.execute(
+                "SELECT p.*,t.expected_part_seconds,(SELECT started_at FROM part_work_sessions s "
+                "WHERE s.part_id=p.part_id AND s.ended_at IS NULL ORDER BY session_id DESC LIMIT 1) active_started_at "
+                f"FROM parts p JOIN tasks t ON t.task_id=p.task_id WHERE {where} "
+                "ORDER BY CASE p.status WHEN 'submitted' THEN 0 WHEN 'rework' THEN 1 WHEN 'in_progress' THEN 2 "
+                "WHEN 'paused' THEN 3 WHEN 'pending' THEN 4 ELSE 5 END,p.part_index LIMIT ? OFFSET ?",
+                [*params, page_size, (page - 1) * page_size],
+            ).fetchall()
+            items = []
+            for row in rows:
+                item = dict(row)
+                item["annotator"] = item.get("annotator") or ""
+                item["work_seconds"] = round(float(item["work_seconds"]) + _elapsed_seconds(item["active_started_at"], now), 3)
+                expected = float(item.get("expected_part_seconds") or 0)
+                item["time_deviation_ratio"] = round((item["work_seconds"] - expected) / expected, 4) if expected else None
+                item["has_time_deviation"] = bool(expected and abs(item["time_deviation_ratio"]) >= TIME_DEVIATION_THRESHOLD)
+                item["comments"] = self._comments(connection, int(item["part_id"]))
+                items.append(item)
+        return {"items": items, "total": total, "page": page, "page_size": page_size, "pages": pages}
 
     def _open_session(self, connection: sqlite3.Connection, part_id: int, actor: str, now: str) -> None:
         connection.execute(

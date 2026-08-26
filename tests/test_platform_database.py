@@ -88,6 +88,32 @@ class PlatformDatabaseTests(unittest.TestCase):
         self.assertEqual(parts[1]["work_path"], r"\\server\data\group\split_002")
         self.assertEqual(self.db.health()["schema_version"], 7)
 
+    def test_large_part_batch_can_be_created_and_reviewed_by_page(self) -> None:
+        self.db.create_task(task(), 2000, "2026-07-15T10:00:00+08:00")
+        self.assertEqual(self.db.part_summary("task-1")["total"], 2000)
+        page = self.db.list_parts_page(
+            "task-1", "2026-07-15T10:01:00+08:00", query="part_0", page=2,
+            page_size=25,
+        )
+        self.assertEqual(page["page"], 2)
+        self.assertEqual(page["page_size"], 25)
+        self.assertEqual(len(page["items"]), 25)
+        self.assertGreater(page["total"], 25)
+        self.assertTrue(all("part_0" in item["name"] for item in page["items"]))
+
+        claimed = self.db.claim_next_part(
+            "task-1", "worker", "2026-07-15T10:02:00+08:00"
+        )
+        self.db.submit_part(
+            "task-1", claimed["part_id"], "worker", "done",
+            "2026-07-15T10:03:00+08:00",
+        )
+        submitted = self.db.list_parts_page(
+            "task-1", "2026-07-15T10:03:00+08:00", status="submitted"
+        )
+        self.assertEqual(submitted["total"], 1)
+        self.assertEqual(submitted["items"][0]["part_id"], claimed["part_id"])
+
     def test_part_can_pause_resume_and_return(self) -> None:
         self.db.create_task(task(), 1, "2026-07-15T10:00:00+08:00")
         claimed = self.db.claim_next_part(

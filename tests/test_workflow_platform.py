@@ -108,6 +108,22 @@ class WorkflowPlatformTests(unittest.TestCase):
                          ["BSD_part_001", "BSD_part_002"])
         self.assertIn("statistics", detail)
 
+    def test_large_publish_returns_lightweight_response_and_detail_pages(self) -> None:
+        created = self._publish(TABLE.splitlines()[1], 2000)
+        self.assertEqual(created["count"], 1)
+        self.assertNotIn("parts", created["tasks"][0])
+        task_id = created["tasks"][0]["task_id"]
+        detail = self.client.get(
+            f"/api/tasks/{task_id}?part_page=2&part_page_size=25&part_query=part_0"
+        )
+        self.assertEqual(detail.status_code, 200, detail.text)
+        payload = detail.json()
+        self.assertEqual(payload["part_summary"]["total"], 2000)
+        self.assertEqual(payload["parts_page"]["page"], 2)
+        self.assertEqual(payload["parts_page"]["page_size"], 25)
+        self.assertEqual(len(payload["parts"]), 25)
+        self.assertTrue(all("part_0" in item["name"] for item in payload["parts"]))
+
     def test_worker_claim_submit_rework_resubmit_and_approve(self) -> None:
         task_id = self._publish(TABLE.splitlines()[1], 2)["tasks"][0]["task_id"]
         self.client.post("/api/auth/logout")
@@ -359,7 +375,7 @@ class WorkflowPlatformTests(unittest.TestCase):
 
     def test_health_and_authentication_contract(self) -> None:
         health = self.client.get("/api/health")
-        self.assertEqual(health.json()["api_schema_version"], 12)
+        self.assertEqual(health.json()["api_schema_version"], 13)
         self.client.post("/api/auth/logout")
         self.assertEqual(self.client.get("/api/tasks").status_code, 401)
 
@@ -410,6 +426,10 @@ class WorkflowPlatformTests(unittest.TestCase):
         self.assertIn("s.annotated", page.text)
         self.assertIn("协同审核", page.text)
         self.assertIn("任务操作日志", page.text)
+        self.assertIn("white-space:nowrap;flex:0 0 auto", page.text)
+        self.assertIn("position:sticky;top:94px", page.text)
+        self.assertIn("partReviewTools", page.text)
+        self.assertIn("展开全部", page.text)
 
     def test_main_enables_https_and_secure_cookie_with_pem_files(self) -> None:
         cert = Path(self.temporary.name) / "server.crt"
