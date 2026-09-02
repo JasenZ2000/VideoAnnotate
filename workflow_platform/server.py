@@ -93,6 +93,7 @@ class PublishTasksReq(BaseModel):
     part_count: int = 0
     part_prefix: str = ""
     part_manifest: str = ""
+    annotation_tool: str = ""
 
 
 class AddPartsReq(BaseModel):
@@ -100,6 +101,7 @@ class AddPartsReq(BaseModel):
 
 
 class UpdateTaskReq(BaseModel):
+    annotation_tool: Optional[str] = None
     manager: Optional[str] = None
     product_tag: Optional[str] = None
     part_prefix: Optional[str] = None
@@ -141,6 +143,12 @@ class ReturnPartReq(BaseModel):
 class TimeReviewReq(BaseModel):
     decision: str
     note: str = ""
+
+class UpdatePartReq(BaseModel):
+    name: Optional[str] = None
+    work_path: Optional[str] = None
+    image_count: Optional[int] = None
+    progress_count: Optional[int] = None
 
 
 def now_iso() -> str:
@@ -286,16 +294,29 @@ def _work_path(data_root: str, manifest_path: str) -> str:
     return root.rstrip("/\\") + separator + path.strip("/\\").replace("/", separator).replace("\\", separator)
 
 
-def parse_part_manifest(text: str, data_root: str) -> list[dict[str, str]]:
+def parse_part_manifest(text: str, data_root: str) -> list[dict[str, Any]]:
     specs: list[dict[str, str]] = []
     seen: set[str] = set()
     for line_number, row in enumerate(csv.reader(io.StringIO(text), delimiter="\t"), 1):
         cells = [cell.strip() for cell in row]
         if not any(cells):
             continue
-        if len(cells) > 2:
-            raise ValueError(f"Part 清单第 {line_number} 行最多只能有两列：显示名和路径")
-        display_name, raw_path = ("", cells[0]) if len(cells) == 1 else (cells[0], cells[1])
+        if len(cells) > 3:
+            raise ValueError(f"Part 清单第 {line_number} 行最多只能有三列：显示名、路径和图像数量")
+        if len(cells) == 1:
+            display_name, raw_path, image_count = "", cells[0], None
+        elif len(cells) == 2:
+            if cells[1].isdigit():
+                display_name, raw_path, image_count = "", cells[0], int(cells[1])
+            else:
+                display_name, raw_path, image_count = cells[0], cells[1], None
+        else:
+            display_name, raw_path = cells[0], cells[1]
+            try:
+                image_count = int(cells[2])
+                if image_count < 0: raise ValueError
+            except ValueError as exc:
+                raise ValueError(f"Part 清单第 {line_number} 行图像数量必须是非负整数") from exc
         if not raw_path:
             raise ValueError(f"Part 清单第 {line_number} 行缺少工作目录")
         work_path = _work_path(data_root, raw_path)
@@ -311,7 +332,10 @@ def parse_part_manifest(text: str, data_root: str) -> list[dict[str, str]]:
                     "数据集根目录" if raw_path in {".", ".\\", "./"} else
                     " / ".join(part for part in re.split(r"[\\/]", raw_path.strip("/\\")) if part)
                 )
-        specs.append({"name": display_name, "work_path": work_path})
+        spec: dict[str, Any] = {"name": display_name, "work_path": work_path}
+        if image_count is not None:
+            spec["image_count"] = image_count
+        specs.append(spec)
     if not specs:
         raise ValueError("Part 工作目录清单为空")
     if len(specs) > 10000:
@@ -540,6 +564,7 @@ async def publish_tasks(req: PublishTasksReq):
                 "manager": actor,
                 "product_tag": tag,
                 "part_prefix": req.part_prefix.strip(),
+                "annotation_tool": req.annotation_tool.strip(),
                 **row,
                 "created_at": now,
                 "updated_at": now,
@@ -577,15 +602,18 @@ async def get_task(task_id: str, part_status: str = "", part_query: str = "",
                    part_page: int = 1, part_page_size: int = 50):
     user = require_user()
     actor = user["username"]
+    now = now_iso()
     try:
-        task = database().get_task(task_id, now_iso())
+        task = database().get_task(task_id, now)
     except KeyError as exc:
         raise HTTPException(404, "任务不存在") from exc
     publisher = task["publisher"] == actor
+    applicant = bool(task.get("applicant")) and task["applicant"] == actor
     manager = bool(task.get("manager")) and task["manager"] == actor and not publisher
     can_review = publisher or manager or user.get("role") == "admin"
-    can_view_all = can_review or manager
+    can_view_all = can_review or manager or task.get("applicant") == actor
     task["is_publisher"] = publisher
+    task["is_applicant"] = applicant
     task["is_manager"] = manager
     task["can_review"] = can_review
     task["can_view_all"] = can_view_all
@@ -594,17 +622,18 @@ async def get_task(task_id: str, part_status: str = "", part_query: str = "",
     if can_view_all:
         try:
             parts_page = database().list_parts_page(
-                task_id, now_iso(), status=part_status, query=part_query,
+                task_id, now, status=part_status, query=part_query,
                 page=part_page, page_size=part_page_size,
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         task["parts"] = parts_page.pop("items")
         task["parts_page"] = parts_page
-    if publisher or manager:
-        task["statistics"] = database().annotator_statistics(task_id, now_iso())
+    if publisher or manager or applicant:
+        task["statistics"] = database().annotator_statistics(task_id, now)
+        task["annotation_statistics"] = database().task_annotation_statistics(task_id, now)
     elif not can_view_all:
-        task["parts"] = database().list_parts(task_id, now_iso(), actor)
+        task["parts"] = database().list_parts(task_id, now, actor)
     task["audit_logs"] = database().list_task_audit_logs(task_id)
     return task
 
@@ -683,6 +712,15 @@ async def delete_part(task_id: str, part_id: int):
     except BaseException as exc:
         _raise_database_error(exc)
     return {"deleted": deleted, "summary": database().part_summary(task_id)}
+
+@app.patch("/api/tasks/{task_id}/parts/{part_id}")
+async def update_part(task_id: str, part_id: int, req: UpdatePartReq):
+    actor = require_user()["username"]
+    try:
+        part = database().update_part(task_id, part_id, actor, now_iso(), name=req.name, work_path=req.work_path, image_count=req.image_count, progress_count=req.progress_count)
+    except BaseException as exc:
+        _raise_database_error(exc)
+    return {"part": part}
 
 
 @app.post("/api/tasks/{task_id}/parts/claim-next")

@@ -70,7 +70,7 @@ class WorkflowPlatformTests(unittest.TestCase):
             "clipboard_text": row,
             "product_tag": "BSD",
             "part_count": 0,
-            "part_manifest": "split_001\ngroup_a/split_002",
+            "part_manifest": "split_001\t120\ngroup_a/split_002\t80",
         })
         self.assertEqual(response.status_code, 200, response.text)
         task_id = response.json()["tasks"][0]["task_id"]
@@ -81,11 +81,18 @@ class WorkflowPlatformTests(unittest.TestCase):
         self.assertEqual(
             detail["parts"][1]["work_path"], r"\\server\data\group_a\split_002",
         )
+        self.assertEqual(detail["parts"][0]["image_count"], 120)
+        self.assertEqual(detail["parts"][1]["image_count"], 80)
 
         self.client.post("/api/auth/logout")
         self.client.post("/api/auth/login", json={"username": "worker", "password": "worker-pass"})
         claimed = self.client.post(f"/api/tasks/{task_id}/parts/claim-next").json()["part"]
         self.assertEqual(claimed["work_path"], r"\\server\data\split_001")
+        submitted = self.client.post(
+            f"/api/tasks/{task_id}/parts/{claimed['part_id']}/submit", json={"note": "完成"},
+        )
+        self.assertEqual(submitted.status_code, 200, submitted.text)
+        self.assertEqual(submitted.json()["part"]["progress_count"], 120)
 
     def test_manifest_publish_requires_one_task_row(self) -> None:
         response = self.client.post("/api/tasks/preview", json={
@@ -107,6 +114,25 @@ class WorkflowPlatformTests(unittest.TestCase):
         self.assertEqual([part["name"] for part in detail["parts"]],
                          ["BSD_part_001", "BSD_part_002"])
         self.assertIn("statistics", detail)
+
+    def test_applicant_detail_includes_annotation_statistics(self) -> None:
+        self.client.post("/api/users", json={
+            "username": "applicant", "password": "applicant-pass", "display_name": "申请人",
+        })
+        created = self._publish(TABLE.splitlines()[1].replace("刘湛基", "applicant"), 1)
+        task_id = created["tasks"][0]["task_id"]
+        self.client.post("/api/auth/logout")
+        logged_in = self.client.post("/api/auth/login", json={
+            "username": "applicant", "password": "applicant-pass",
+        })
+        self.assertEqual(logged_in.status_code, 200, logged_in.text)
+        detail = self.client.get(f"/api/tasks/{task_id}")
+        self.assertEqual(detail.status_code, 200, detail.text)
+        payload = detail.json()
+        self.assertTrue(payload["is_applicant"])
+        self.assertIn("statistics", payload)
+        self.assertIn("annotation_statistics", payload)
+        self.assertEqual(payload["annotation_statistics"]["image_count"], 0)
 
     def test_large_publish_returns_lightweight_response_and_detail_pages(self) -> None:
         created = self._publish(TABLE.splitlines()[1], 2000)

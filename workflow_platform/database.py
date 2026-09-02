@@ -105,6 +105,7 @@ class PlatformDatabase:
                     manager TEXT NOT NULL DEFAULT '',
                     product_tag TEXT NOT NULL DEFAULT '',
                     part_prefix TEXT NOT NULL DEFAULT '',
+                    annotation_tool TEXT NOT NULL DEFAULT '',
                     application_date TEXT NOT NULL DEFAULT '',
                     applicant TEXT NOT NULL DEFAULT '',
                     project TEXT NOT NULL DEFAULT '',
@@ -128,6 +129,8 @@ class PlatformDatabase:
                     name TEXT NOT NULL,
                     instructions TEXT NOT NULL DEFAULT '',
                     work_path TEXT NOT NULL DEFAULT '',
+                    image_count INTEGER NOT NULL DEFAULT 0,
+                    progress_count INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'pending',
                     annotator TEXT,
                     claimed_at TEXT,
@@ -202,6 +205,7 @@ class PlatformDatabase:
                 "expected_part_seconds": "REAL NOT NULL DEFAULT 0",
                 "priority": "TEXT NOT NULL DEFAULT 'medium'",
                 "rank": "INTEGER NOT NULL DEFAULT 0",
+                "annotation_tool": "TEXT NOT NULL DEFAULT ''",
             }
             for column, definition in additions.items():
                 if column not in task_columns:
@@ -214,6 +218,8 @@ class PlatformDatabase:
             if "work_path" not in part_columns:
                 connection.execute("ALTER TABLE parts ADD COLUMN work_path TEXT NOT NULL DEFAULT ''")
             part_additions = {
+                "image_count": "INTEGER NOT NULL DEFAULT 0",
+                "progress_count": "INTEGER NOT NULL DEFAULT 0",
                 "time_review_status": "TEXT NOT NULL DEFAULT ''",
                 "time_review_note": "TEXT NOT NULL DEFAULT ''",
                 "time_review_actor": "TEXT NOT NULL DEFAULT ''",
@@ -490,7 +496,7 @@ class PlatformDatabase:
 
     def update_task(self, task_id: str, actor: str, changes: dict[str, str],
                     now: str) -> dict[str, Any]:
-        allowed = {"manager", "product_tag", "part_prefix", "expected_part_seconds", *TASK_FIELDS}
+        allowed = {"manager", "product_tag", "part_prefix", "expected_part_seconds", "annotation_tool", *TASK_FIELDS}
         unknown = set(changes) - allowed
         if unknown:
             raise ValueError(f"unsupported task fields: {', '.join(sorted(unknown))}")
@@ -593,7 +599,7 @@ class PlatformDatabase:
 
     def _insert_parts(self, connection: sqlite3.Connection, task_id: str, count: int,
                       prefix: str, now: str,
-                      part_specs: Optional[list[dict[str, str]]] = None) -> None:
+                      part_specs: Optional[list[dict[str, Any]]] = None) -> None:
         row = connection.execute(
             "SELECT COALESCE(MAX(part_index),0) FROM parts WHERE task_id=?", (task_id,)
         ).fetchone()
@@ -607,10 +613,11 @@ class PlatformDatabase:
             if not name:
                 name = f"{clean}{separator}part_{index:03d}"
             work_path = str(spec.get("work_path", "")).strip() if spec else ""
-            values.append((task_id, index, name, work_path, now, now))
+            image_count = int(spec.get("image_count", 0) or 0) if spec else 0
+            values.append((task_id, index, name, work_path, image_count, now, now))
         connection.executemany(
-            "INSERT INTO parts(task_id,part_index,name,work_path,status,created_at,updated_at) "
-            "VALUES(?,?,?,?,'pending',?,?)", values,
+            "INSERT INTO parts(task_id,part_index,name,work_path,image_count,status,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,'pending',?,?)", values,
         )
 
     def add_parts(self, task_id: str, count: int, actor: str, now: str, *,
@@ -643,6 +650,26 @@ class PlatformDatabase:
                 )
             self._normalize_active_task_ranks(connection)
         return self.list_parts(task_id, now) if return_parts else []
+
+    def update_part(self, task_id: str, part_id: int, actor: str, now: str, *,
+                    name: Optional[str] = None, work_path: Optional[str] = None,
+                    image_count: Optional[int] = None, progress_count: Optional[int] = None) -> dict[str, Any]:
+        with self.transaction() as connection:
+            row = connection.execute("SELECT p.*,t.publisher,t.applicant FROM parts p JOIN tasks t ON t.task_id=p.task_id WHERE p.task_id=? AND p.part_id=?", (task_id, part_id)).fetchone()
+            if row is None: raise KeyError(part_id)
+            is_publisher = row["publisher"] == actor or row["applicant"] == actor
+            if not is_publisher and row["annotator"] != actor: raise PermissionError("not allowed to edit part")
+            changes = {}
+            if is_publisher:
+                if name is not None: changes["name"] = str(name).strip()
+                if work_path is not None: changes["work_path"] = str(work_path).strip()
+                if image_count is not None: changes["image_count"] = max(0, int(image_count))
+            if progress_count is not None and row["annotator"] == actor:
+                changes["progress_count"] = max(0, int(progress_count))
+            if changes:
+                assignments = ",".join(f"{k}=?" for k in changes)
+                connection.execute(f"UPDATE parts SET {assignments},updated_at=? WHERE part_id=?", [*changes.values(), now, part_id])
+        return next(item for item in self.list_parts(task_id, now) if item["part_id"] == part_id)
 
     def delete_part(self, task_id: str, part_id: int, actor: str, now: str) -> dict[str, Any]:
         with self.transaction() as connection:
@@ -683,7 +710,7 @@ class PlatformDatabase:
     def _task_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         result = {key: row[key] for key in (
             "task_id", "name", "status", "publisher", "manager", "product_tag", "part_prefix",
-            "expected_part_seconds", "priority", "rank",
+            "expected_part_seconds", "priority", "rank", "annotation_tool",
             *TASK_FIELDS, "created_at", "updated_at"
         )}
         return result
@@ -975,7 +1002,7 @@ class PlatformDatabase:
     def submit_part(self, task_id: str, part_id: int, actor: str, note: str, now: str) -> dict[str, Any]:
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT status,annotator FROM parts WHERE task_id=? AND part_id=?", (task_id, part_id)
+                "SELECT status,annotator,image_count FROM parts WHERE task_id=? AND part_id=?", (task_id, part_id)
             ).fetchone()
             if row is None:
                 raise KeyError(part_id)
@@ -984,8 +1011,10 @@ class PlatformDatabase:
             self._close_session(connection, part_id, now)
             connection.execute(
                 "UPDATE parts SET status='submitted',submitted_at=?,submission_note=?,"
-                "time_review_status='',time_review_note='',time_review_actor='',time_reviewed_at=NULL,updated_at=? "
-                "WHERE part_id=?", (now, note.strip(), now, part_id)
+                "progress_count=CASE WHEN image_count>0 THEN image_count ELSE progress_count END,"
+                "time_review_status='',time_review_note='',"
+                "time_review_actor='',time_reviewed_at=NULL,updated_at=? WHERE part_id=?",
+                (now, note.strip(), now, part_id)
             )
             if note.strip():
                 connection.execute(
@@ -1112,4 +1141,29 @@ class PlatformDatabase:
         for item in grouped.values():
             item["display_name"] = names.get(item["username"], "")
             item["work_seconds"] = round(item["work_seconds"], 3)
+            item["image_count"] = sum(int(p.get("progress_count") or 0) for p in parts if p.get("annotator") == item["username"])
+            item["images_per_hour"] = round(
+                item["image_count"] / item["work_seconds"] * 3600,
+                3,
+            ) if item["work_seconds"] > 0 else 0.0
         return sorted(grouped.values(), key=lambda item: (-item["completed"], item["username"]))
+
+    def task_annotation_statistics(self, task_id: str, now: str) -> dict[str, Any]:
+        """Return the aggregate annotation statistics for a task.
+
+        Image counts come from each assigned Part's progress count, while work
+        time comes from all recorded work sessions (including an active one).
+        Keeping this derived from ``annotator_statistics`` ensures the task and
+        per-person views use the same accounting rules.
+        """
+        stats = self.annotator_statistics(task_id, now)
+        total_work_seconds = sum(float(item["work_seconds"]) for item in stats)
+        total_image_count = sum(int(item["image_count"]) for item in stats)
+        return {
+            "work_seconds": round(total_work_seconds, 3),
+            "image_count": total_image_count,
+            "images_per_hour": round(
+                total_image_count / total_work_seconds * 3600,
+                3,
+            ) if total_work_seconds > 0 else 0.0,
+        }

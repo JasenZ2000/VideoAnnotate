@@ -49,6 +49,10 @@ class PlatformDatabaseTests(unittest.TestCase):
                          ["BSD_part_001", "BSD_part_002"])
 
         claimed = self.db.claim_next_part("task-1", "worker", "2026-07-15T10:01:00+08:00")
+        self.db.update_part(
+            "task-1", claimed["part_id"], "worker", "2026-07-15T10:02:00+08:00",
+            progress_count=12,
+        )
         submitted = self.db.submit_part(
             "task-1", claimed["part_id"], "worker", "发现两张模糊图", "2026-07-15T10:11:00+08:00"
         )
@@ -74,6 +78,27 @@ class PlatformDatabaseTests(unittest.TestCase):
         stats = self.db.annotator_statistics("task-1", "2026-07-15T10:20:00+08:00")
         self.assertEqual(stats[0]["completed"], 1)
         self.assertEqual(stats[0]["work_seconds"], 900)
+        self.assertEqual(stats[0]["image_count"], 12)
+        self.assertEqual(stats[0]["images_per_hour"], 48.0)
+        self.assertEqual(
+            self.db.task_annotation_statistics("task-1", "2026-07-15T10:20:00+08:00"),
+            {"work_seconds": 900.0, "image_count": 12, "images_per_hour": 48.0},
+        )
+
+    def test_submit_marks_all_part_images_annotated(self) -> None:
+        self.db.create_task(
+            task(), 0, "2026-07-15T10:00:00+08:00",
+            part_specs=[{"name": "split_001", "image_count": 120}],
+        )
+        claimed = self.db.claim_next_part("task-1", "worker", "2026-07-15T10:01:00+08:00")
+        self.assertEqual(claimed["progress_count"], 0)
+        submitted = self.db.submit_part(
+            "task-1", claimed["part_id"], "worker", "完成", "2026-07-15T10:11:00+08:00",
+        )
+        self.assertEqual(submitted["image_count"], 120)
+        self.assertEqual(submitted["progress_count"], 120)
+        stats = self.db.annotator_statistics("task-1", "2026-07-15T10:11:00+08:00")
+        self.assertEqual(stats[0]["image_count"], 120)
 
     def test_task_can_create_parts_from_work_directory_specs(self) -> None:
         self.db.create_task(

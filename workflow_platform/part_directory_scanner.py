@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 DEFAULT_MARKERS = ("images", "labels", "annotations")
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
 
 
 @dataclass
@@ -15,6 +16,7 @@ class ScanItem:
     full_path: str
     depth: int
     matched_markers: list[str] = field(default_factory=list)
+    image_count: int | None = None
 
 
 @dataclass
@@ -23,8 +25,23 @@ class ScanResult:
     items: list[ScanItem] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
-    def manifest_lines(self, full_paths: bool = False) -> list[str]:
-        return [item.full_path if full_paths else item.relative_path for item in self.items]
+    def manifest_lines(self, full_paths: bool = False, include_image_counts: bool = False) -> list[str]:
+        lines = []
+        for item in self.items:
+            path = item.full_path if full_paths else item.relative_path
+            lines.append(f"{path}\t{item.image_count or 0}" if include_image_counts else path)
+        return lines
+
+
+def _count_images(directory: Path) -> int:
+    count = 0
+    try:
+        for path in directory.rglob("*"):
+            if path.is_file() and path.suffix.casefold() in IMAGE_EXTENSIONS:
+                count += 1
+    except (OSError, PermissionError):
+        return count
+    return count
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -73,6 +90,8 @@ def scan_part_directories(
                 full_path=str(directory),
                 depth=depth,
                 matched_markers=matched,
+                image_count=_count_images(directory / child_names["images"])
+                if any(name.casefold() == "images" for name in matched) else None,
             ))
             return
         if depth >= max_depth:

@@ -67,6 +67,8 @@ class PartDirectoryScannerWindow(QMainWindow):
         self.minimum.setValue(1)
         self.full_paths = QCheckBox("复制完整路径（通常不勾选，推荐复制相对路径）")
         self.full_paths.stateChanged.connect(self._refresh_preview)
+        self.include_image_counts = QCheckBox("复制图像数量（追加为：目录\t数量）")
+        self.include_image_counts.stateChanged.connect(self._refresh_preview)
         depth_help = QLabel(
             "深度说明：根目录是 0，其直接子目录是 1。发现某目录直接包含识别标志后，就把该目录作为 Part，并停止扫描其内部。"
         )
@@ -82,7 +84,8 @@ class PartDirectoryScannerWindow(QMainWindow):
         grid.addWidget(QLabel("最少命中几个标志"), 2, 0)
         grid.addWidget(self.minimum, 2, 1)
         grid.addWidget(self.full_paths, 2, 2, 1, 3)
-        grid.addWidget(depth_help, 3, 0, 1, 5)
+        grid.addWidget(self.include_image_counts, 3, 0, 1, 5)
+        grid.addWidget(depth_help, 4, 0, 1, 5)
         root_layout.addWidget(settings)
 
         action_row = QHBoxLayout()
@@ -105,8 +108,8 @@ class PartDirectoryScannerWindow(QMainWindow):
         result_layout = QVBoxLayout(result_group)
         self.summary = QLabel("尚未扫描")
         self.summary.setWordWrap(True)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["清单内容", "深度", "命中的标志", "完整目录"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["清单内容", "图像数量", "深度", "命中的标志", "完整目录"])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -151,7 +154,7 @@ class PartDirectoryScannerWindow(QMainWindow):
         self.result = result
         self.table.setRowCount(len(result.items))
         for row, item in enumerate(result.items):
-            values = [item.relative_path, str(item.depth), ", ".join(item.matched_markers), item.full_path]
+            values = [item.relative_path, str(item.image_count or 0), str(item.depth), ", ".join(item.matched_markers), item.full_path]
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(value)
                 cell.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -172,7 +175,9 @@ class PartDirectoryScannerWindow(QMainWindow):
     def _refresh_preview(self) -> None:
         if not self.result:
             return
-        self.preview.setPlainText("\n".join(self.result.manifest_lines(self.full_paths.isChecked())))
+        self.preview.setPlainText("\n".join(self.result.manifest_lines(
+            self.full_paths.isChecked(), self.include_image_counts.isChecked()
+        )))
 
     def _manifest_text(self) -> str:
         return self.preview.toPlainText().strip()
