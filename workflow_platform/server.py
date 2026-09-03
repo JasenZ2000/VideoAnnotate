@@ -11,7 +11,7 @@ import re
 import secrets
 import threading
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -29,7 +29,7 @@ APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 PROJECT_ROOT = APP_DIR.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "platform_tasks"
-API_SCHEMA_VERSION = 13
+API_SCHEMA_VERSION = 14
 SESSION_COOKIE_NAME = "annotation_platform_session"
 SESSION_TTL_DAYS = int(os.environ.get("ANNOTATION_PLATFORM_SESSION_DAYS", "7"))
 PASSWORD_ITERATIONS = 200_000
@@ -153,6 +153,33 @@ class UpdatePartReq(BaseModel):
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def statistics_period_bounds(period: str, anchor: str = "", *, now: Optional[str] = None) -> tuple[str, str]:
+    """Resolve a day/week/month report window in the platform's local timezone."""
+    value = period.strip().lower()
+    if value not in {"day", "week", "month"}:
+        raise ValueError("统计周期必须是 day、week 或 month")
+    current = datetime.fromisoformat(now) if now else datetime.now().astimezone()
+    tz = current.tzinfo or timezone.utc
+    try:
+        selected = date.fromisoformat(anchor) if anchor.strip() else current.date()
+    except ValueError as exc:
+        raise ValueError("统计日期必须使用 YYYY-MM-DD 格式") from exc
+    start_date = selected
+    if value == "week":
+        start_date = selected - timedelta(days=selected.weekday())
+    elif value == "month":
+        start_date = selected.replace(day=1)
+    start = datetime.combine(start_date, datetime.min.time(), tzinfo=tz)
+    if value == "day":
+        end = start + timedelta(days=1)
+    elif value == "week":
+        end = start + timedelta(days=7)
+    else:
+        next_month = (start_date.replace(day=28) + timedelta(days=4)).replace(day=1)
+        end = datetime.combine(next_month, datetime.min.time(), tzinfo=tz)
+    return start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")
 
 
 def database_path() -> Path:
@@ -447,6 +474,17 @@ async def change_password(req: ChangePasswordReq):
 async def list_users():
     require_admin()
     return {"users": database().list_users()}
+
+
+@app.get("/api/admin/statistics")
+async def admin_statistics(period: str = "month", date: str = ""):
+    require_admin()
+    try:
+        current = now_iso()
+        start, end = statistics_period_bounds(period, date, now=current)
+        return database().admin_annotation_statistics(start, end, current)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.get("/api/user-options")

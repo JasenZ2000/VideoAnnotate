@@ -228,6 +228,15 @@ class PlatformDatabase:
             for column, definition in part_additions.items():
                 if column not in part_columns:
                     connection.execute(f"ALTER TABLE parts ADD COLUMN {column} {definition}")
+            # Parts submitted before progress tracking was introduced may have
+            # a known image total but a zero progress value.  A submitted or
+            # approved Part represents completion of its full image set, so
+            # safely backfill that derived value during initialization.
+            connection.execute(
+                "UPDATE parts SET progress_count=image_count "
+                "WHERE image_count>0 AND progress_count=0 "
+                "AND status IN ('submitted','completed')"
+            )
             task_columns.update(additions)
             legacy_columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
             if "assignee" in legacy_columns:
@@ -1166,4 +1175,163 @@ class PlatformDatabase:
                 total_image_count / total_work_seconds * 3600,
                 3,
             ) if total_work_seconds > 0 else 0.0,
+        }
+
+    def admin_annotation_statistics(self, start: str, end: str, now: str) -> dict[str, Any]:
+        """Aggregate per-user and per-task annotation work for a time window.
+
+        A Part contributes to a row when it was submitted in the window or
+        when one of its work sessions overlaps the window.  Work time is
+        clipped to the requested window so week/day/month reports remain
+        accurate even when a session crosses a boundary.  Image counts use
+        the Part's current progress value, which is finalized to the Part's
+        image total on submission when that total is known.
+        """
+        try:
+            window_start = datetime.fromisoformat(start)
+            window_end = datetime.fromisoformat(end)
+            now_dt = datetime.fromisoformat(now)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid statistics time window") from exc
+        if window_end <= window_start:
+            raise ValueError("statistics end must be after start")
+
+        def overlap_seconds(started: Optional[str], ended: Optional[str]) -> float:
+            if not started:
+                return 0.0
+            try:
+                session_start = datetime.fromisoformat(started)
+                session_end = datetime.fromisoformat(ended) if ended else now_dt
+            except (TypeError, ValueError):
+                return 0.0
+            left = max(window_start, session_start)
+            right = min(window_end, session_end)
+            return max(0.0, (right - left).total_seconds())
+
+        with self.connection() as connection:
+            user_rows = connection.execute(
+                "SELECT username,display_name,role,is_active FROM users ORDER BY username"
+            ).fetchall()
+            part_rows = connection.execute(
+                "SELECT p.part_id,p.task_id,p.annotator,p.image_count,p.progress_count,"
+                "p.submitted_at,p.reviewed_at,t.name,t.project,t.annotation_content "
+                "FROM parts p JOIN tasks t ON t.task_id=p.task_id "
+                "WHERE t.deleted=0 AND COALESCE(p.annotator,'')!=''"
+            ).fetchall()
+            session_rows = connection.execute(
+                "SELECT s.part_id,s.annotator,s.started_at,s.ended_at "
+                "FROM part_work_sessions s JOIN parts p ON p.part_id=s.part_id "
+                "JOIN tasks t ON t.task_id=p.task_id WHERE t.deleted=0"
+            ).fetchall()
+
+        session_seconds: dict[int, float] = {}
+        for session in session_rows:
+            part_id = int(session["part_id"])
+            seconds = overlap_seconds(session["started_at"], session["ended_at"])
+            if seconds <= 0:
+                continue
+            session_seconds[part_id] = session_seconds.get(part_id, 0.0) + seconds
+
+        def in_window(value: Optional[str]) -> bool:
+            if not value:
+                return False
+            try:
+                moment = datetime.fromisoformat(value)
+            except (TypeError, ValueError):
+                return False
+            return window_start <= moment < window_end
+
+        display_names = {str(row["username"]): str(row["display_name"] or "") for row in user_rows}
+        roles = {str(row["username"]): str(row["role"] or "user") for row in user_rows}
+        active = {str(row["username"]): bool(row["is_active"]) for row in user_rows}
+        grouped: dict[str, dict[str, Any]] = {}
+
+        def user_item(username: str) -> dict[str, Any]:
+            return grouped.setdefault(username, {
+                "username": username,
+                "display_name": display_names.get(username, ""),
+                "role": roles.get(username, "user"),
+                "is_active": active.get(username, False),
+                "completed_parts": 0,
+                "image_count": 0,
+                "work_seconds": 0.0,
+                "tasks": {},
+            })
+
+        # Include every current account, including users with no work in the
+        # selected window; historical annotator names are added below too.
+        for row in user_rows:
+            user_item(str(row["username"]))
+
+        for part in part_rows:
+            part_id = int(part["part_id"])
+            completed = in_window(part["submitted_at"]) or (
+                not part["submitted_at"] and in_window(part["reviewed_at"])
+            )
+            seconds = session_seconds.get(part_id, 0.0)
+            if not completed and seconds <= 0:
+                continue
+            username = str(part["annotator"] or "")
+            if not username:
+                continue
+            item = user_item(username)
+            task_id = str(part["task_id"])
+            tasks = item["tasks"]
+            task_item = tasks.setdefault(task_id, {
+                "task_id": task_id,
+                "name": str(part["name"] or ""),
+                "project": str(part["project"] or ""),
+                "annotation_content": str(part["annotation_content"] or ""),
+                "completed_parts": 0,
+                "image_count": 0,
+                "work_seconds": 0.0,
+            })
+            if completed:
+                task_item["completed_parts"] += 1
+                item["completed_parts"] += 1
+            task_item["image_count"] += max(0, int(part["progress_count"] or 0))
+            task_item["work_seconds"] += seconds
+            item["image_count"] += max(0, int(part["progress_count"] or 0))
+            item["work_seconds"] += seconds
+
+        users: list[dict[str, Any]] = []
+        for item in grouped.values():
+            item["work_seconds"] = round(item["work_seconds"], 3)
+            item["images_per_hour"] = round(
+                item["image_count"] / item["work_seconds"] * 3600,
+                3,
+            ) if item["work_seconds"] > 0 else 0.0
+            item["tasks"] = sorted(
+                (
+                    {
+                        **task,
+                        "work_seconds": round(task["work_seconds"], 3),
+                        "images_per_hour": round(
+                            task["image_count"] / task["work_seconds"] * 3600,
+                            3,
+                        ) if task["work_seconds"] > 0 else 0.0,
+                    }
+                    for task in item["tasks"].values()
+                ),
+                key=lambda task: (-task["completed_parts"], task["name"], task["task_id"]),
+            )
+            users.append(item)
+
+        users.sort(key=lambda item: (-item["image_count"], item["display_name"] or item["username"]))
+        total_work_seconds = sum(float(item["work_seconds"]) for item in users)
+        total_image_count = sum(int(item["image_count"]) for item in users)
+        total_completed_parts = sum(int(item["completed_parts"]) for item in users)
+        return {
+            "start": start,
+            "end": end,
+            "users": users,
+            "total": {
+                "completed_parts": total_completed_parts,
+                "image_count": total_image_count,
+                "work_seconds": round(total_work_seconds, 3),
+                "images_per_hour": round(
+                    total_image_count / total_work_seconds * 3600,
+                    3,
+                ) if total_work_seconds > 0 else 0.0,
+            },
         }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -51,6 +52,26 @@ class WorkflowPlatformTests(unittest.TestCase):
         self.assertEqual(rows[0]["data_path"], r"\\server\data")
         headerless = platform.parse_spreadsheet_rows(TABLE.splitlines()[1])
         self.assertEqual(headerless[0]["applicant"], "刘湛基")
+
+    def test_statistics_period_bounds_support_day_week_and_month(self) -> None:
+        self.assertEqual(
+            platform.statistics_period_bounds(
+                "day", "2026-07-16", now="2026-07-16T12:00:00+08:00"
+            ),
+            ("2026-07-16T00:00:00+08:00", "2026-07-17T00:00:00+08:00"),
+        )
+        self.assertEqual(
+            platform.statistics_period_bounds(
+                "week", "2026-07-16", now="2026-07-16T12:00:00+08:00"
+            ),
+            ("2026-07-13T00:00:00+08:00", "2026-07-20T00:00:00+08:00"),
+        )
+        self.assertEqual(
+            platform.statistics_period_bounds(
+                "month", "2026-07-16", now="2026-07-16T12:00:00+08:00"
+            ),
+            ("2026-07-01T00:00:00+08:00", "2026-08-01T00:00:00+08:00"),
+        )
 
     def test_part_manifest_builds_nested_work_paths_and_rejects_duplicates(self) -> None:
         specs = platform.parse_part_manifest(
@@ -401,7 +422,7 @@ class WorkflowPlatformTests(unittest.TestCase):
 
     def test_health_and_authentication_contract(self) -> None:
         health = self.client.get("/api/health")
-        self.assertEqual(health.json()["api_schema_version"], 13)
+        self.assertEqual(health.json()["api_schema_version"], 14)
         self.client.post("/api/auth/logout")
         self.assertEqual(self.client.get("/api/tasks").status_code, 401)
 
@@ -437,6 +458,38 @@ class WorkflowPlatformTests(unittest.TestCase):
         detail = self.client.get(f"/api/tasks/{task_id}").json()
         self.assertEqual(detail["parts"][0]["status"], "pending")
 
+    def test_admin_statistics_endpoint_is_admin_only(self) -> None:
+        row = TABLE.splitlines()[1]
+        created = self.client.post("/api/tasks", json={
+            "clipboard_text": row, "product_tag": "BSD", "part_count": 0,
+            "part_manifest": "split_001\t12",
+        })
+        self.assertEqual(created.status_code, 200, created.text)
+        task_id = created.json()["tasks"][0]["task_id"]
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={"username": "worker", "password": "worker-pass"})
+        claimed = self.client.post(f"/api/tasks/{task_id}/parts/claim-next").json()["part"]
+        submitted = self.client.post(
+            f"/api/tasks/{task_id}/parts/{claimed['part_id']}/submit", json={"note": "完成"},
+        )
+        self.assertEqual(submitted.status_code, 200, submitted.text)
+        self.assertEqual(
+            self.client.get(f"/api/admin/statistics?period=day&date={datetime.now().date().isoformat()}").status_code,
+            403,
+        )
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={"username": "publisher", "password": "publisher-pass"})
+        report = self.client.get(
+            f"/api/admin/statistics?period=day&date={datetime.now().date().isoformat()}"
+        )
+        self.assertEqual(report.status_code, 200, report.text)
+        payload = report.json()
+        self.assertIn("users", payload)
+        self.assertIn("total", payload)
+        worker = next(item for item in payload["users"] if item["username"] == "worker")
+        self.assertEqual(worker["image_count"], 12)
+        self.assertEqual(worker["completed_parts"], 1)
+
     def test_frontend_has_long_path_wrapping_and_clipboard_fallback(self) -> None:
         page = self.client.get("/")
         self.assertEqual(page.status_code, 200)
@@ -456,6 +509,10 @@ class WorkflowPlatformTests(unittest.TestCase):
         self.assertIn("position:sticky;top:94px", page.text)
         self.assertIn("partReviewTools", page.text)
         self.assertIn("展开全部", page.text)
+        self.assertIn("openAdminStatistics", page.text)
+        self.assertIn("/api/admin/statistics", page.text)
+        self.assertIn("人员任务统计", page.text)
+        self.assertIn("总体完成图片", page.text)
 
     def test_main_enables_https_and_secure_cookie_with_pem_files(self) -> None:
         cert = Path(self.temporary.name) / "server.crt"

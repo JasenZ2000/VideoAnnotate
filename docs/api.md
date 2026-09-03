@@ -8,6 +8,7 @@
 - `GET /api/auth/me`
 - `POST /api/auth/bootstrap-admin|login|logout|change-password`
 - `GET|POST /api/users`、`PATCH /api/users/{username}`：管理员创建用户、修改资料或重置密码
+- `GET /api/admin/statistics?period=day|week|month&date=YYYY-MM-DD`：管理员按日、周或月查看各用户在各任务中的完成 Part、标注图像和耗时统计
 - `DELETE /api/users/{username}`：管理员删除用户；任务自动转交，未提交的在手 Part 自动退回
 - `GET /api/user-options`：获取可指定为协同查看人的启用用户
 - `POST /api/tasks/preview`：解析粘贴的表格行

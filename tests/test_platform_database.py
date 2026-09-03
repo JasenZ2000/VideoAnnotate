@@ -100,6 +100,35 @@ class PlatformDatabaseTests(unittest.TestCase):
         stats = self.db.annotator_statistics("task-1", "2026-07-15T10:11:00+08:00")
         self.assertEqual(stats[0]["image_count"], 120)
 
+    def test_admin_annotation_statistics_groups_users_tasks_and_period_overlap(self) -> None:
+        self.db.create_user("worker", "hash", "user", "标注员", "2026-07-15T10:00:00+08:00")
+        self.db.create_task(
+            task("task-1"), 0, "2026-07-15T10:00:00+08:00",
+            part_specs=[{"name": "day-one", "image_count": 100}],
+        )
+        self.db.create_task(
+            task("task-2"), 0, "2026-07-15T10:00:00+08:00",
+            part_specs=[{"name": "day-two", "image_count": 50}],
+        )
+        first = self.db.claim_next_part("task-1", "worker", "2026-07-15T23:50:00+08:00")
+        self.db.submit_part("task-1", first["part_id"], "worker", "完成", "2026-07-16T00:10:00+08:00")
+        second = self.db.claim_next_part("task-2", "worker", "2026-07-16T02:00:00+08:00")
+        self.db.submit_part("task-2", second["part_id"], "worker", "完成", "2026-07-16T03:00:00+08:00")
+
+        report = self.db.admin_annotation_statistics(
+            "2026-07-16T00:00:00+08:00",
+            "2026-07-17T00:00:00+08:00",
+            "2026-07-16T12:00:00+08:00",
+        )
+        worker = next(item for item in report["users"] if item["username"] == "worker")
+        self.assertEqual(worker["completed_parts"], 2)
+        self.assertEqual(worker["image_count"], 150)
+        self.assertEqual(worker["work_seconds"], 4200.0)
+        self.assertEqual(worker["tasks"][0]["completed_parts"], 1)
+        self.assertEqual(len(worker["tasks"]), 2)
+        self.assertEqual(report["total"]["image_count"], 150)
+        self.assertEqual(report["total"]["work_seconds"], 4200.0)
+
     def test_task_can_create_parts_from_work_directory_specs(self) -> None:
         self.db.create_task(
             task(), 0, "2026-07-15T10:00:00+08:00",
