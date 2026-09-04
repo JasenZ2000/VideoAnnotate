@@ -129,6 +129,53 @@ class PlatformDatabaseTests(unittest.TestCase):
         self.assertEqual(report["total"]["image_count"], 150)
         self.assertEqual(report["total"]["work_seconds"], 4200.0)
 
+    def test_admin_statistics_does_not_count_reworked_part_images_twice(self) -> None:
+        self.db.create_user("worker", "hash", "user", "标注员", "2026-07-15T08:00:00+08:00")
+        self.db.create_task(
+            task("task-1"), 0, "2026-07-15T08:00:00+08:00",
+            part_specs=[{"name": "needs-rework", "image_count": 80}],
+        )
+        part = self.db.claim_next_part("task-1", "worker", "2026-07-15T09:00:00+08:00")
+        self.db.submit_part("task-1", part["part_id"], "worker", "首次完成", "2026-07-15T10:00:00+08:00")
+        self.db.review_part(
+            "task-1", part["part_id"], "publisher", "rework", "需要复修", "2026-07-15T11:00:00+08:00",
+        )
+        self.db.start_rework("task-1", part["part_id"], "worker", "2026-07-16T09:00:00+08:00")
+        self.db.submit_part("task-1", part["part_id"], "worker", "复修完成", "2026-07-16T10:00:00+08:00")
+        self.db.review_part(
+            "task-1", part["part_id"], "publisher", "approve", "通过", "2026-07-16T11:00:00+08:00",
+        )
+
+        first_day = self.db.admin_annotation_statistics(
+            "2026-07-15T00:00:00+08:00",
+            "2026-07-16T00:00:00+08:00",
+            "2026-07-16T12:00:00+08:00",
+        )
+        first_worker = next(item for item in first_day["users"] if item["username"] == "worker")
+        self.assertEqual(first_worker["completed_parts"], 0)
+        self.assertEqual(first_worker["image_count"], 0)
+        self.assertEqual(first_worker["work_seconds"], 3600.0)
+
+        second_day = self.db.admin_annotation_statistics(
+            "2026-07-16T00:00:00+08:00",
+            "2026-07-17T00:00:00+08:00",
+            "2026-07-16T12:00:00+08:00",
+        )
+        second_worker = next(item for item in second_day["users"] if item["username"] == "worker")
+        self.assertEqual(second_worker["completed_parts"], 1)
+        self.assertEqual(second_worker["image_count"], 80)
+        self.assertEqual(second_worker["work_seconds"], 3600.0)
+
+        full_period = self.db.admin_annotation_statistics(
+            "2026-07-15T00:00:00+08:00",
+            "2026-07-17T00:00:00+08:00",
+            "2026-07-16T12:00:00+08:00",
+        )
+        full_worker = next(item for item in full_period["users"] if item["username"] == "worker")
+        self.assertEqual(full_worker["completed_parts"], 1)
+        self.assertEqual(full_worker["image_count"], 80)
+        self.assertEqual(full_worker["work_seconds"], 7200.0)
+
     def test_task_can_create_parts_from_work_directory_specs(self) -> None:
         self.db.create_task(
             task(), 0, "2026-07-15T10:00:00+08:00",

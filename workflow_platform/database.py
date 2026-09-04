@@ -1180,12 +1180,12 @@ class PlatformDatabase:
     def admin_annotation_statistics(self, start: str, end: str, now: str) -> dict[str, Any]:
         """Aggregate per-user and per-task annotation work for a time window.
 
-        A Part contributes to a row when it was submitted in the window or
-        when one of its work sessions overlaps the window.  Work time is
-        clipped to the requested window so week/day/month reports remain
-        accurate even when a session crosses a boundary.  Image counts use
-        the Part's current progress value, which is finalized to the Part's
-        image total on submission when that total is known.
+        A Part contributes work time when one of its sessions overlaps the
+        window.  Completed Part and image counts are attributed only to the
+        window containing the Part's latest submission.  This keeps rework
+        sessions in the time total without counting the same image set again.
+        Work time is clipped to the requested window so week/day/month reports
+        remain accurate even when a session crosses a boundary.
         """
         try:
             window_start = datetime.fromisoformat(start)
@@ -1289,9 +1289,10 @@ class PlatformDatabase:
             if completed:
                 task_item["completed_parts"] += 1
                 item["completed_parts"] += 1
-            task_item["image_count"] += max(0, int(part["progress_count"] or 0))
+                image_count = max(0, int(part["progress_count"] or 0))
+                task_item["image_count"] += image_count
+                item["image_count"] += image_count
             task_item["work_seconds"] += seconds
-            item["image_count"] += max(0, int(part["progress_count"] or 0))
             item["work_seconds"] += seconds
 
         users: list[dict[str, Any]] = []
