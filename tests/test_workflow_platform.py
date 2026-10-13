@@ -241,7 +241,8 @@ class WorkflowPlatformTests(unittest.TestCase):
         self.assertFalse(detail["is_publisher"])
         self.assertTrue(detail["can_review"])
         self.assertEqual(len(detail["parts"]), 2)
-        self.assertNotIn("statistics", detail)
+        self.assertIn("statistics", detail)
+        self.assertTrue(detail["can_manage_task"])
 
         reviewed = self.client.post(
             f"/api/tasks/{task_id}/parts/{claimed['part_id']}/review",
@@ -422,9 +423,45 @@ class WorkflowPlatformTests(unittest.TestCase):
 
     def test_health_and_authentication_contract(self) -> None:
         health = self.client.get("/api/health")
-        self.assertEqual(health.json()["api_schema_version"], 14)
+        self.assertEqual(health.json()["api_schema_version"], 18)
         self.client.post("/api/auth/logout")
         self.assertEqual(self.client.get("/api/tasks").status_code, 401)
+
+    def test_part_work_time_api_allows_initiators_and_admin_only(self) -> None:
+        self.client.post("/api/users", json={
+            "username": "admin2", "password": "admin2-pass", "role": "admin",
+        })
+        platform.database().create_task({
+            "task_id": "time-edit", "name": "耗时修正", "publisher": "publisher",
+            "applicant": "worker",
+        }, 1, "2026-09-10T10:00:00+08:00")
+        part_id = platform.database().list_parts("time-edit", "2026-09-10T10:00:00+08:00")[0]["part_id"]
+        route = f"/api/tasks/time-edit/parts/{part_id}"
+
+        self.client.post("/api/auth/login", json={"username": "worker", "password": "worker-pass"})
+        applicant_edit = self.client.patch(route, json={"work_seconds": 600})
+        self.assertEqual(applicant_edit.status_code, 200, applicant_edit.text)
+        self.assertEqual(applicant_edit.json()["part"]["work_seconds"], 600)
+
+        platform.database().create_user(
+            "outsider", platform.hash_password("outsider-pass"), "user", "",
+            "2026-09-10T10:00:00+08:00",
+        )
+        self.client.post("/api/auth/login", json={"username": "outsider", "password": "outsider-pass"})
+        self.assertEqual(self.client.patch(route, json={"work_seconds": 300}).status_code, 403)
+
+        self.client.post("/api/auth/login", json={"username": "admin2", "password": "admin2-pass"})
+        admin_edit = self.client.patch(route, json={"work_seconds": 300})
+        self.assertEqual(admin_edit.status_code, 200, admin_edit.text)
+        self.assertEqual(admin_edit.json()["part"]["work_seconds_override"], 300)
+        cleared = self.client.patch(route, json={"work_seconds": None})
+        self.assertEqual(cleared.status_code, 200, cleared.text)
+        self.assertIsNone(cleared.json()["part"]["work_seconds_override"])
+        self.assertEqual(self.client.patch(route, json={"work_seconds": 31 * 86400 + 1}).status_code, 422)
+        self.assertEqual(self.client.patch(route, json={"work_seconds": "300"}).status_code, 422)
+        self.assertEqual(self.client.patch(route, json={"work_seconds": True}).status_code, 422)
+        self.assertEqual(self.client.patch(route, json={"work_seconds": True}).status_code, 422)
+        self.assertEqual(self.client.patch(route, json={"work_seconds": "300"}).status_code, 422)
 
     def test_admin_resets_and_deletes_user(self) -> None:
         task_id = self._publish(TABLE.splitlines()[1], 1)["tasks"][0]["task_id"]

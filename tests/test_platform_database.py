@@ -82,7 +82,7 @@ class PlatformDatabaseTests(unittest.TestCase):
         self.assertEqual(stats[0]["images_per_hour"], 48.0)
         self.assertEqual(
             self.db.task_annotation_statistics("task-1", "2026-07-15T10:20:00+08:00"),
-            {"work_seconds": 900.0, "image_count": 12, "images_per_hour": 48.0},
+            {"work_seconds": 900.0, "image_count": 12, "images_per_hour": 48.0, "bbox_count": 1, "bboxes_per_hour": 4.0},
         )
 
     def test_submit_marks_all_part_images_annotated(self) -> None:
@@ -187,7 +187,54 @@ class PlatformDatabaseTests(unittest.TestCase):
         parts = self.db.list_parts("task-1", "2026-07-15T10:00:00+08:00")
         self.assertEqual([part["name"] for part in parts], ["split_001", "group / split_002"])
         self.assertEqual(parts[1]["work_path"], r"\\server\data\group\split_002")
-        self.assertEqual(self.db.health()["schema_version"], 7)
+        self.assertEqual(self.db.health()["schema_version"], 10)
+
+    def test_part_work_time_override_preserves_sessions_and_updates_statistics(self) -> None:
+        self.db.create_task(task(), 1, "2026-07-15T10:00:00+08:00")
+        self.db.create_user("admin", "hash", "admin", "管理员", "2026-07-15T10:00:00+08:00")
+        part = self.db.claim_next_part("task-1", "worker", "2026-07-15T10:00:00+08:00")
+        self.db.submit_part("task-1", part["part_id"], "worker", "", "2026-07-15T11:00:00+08:00")
+
+        updated = self.db.update_part(
+            "task-1", part["part_id"], "刘湛基", "2026-07-15T11:05:00+08:00",
+            work_seconds=1800,
+        )
+        self.assertEqual(updated["work_seconds"], 1800)
+        self.assertEqual(updated["work_seconds_override"], 1800)
+        with self.db.connection() as connection:
+            session = connection.execute(
+                "SELECT duration_seconds FROM part_work_sessions WHERE part_id=?",
+                (part["part_id"],),
+            ).fetchone()
+        self.assertEqual(session["duration_seconds"], 3600)
+        self.assertEqual(self.db.annotator_statistics("task-1", "2026-07-15T11:05:00+08:00")[0]["work_seconds"], 1800)
+        self.assertEqual(self.db.task_annotation_statistics("task-1", "2026-07-15T11:05:00+08:00")["work_seconds"], 1800)
+        admin_stats = self.db.admin_annotation_statistics(
+            "2026-07-15T00:00:00+08:00", "2026-07-16T00:00:00+08:00",
+            "2026-07-15T11:05:00+08:00",
+        )
+        worker = next(item for item in admin_stats["users"] if item["username"] == "worker")
+        self.assertEqual(worker["work_seconds"], 1800)
+        self.assertEqual(admin_stats["total"]["work_seconds"], 1800)
+
+        cleared = self.db.update_part(
+            "task-1", part["part_id"], "admin", "2026-07-15T11:10:00+08:00",
+            work_seconds=None,
+        )
+        self.assertIsNone(cleared["work_seconds_override"])
+        self.assertEqual(cleared["work_seconds"], 3600)
+        self.assertEqual(self.db.task_annotation_statistics("task-1", "2026-07-15T11:10:00+08:00")["work_seconds"], 3600)
+        logs = self.db.list_task_audit_logs("task-1")
+        self.assertEqual([log["field_name"] for log in logs[:2]], ["work_seconds", "work_seconds"])
+
+        with self.assertRaises(PermissionError):
+            self.db.update_part("task-1", part["part_id"], "worker", "2026-07-15T11:10:00+08:00", work_seconds=10)
+        admin_updated = self.db.update_part("task-1", part["part_id"], "admin", "2026-07-15T11:10:00+08:00", bbox_count=10)
+        self.assertEqual(admin_updated["bbox_count"], 10)
+        with self.assertRaises(ValueError):
+            self.db.update_part("task-1", part["part_id"], "admin", "2026-07-15T11:10:00+08:00", work_seconds=31 * 86400 + 1)
+        with self.assertRaises(ValueError):
+            self.db.update_part("task-1", part["part_id"], "admin", "2026-07-15T11:10:00+08:00", work_seconds=True)
 
     def test_large_part_batch_can_be_created_and_reviewed_by_page(self) -> None:
         self.db.create_task(task(), 2000, "2026-07-15T10:00:00+08:00")

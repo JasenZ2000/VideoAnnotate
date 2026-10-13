@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import math
+import ntpath
+import posixpath
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 10
+_UNSET = object()
 PART_STATUSES = ("pending", "in_progress", "paused", "submitted", "rework", "completed")
 TIME_DEVIATION_THRESHOLD = 0.5
 TASK_PRIORITIES = ("low", "medium", "high", "urgent")
@@ -45,6 +49,19 @@ class PlatformDatabase:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
         return connection
+
+    def _is_admin(self, connection: sqlite3.Connection, actor: str) -> bool:
+        user = connection.execute("SELECT role,is_active FROM users WHERE username=?", (actor,)).fetchone()
+        return bool(user and user["role"] == "admin" and user["is_active"])
+
+    def _can_manage_task(self, connection: sqlite3.Connection, publisher: str, actor: str) -> bool:
+        return publisher == actor or self._is_admin(connection, actor)
+
+    @staticmethod
+    def _path_key(path: str) -> str:
+        if "\\" in path or ntpath.splitdrive(path)[0]:
+            return ntpath.normcase(ntpath.normpath(path))
+        return posixpath.normpath(path)
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -83,6 +100,7 @@ class PlatformDatabase:
                     password_hash TEXT NOT NULL,
                     role TEXT NOT NULL DEFAULT 'user',
                     display_name TEXT NOT NULL DEFAULT '',
+                    phone TEXT NOT NULL DEFAULT '',
                     is_active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -130,6 +148,7 @@ class PlatformDatabase:
                     instructions TEXT NOT NULL DEFAULT '',
                     work_path TEXT NOT NULL DEFAULT '',
                     image_count INTEGER NOT NULL DEFAULT 0,
+                    bbox_count INTEGER CHECK(bbox_count IS NULL OR (typeof(bbox_count)='integer' AND bbox_count>=0)),
                     progress_count INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'pending',
                     annotator TEXT,
@@ -137,6 +156,7 @@ class PlatformDatabase:
                     submitted_at TEXT,
                     reviewed_at TEXT,
                     work_seconds REAL NOT NULL DEFAULT 0,
+                    work_seconds_override REAL CHECK(work_seconds_override IS NULL OR (work_seconds_override>=0 AND work_seconds_override<=2678400)),
                     submission_note TEXT NOT NULL DEFAULT '',
                     review_note TEXT NOT NULL DEFAULT '',
                     time_review_status TEXT NOT NULL DEFAULT '',
@@ -183,8 +203,67 @@ class PlatformDatabase:
                 );
                 CREATE INDEX IF NOT EXISTS idx_task_audit_logs_task
                     ON task_audit_logs(task_id, audit_id DESC);
+                CREATE TABLE IF NOT EXISTS attendance_settings (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    work_start TEXT NOT NULL DEFAULT '09:00',
+                    work_end TEXT NOT NULL DEFAULT '18:00',
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS attendance_records (
+                    attendance_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+                    work_date TEXT NOT NULL,
+                    checked_in_at TEXT NOT NULL,
+                    UNIQUE(username, work_date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance_records(work_date);
+                CREATE TABLE IF NOT EXISTS notification_settings (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    config TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS reminder_config (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    config TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS reminder_events (
+                    event_id TEXT PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    detail TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS automatic_report_runs (
+                    work_date TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ding_robots (
+                    robot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    webhook_url TEXT NOT NULL,
+                    secret TEXT NOT NULL DEFAULT '',
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ding_recipients (
+                    recipient_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    phone TEXT NOT NULL UNIQUE,
+                    username TEXT NOT NULL DEFAULT '',
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
+            user_columns = {row["name"] for row in connection.execute("PRAGMA table_info(users)")}
+            if "phone" not in user_columns:
+                connection.execute("ALTER TABLE users ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
             task_columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
             rank_added = "rank" not in task_columns
             additions = {
@@ -218,7 +297,9 @@ class PlatformDatabase:
             if "work_path" not in part_columns:
                 connection.execute("ALTER TABLE parts ADD COLUMN work_path TEXT NOT NULL DEFAULT ''")
             part_additions = {
+                "work_seconds_override": "REAL CHECK(work_seconds_override IS NULL OR (work_seconds_override>=0 AND work_seconds_override<=2678400))",
                 "image_count": "INTEGER NOT NULL DEFAULT 0",
+                "bbox_count": "INTEGER CHECK(bbox_count IS NULL OR (typeof(bbox_count)='integer' AND bbox_count>=0))",
                 "progress_count": "INTEGER NOT NULL DEFAULT 0",
                 "time_review_status": "TEXT NOT NULL DEFAULT ''",
                 "time_review_note": "TEXT NOT NULL DEFAULT ''",
@@ -280,12 +361,12 @@ class PlatformDatabase:
             ).fetchone()[0])
 
     def create_user(self, username: str, password_hash: str, role: str, display_name: str,
-                    now: str, is_active: bool = True) -> dict[str, Any]:
+                    now: str, is_active: bool = True, phone: str = "") -> dict[str, Any]:
         with self.transaction() as connection:
             connection.execute(
-                "INSERT INTO users(username,password_hash,role,display_name,is_active,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (username, password_hash, role, display_name, int(is_active), now, now),
+                "INSERT INTO users(username,password_hash,role,display_name,phone,is_active,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (username, password_hash, role, display_name, phone, int(is_active), now, now),
             )
         return self.get_user(username)
 
@@ -303,18 +384,19 @@ class PlatformDatabase:
     def list_users(self) -> list[dict[str, Any]]:
         with self.connection() as connection:
             rows = connection.execute(
-                "SELECT username,role,display_name,is_active,created_at,updated_at,last_login_at "
+                "SELECT username,role,display_name,phone,is_active,created_at,updated_at,last_login_at "
                 "FROM users ORDER BY role DESC, username"
             ).fetchall()
         return [{**dict(row), "is_active": bool(row["is_active"])} for row in rows]
 
     def update_user(self, username: str, *, role: Optional[str] = None,
                     display_name: Optional[str] = None, password_hash: Optional[str] = None,
+                    phone: Optional[str] = None,
                     is_active: Optional[bool] = None, now: str) -> dict[str, Any]:
         assignments = ["updated_at=?"]
         values: list[Any] = [now]
         for column, value in (("role", role), ("display_name", display_name),
-                              ("password_hash", password_hash)):
+                              ("password_hash", password_hash), ("phone", phone)):
             if value is not None:
                 assignments.append(f"{column}=?")
                 values.append(value)
@@ -471,8 +553,8 @@ class PlatformDatabase:
                     part_specs: Optional[list[dict[str, str]]] = None,
                     *, return_details: bool = True) -> dict[str, Any]:
         effective_count = len(part_specs) if part_specs is not None else part_count
-        if effective_count < 1 or effective_count > 10000:
-            raise ValueError("part count must be between 1 and 10000")
+        if effective_count < 0 or effective_count > 10000:
+            raise ValueError("part count must be between 0 and 10000")
         with self.transaction() as connection:
             self._normalize_active_task_ranks(connection)
             rank = task.get("rank")
@@ -484,7 +566,7 @@ class PlatformDatabase:
             if priority not in TASK_PRIORITIES:
                 raise ValueError("unsupported task priority")
             columns = ["task_id", "name", "status", "publisher", "manager", "product_tag",
-                       "part_prefix", *TASK_FIELDS, "priority", "rank", "created_at", "updated_at"]
+                       "part_prefix", "annotation_tool", *TASK_FIELDS, "priority", "rank", "created_at", "updated_at"]
             values = [
                 priority if column == "priority" else rank if column == "rank" else task.get(column, "")
                 for column in columns
@@ -515,7 +597,7 @@ class PlatformDatabase:
             ).fetchone()
             if task is None:
                 raise KeyError(task_id)
-            if task["publisher"] != actor:
+            if not self._can_manage_task(connection, task["publisher"], actor):
                 raise PermissionError("only publisher can edit task")
             values = {key: str(value).strip() for key, value in changes.items()}
             expected_changed = (
@@ -531,6 +613,10 @@ class PlatformDatabase:
                 f"UPDATE tasks SET {','.join(assignments)},updated_at=? WHERE task_id=?",
                 [*values.values(), now, task_id],
             )
+            for field, value in values.items():
+                if str(task[field]) != str(value):
+                    self._insert_audit(connection, task_id, actor, "edit_task", field,
+                                       str(task[field]), str(value), "", now)
             if expected_changed:
                 connection.execute(
                     "UPDATE parts SET time_review_status='',time_review_note='',"
@@ -546,8 +632,9 @@ class PlatformDatabase:
             ).fetchone()
             if task is None:
                 raise KeyError(task_id)
-            if task["publisher"] != actor:
+            if not self._can_manage_task(connection, task["publisher"], actor):
                 raise PermissionError("only publisher can delete task")
+            self._insert_audit(connection, task_id, actor, "delete_task", "deleted", "0", "1", "", now)
             connection.execute(
                 "UPDATE tasks SET deleted=1,updated_at=? WHERE task_id=?", (now, task_id)
             )
@@ -616,12 +703,22 @@ class PlatformDatabase:
         clean = prefix.strip()
         separator = "" if not clean or clean.endswith(("_", "-", " ")) else "_"
         values = []
+        existing_paths = {
+            self._path_key(row["work_path"])
+            for row in connection.execute("SELECT work_path FROM parts WHERE task_id=?", (task_id,))
+            if row["work_path"]
+        }
         for offset, index in enumerate(range(start, start + count)):
             spec = part_specs[offset] if part_specs is not None else None
             name = str(spec.get("name", "")).strip() if spec else ""
             if not name:
                 name = f"{clean}{separator}part_{index:03d}"
             work_path = str(spec.get("work_path", "")).strip() if spec else ""
+            if work_path:
+                key = self._path_key(work_path)
+                if key in existing_paths:
+                    raise ValueError(f"重复工作目录：{work_path}")
+                existing_paths.add(key)
             image_count = int(spec.get("image_count", 0) or 0) if spec else 0
             values.append((task_id, index, name, work_path, image_count, now, now))
         connection.executemany(
@@ -630,7 +727,9 @@ class PlatformDatabase:
         )
 
     def add_parts(self, task_id: str, count: int, actor: str, now: str, *,
-                  return_parts: bool = True) -> list[dict[str, Any]]:
+                  return_parts: bool = True,
+                  part_specs: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
+        count = len(part_specs) if part_specs is not None else count
         if count < 1 or count > 10000:
             raise ValueError("part count must be between 1 and 10000")
         with self.transaction() as connection:
@@ -641,9 +740,11 @@ class PlatformDatabase:
             ).fetchone()
             if task is None:
                 raise KeyError(task_id)
-            if task["publisher"] != actor:
+            if not self._can_manage_task(connection, task["publisher"], actor):
                 raise PermissionError("only publisher can add parts")
-            self._insert_parts(connection, task_id, count, task["part_prefix"], now)
+            self._insert_parts(connection, task_id, count, task["part_prefix"], now, part_specs)
+            self._insert_audit(connection, task_id, actor, "add_parts", "parts", "", str(count),
+                               json.dumps(part_specs or [], ensure_ascii=False), now)
             if task["status"] == "completed":
                 rank = int(connection.execute(
                     "SELECT COUNT(*)+1 FROM tasks WHERE deleted=0 AND status!='completed'"
@@ -662,20 +763,43 @@ class PlatformDatabase:
 
     def update_part(self, task_id: str, part_id: int, actor: str, now: str, *,
                     name: Optional[str] = None, work_path: Optional[str] = None,
-                    image_count: Optional[int] = None, progress_count: Optional[int] = None) -> dict[str, Any]:
+                    image_count: Optional[int] = None, progress_count: Optional[int] = None,
+                    bbox_count: Any = _UNSET, work_seconds: Any = _UNSET) -> dict[str, Any]:
         with self.transaction() as connection:
             row = connection.execute("SELECT p.*,t.publisher,t.applicant FROM parts p JOIN tasks t ON t.task_id=p.task_id WHERE p.task_id=? AND p.part_id=?", (task_id, part_id)).fetchone()
             if row is None: raise KeyError(part_id)
-            is_publisher = row["publisher"] == actor or row["applicant"] == actor
-            if not is_publisher and row["annotator"] != actor: raise PermissionError("not allowed to edit part")
+            is_admin = self._is_admin(connection, actor)
+            is_initiator = row["publisher"] == actor or row["applicant"] == actor or is_admin
+            is_annotator = row["annotator"] == actor
             changes = {}
-            if is_publisher:
+            if work_seconds is not _UNSET:
+                if work_seconds is not None:
+                    if type(work_seconds) not in (int, float) or not math.isfinite(float(work_seconds)) or not 0 <= float(work_seconds) <= 31 * 86400:
+                        raise ValueError("work seconds must be between 0 and 31 days")
+                if not is_initiator and not is_admin:
+                    raise PermissionError("only publisher, applicant or admin can edit part work time")
+                changes["work_seconds_override"] = work_seconds
+            if bbox_count is not _UNSET:
+                if bbox_count is not None and (type(bbox_count) is not int or not 0 <= bbox_count <= 2**53 - 1):
+                    raise ValueError("bbox count must be a nonnegative safe integer or null")
+                if not is_initiator and (not is_annotator or row["status"] not in {"in_progress", "paused", "rework", "submitted"}):
+                    raise PermissionError("only publisher or applicant can edit completed part bbox count")
+                changes["bbox_count"] = bbox_count
+            if is_initiator:
                 if name is not None: changes["name"] = str(name).strip()
                 if work_path is not None: changes["work_path"] = str(work_path).strip()
                 if image_count is not None: changes["image_count"] = max(0, int(image_count))
-            if progress_count is not None and row["annotator"] == actor:
+            elif any(value is not None for value in (name, work_path, image_count)):
+                raise PermissionError("only publisher or applicant can edit part details")
+            if progress_count is not None and is_annotator:
                 changes["progress_count"] = max(0, int(progress_count))
+            elif progress_count is not None:
+                raise PermissionError("only assigned annotator can edit progress")
             if changes:
+                if "work_seconds_override" in changes and row["work_seconds_override"] != changes["work_seconds_override"]:
+                    old_seconds = float(row["work_seconds_override"]) if row["work_seconds_override"] is not None else float(row["work_seconds"])
+                    new_seconds = changes["work_seconds_override"]
+                    self._insert_audit(connection, task_id, actor, "update_part_work_seconds", "work_seconds", old_seconds, "" if new_seconds is None else new_seconds, "manual override; original sessions preserved", now)
                 assignments = ",".join(f"{k}=?" for k in changes)
                 connection.execute(f"UPDATE parts SET {assignments},updated_at=? WHERE part_id=?", [*changes.values(), now, part_id])
         return next(item for item in self.list_parts(task_id, now) if item["part_id"] == part_id)
@@ -690,7 +814,7 @@ class PlatformDatabase:
             ).fetchone()
             if row is None:
                 raise KeyError(part_id)
-            if row["publisher"] != actor:
+            if not self._can_manage_task(connection, row["publisher"], actor):
                 raise PermissionError("only publisher can delete part")
             deleted = dict(row)
             detail = json.dumps({
@@ -744,6 +868,233 @@ class PlatformDatabase:
             task["part_summary"] = self.part_summary(task["task_id"])
             tasks.append(task)
         return tasks
+
+    def task_overview(self, now: str) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            tasks = connection.execute("SELECT * FROM tasks WHERE deleted=0 ORDER BY updated_at DESC,task_id").fetchall()
+            counts = connection.execute(
+                "SELECT p.task_id,p.status,COUNT(*) count FROM parts p JOIN tasks t ON t.task_id=p.task_id "
+                "WHERE t.deleted=0 GROUP BY p.task_id,p.status"
+            ).fetchall()
+        summaries: dict[str, dict[str, int]] = {}
+        for row in counts:
+            summaries.setdefault(row["task_id"], {status: 0 for status in PART_STATUSES})[row["status"]] = row["count"]
+        result = []
+        for row in tasks:
+            task = self._task_dict(row)
+            summary = summaries.get(row["task_id"], {status: 0 for status in PART_STATUSES})
+            total = sum(summary.values())
+            if total == 0:
+                state = "awaiting_parts"
+            elif summary["completed"] == total:
+                state = "completed"
+            elif summary["pending"] == total:
+                state = "pending"
+            elif summary["submitted"] + summary["completed"] == total:
+                state = "submitted"
+            elif summary["in_progress"] or summary["paused"] or summary["rework"]:
+                state = "in_progress"
+            else:
+                state = "mixed"
+            task.update(part_summary={**summary, "total": total}, overview_status=state,
+                        completion_percent=round(summary["completed"] / total * 100, 1) if total else 0)
+            result.append(task)
+        return result
+
+    def attendance_settings(self, now: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute("SELECT work_start,work_end,updated_at FROM attendance_settings WHERE id=1").fetchone()
+        return dict(row) if row else {"work_start": "09:00", "work_end": "18:00", "updated_at": now}
+
+    def update_attendance_settings(self, work_start: str, work_end: str, now: str) -> dict[str, Any]:
+        with self.transaction() as connection:
+            connection.execute("INSERT INTO attendance_settings(id,work_start,work_end,updated_at) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET work_start=excluded.work_start,work_end=excluded.work_end,updated_at=excluded.updated_at", (work_start, work_end, now))
+        return self.attendance_settings(now)
+
+    def check_in(self, username: str, work_date: str, now: str) -> dict[str, Any]:
+        with self.transaction() as connection:
+            connection.execute("INSERT INTO attendance_records(username,work_date,checked_in_at) VALUES(?,?,?) ON CONFLICT(username,work_date) DO NOTHING", (username, work_date, now))
+            row = connection.execute("SELECT username,work_date,checked_in_at FROM attendance_records WHERE username=? AND work_date=?", (username, work_date)).fetchone()
+        return dict(row)
+
+    def attendance_status(self, username: str, work_date: str, now: str) -> dict[str, Any]:
+        settings = self.attendance_settings(now)
+        with self.connection() as connection:
+            row = connection.execute("SELECT username,work_date,checked_in_at FROM attendance_records WHERE username=? AND work_date=?", (username, work_date)).fetchone()
+            count = connection.execute("SELECT COUNT(*) FROM attendance_records WHERE work_date=?", (work_date,)).fetchone()[0]
+        return {"date": work_date, "checked_in": row is not None, "record": dict(row) if row else None, "checked_in_count": count, **settings}
+
+    def attendance_summary(self, work_date: str, now: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            count = connection.execute("SELECT COUNT(*) FROM attendance_records WHERE work_date=?", (work_date,)).fetchone()[0]
+        return {"date": work_date, "checked_in_count": count, **self.attendance_settings(now)}
+
+    def attendance_settlements(self, selected_date: str, days: int = 7) -> dict[str, Any]:
+        days = max(1, min(days, 7))
+        end_date = datetime.fromisoformat(selected_date).date()
+        dates = [(end_date - timedelta(days=offset)).isoformat() for offset in reversed(range(days))]
+        with self.connection() as connection:
+            attendance_daily = connection.execute(
+                "SELECT work_date date,COUNT(*) count FROM attendance_records "
+                "WHERE work_date BETWEEN ? AND ? GROUP BY work_date ORDER BY work_date", (dates[0], dates[-1]),
+            ).fetchall()
+            attendance_people = connection.execute(
+                "SELECT a.username,COALESCE(u.display_name,'') display_name,a.checked_in_at "
+                "FROM attendance_records a LEFT JOIN users u ON u.username=a.username "
+                "WHERE a.work_date=? ORDER BY display_name,a.username", (selected_date,),
+            ).fetchall()
+            work_daily = connection.execute(
+                "SELECT substr(p.submitted_at,1,10) date,COUNT(*) count "
+                "FROM parts p JOIN tasks t ON t.task_id=p.task_id "
+                "WHERE t.deleted=0 AND p.submitted_at IS NOT NULL AND substr(p.submitted_at,1,10) BETWEEN ? AND ? "
+                "GROUP BY substr(p.submitted_at,1,10) ORDER BY date", (dates[0], dates[-1]),
+            ).fetchall()
+            parts = connection.execute(
+                "SELECT p.part_id,p.annotator username,COALESCE(u.display_name,'') display_name,"
+                "t.product_tag,t.project,t.annotation_content,"
+                "CASE WHEN CAST(t.estimated_hours AS REAL)>0 AND pc.total>0 "
+                "THEN CAST(t.estimated_hours AS REAL)/pc.total "
+                "WHEN CAST(t.hourly_capacity AS REAL)>0 THEN CAST(t.data_amount AS REAL)/CAST(t.hourly_capacity AS REAL)/pc.total "
+                "ELSE 0 END expected_hours,"
+                "CASE WHEN p.work_seconds_override IS NOT NULL THEN p.work_seconds_override "
+                "ELSE p.work_seconds END actual_seconds "
+                "FROM parts p JOIN tasks t ON t.task_id=p.task_id "
+                "LEFT JOIN users u ON u.username=p.annotator "
+                "JOIN (SELECT task_id,COUNT(*) total FROM parts GROUP BY task_id) pc ON pc.task_id=t.task_id "
+                "WHERE t.deleted=0 AND p.submitted_at IS NOT NULL AND substr(p.submitted_at,1,10)=? "
+                "ORDER BY t.rank,t.task_id,p.part_index", (selected_date,),
+            ).fetchall()
+        attendance_counts = {row["date"]: row["count"] for row in attendance_daily}
+        work_counts = {row["date"]: row["count"] for row in work_daily}
+        return {
+            "attendance": {"daily": [{"date": value, "count": attendance_counts.get(value, 0)} for value in dates],
+                           "selected_date": selected_date, "users": [dict(row) for row in attendance_people]},
+            "work": {"daily": [{"date": value, "count": work_counts.get(value, 0)} for value in dates],
+                     "selected_date": selected_date,
+                     "parts": [{**dict(row), "actual_hours": round(float(row["actual_seconds"] or 0) / 3600, 3)} for row in parts]},
+        }
+
+    def list_ding_robots(self) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute("SELECT robot_id,name,webhook_url,is_active,created_at,updated_at FROM ding_robots ORDER BY robot_id").fetchall()
+        return [dict(row) for row in rows]
+
+    def notification_settings(self) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute("SELECT config FROM notification_settings WHERE id=1").fetchone()
+            latest = connection.execute("SELECT * FROM automatic_report_runs ORDER BY work_date DESC LIMIT 1").fetchone()
+        config = json.loads(row["config"]) if row else {"enabled": False, "robot_id": None, "usernames": [], "note": ""}
+        return {**config, "latest_run": dict(latest) if latest else None}
+
+    def reminder_config(self) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute("SELECT config FROM reminder_config WHERE id=1").fetchone()
+        return json.loads(row["config"]) if row else {}
+
+    def save_reminder_config(self, config: dict[str, Any]) -> None:
+        with self.transaction() as connection:
+            connection.execute("INSERT INTO reminder_config(id,config) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET config=excluded.config", (json.dumps(config, ensure_ascii=False),))
+
+    def enqueue_reminder(self, event_id: str, event_type: str, task_id: str, payload: dict[str, Any], now: str) -> None:
+        with self.transaction() as connection:
+            connection.execute("INSERT OR IGNORE INTO reminder_events(event_id,event_type,task_id,payload,created_at) VALUES(?,?,?,?,?)", (event_id, event_type, task_id, json.dumps(payload, ensure_ascii=False), now))
+
+    def claim_reminder(self) -> Optional[dict[str, Any]]:
+        with self.transaction() as connection:
+            row = connection.execute("SELECT * FROM reminder_events WHERE status='pending' ORDER BY created_at,event_id LIMIT 1").fetchone()
+            if row:
+                connection.execute("UPDATE reminder_events SET status='sending' WHERE event_id=?", (row["event_id"],))
+        return dict(row) if row else None
+
+    def finish_reminder(self, event_id: str, status: str, detail: str) -> None:
+        with self.transaction() as connection:
+            connection.execute("UPDATE reminder_events SET status=?,detail=? WHERE event_id=?", (status, detail, event_id))
+
+    def reminder_history(self) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute("SELECT event_id,event_type,task_id,status,detail,created_at FROM reminder_events ORDER BY created_at DESC LIMIT 30").fetchall()
+        return [dict(row) for row in rows]
+
+    def save_notification_settings(self, config: dict[str, Any], now: str) -> dict[str, Any]:
+        with self.transaction() as connection:
+            connection.execute("INSERT INTO notification_settings(id,config,updated_at) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET config=excluded.config,updated_at=excluded.updated_at", (json.dumps(config, ensure_ascii=False), now))
+        return self.notification_settings()
+
+    def claim_automatic_report(self, work_date: str, now: str) -> bool:
+        with self.transaction() as connection:
+            cursor = connection.execute("INSERT OR IGNORE INTO automatic_report_runs(work_date,status,updated_at) VALUES(?,'sending',?)", (work_date, now))
+        return cursor.rowcount == 1
+
+    def finish_automatic_report(self, work_date: str, status: str, detail: str, now: str) -> None:
+        with self.transaction() as connection:
+            connection.execute("UPDATE automatic_report_runs SET status=?,detail=?,updated_at=? WHERE work_date=?", (status, detail, now, work_date))
+
+    def get_ding_robot(self, robot_id: int) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute("SELECT * FROM ding_robots WHERE robot_id=?", (robot_id,)).fetchone()
+        if row is None:
+            raise KeyError(robot_id)
+        return dict(row)
+
+    def save_ding_robot(self, name: str, webhook_url: str, secret: str, now: str) -> int:
+        with self.transaction() as connection:
+            cursor = connection.execute("INSERT INTO ding_robots(name,webhook_url,secret,created_at,updated_at) VALUES(?,?,?,?,?)", (name, webhook_url, secret, now, now))
+        return int(cursor.lastrowid)
+
+    def delete_ding_robot(self, robot_id: int) -> None:
+        with self.transaction() as connection:
+            cursor = connection.execute("DELETE FROM ding_robots WHERE robot_id=?", (robot_id,))
+            if cursor.rowcount != 1:
+                raise KeyError(robot_id)
+
+    def list_ding_recipients(self) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute("SELECT recipient_id,name,phone,username,is_active FROM ding_recipients ORDER BY name,recipient_id").fetchall()
+        return [dict(row) for row in rows]
+
+    def save_ding_recipient(self, name: str, phone: str, username: str, now: str) -> int:
+        with self.transaction() as connection:
+            cursor = connection.execute("INSERT INTO ding_recipients(name,phone,username,created_at,updated_at) VALUES(?,?,?,?,?)", (name, phone, username, now, now))
+        return int(cursor.lastrowid)
+
+    def delete_ding_recipient(self, recipient_id: int) -> None:
+        with self.transaction() as connection:
+            cursor = connection.execute("DELETE FROM ding_recipients WHERE recipient_id=?", (recipient_id,))
+            if cursor.rowcount != 1:
+                raise KeyError(recipient_id)
+
+    def directory_overview(self, task_id: str = "", status: str = "", query: str = "",
+                           page: int = 1, page_size: int = 50, product_tag: str = "") -> dict[str, Any]:
+        if status and status not in PART_STATUSES:
+            raise ValueError("unsupported part status")
+        if page < 1 or not 1 <= page_size <= 200:
+            raise ValueError("invalid pagination")
+        conditions = ["t.deleted=0"]
+        params: list[Any] = []
+        if task_id:
+            conditions.append("t.task_id=?")
+            params.append(task_id)
+        if status:
+            conditions.append("p.status=?")
+            params.append(status)
+        if product_tag:
+            conditions.append("t.product_tag=?")
+            params.append(product_tag)
+        if query.strip():
+            conditions.append("(instr(lower(p.work_path),lower(?))>0 OR instr(lower(p.name),lower(?))>0 "
+                              "OR instr(lower(t.project),lower(?))>0)")
+            params.extend([query.strip()] * 3)
+        source = " FROM parts p JOIN tasks t ON t.task_id=p.task_id WHERE " + " AND ".join(conditions)
+        with self.connection() as connection:
+            total = connection.execute("SELECT COUNT(*)" + source, params).fetchone()[0]
+            rows = connection.execute(
+                "SELECT p.part_id,p.name part_name,p.work_path,p.status,p.annotator,p.claimed_at,"
+                "p.submitted_at,p.reviewed_at,t.task_id,t.name task_name,t.project,t.product_tag,"
+                "t.annotation_content,t.application_date,t.applicant,t.publisher,t.annotation_tool,"
+                "t.data_path,t.guide_path" + source + " ORDER BY t.updated_at DESC,t.task_id,p.part_index LIMIT ? OFFSET ?",
+                [*params, page_size, (page - 1) * page_size],
+            ).fetchall()
+        return {"items": [dict(row) for row in rows], "total": total, "page": page, "page_size": page_size}
 
     def get_task(self, task_id: str, now: str) -> dict[str, Any]:
         with self.connection() as connection:
@@ -815,7 +1166,10 @@ class PlatformDatabase:
                 item = dict(row)
                 item["annotator"] = item.get("annotator") or ""
                 item["work_seconds"] = round(
-                    float(item["work_seconds"]) + _elapsed_seconds(item["active_started_at"], now), 3
+                    float(item["work_seconds_override"])
+                    if item.get("work_seconds_override") is not None
+                    else float(item["work_seconds"]) + _elapsed_seconds(item["active_started_at"], now),
+                    3,
                 )
                 expected = float(item.get("expected_part_seconds") or 0)
                 item["time_deviation_ratio"] = round(
@@ -861,7 +1215,12 @@ class PlatformDatabase:
             for row in rows:
                 item = dict(row)
                 item["annotator"] = item.get("annotator") or ""
-                item["work_seconds"] = round(float(item["work_seconds"]) + _elapsed_seconds(item["active_started_at"], now), 3)
+                item["work_seconds"] = round(
+                    float(item["work_seconds_override"])
+                    if item.get("work_seconds_override") is not None
+                    else float(item["work_seconds"]) + _elapsed_seconds(item["active_started_at"], now),
+                    3,
+                )
                 expected = float(item.get("expected_part_seconds") or 0)
                 item["time_deviation_ratio"] = round((item["work_seconds"] - expected) / expected, 4) if expected else None
                 item["has_time_deviation"] = bool(expected and abs(item["time_deviation_ratio"]) >= TIME_DEVIATION_THRESHOLD)
@@ -1044,13 +1403,13 @@ class PlatformDatabase:
             ).fetchone()
             if row is None:
                 raise KeyError(part_id)
-            if actor not in {row["annotator"], row["publisher"]}:
+            if actor not in {row["annotator"], row["publisher"]} and not self._is_admin(connection, actor):
                 raise PermissionError("only assigned annotator or publisher can comment")
             connection.execute(
                 "INSERT INTO part_comments(part_id,actor,kind,content,created_at) VALUES(?,?,?,?,?)",
                 (part_id, actor, "note", text, now),
             )
-        parts = self.list_parts(task_id, now, None if actor == row["publisher"] else actor)
+        parts = self.list_parts(task_id, now)
         return next(item for item in parts if item["part_id"] == part_id)
 
     def review_part(self, task_id: str, part_id: int, actor: str, action: str,
@@ -1092,16 +1451,19 @@ class PlatformDatabase:
             raise ValueError("unsupported time review decision")
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT p.status,p.work_seconds,t.publisher,t.expected_part_seconds "
+                "SELECT p.status,p.work_seconds,p.work_seconds_override,t.publisher,t.expected_part_seconds,"
+                "(SELECT started_at FROM part_work_sessions s WHERE s.part_id=p.part_id AND s.ended_at IS NULL "
+                "ORDER BY session_id DESC LIMIT 1) active_started_at "
                 "FROM parts p JOIN tasks t ON t.task_id=p.task_id WHERE p.task_id=? AND p.part_id=?",
                 (task_id, part_id),
             ).fetchone()
             if row is None:
                 raise KeyError(part_id)
-            if row["publisher"] != actor:
+            if not self._can_manage_task(connection, row["publisher"], actor):
                 raise PermissionError("only publisher can review time deviation")
             expected = float(row["expected_part_seconds"] or 0)
-            if expected <= 0 or abs((float(row["work_seconds"]) - expected) / expected) < TIME_DEVIATION_THRESHOLD:
+            effective_seconds = float(row["work_seconds_override"]) if row["work_seconds_override"] is not None else float(row["work_seconds"]) + _elapsed_seconds(row["active_started_at"], now)
+            if expected <= 0 or abs((effective_seconds - expected) / expected) < TIME_DEVIATION_THRESHOLD:
                 raise ValueError("part work time does not currently have a large deviation")
             if row["status"] not in {"paused", "submitted", "rework", "completed"}:
                 raise ValueError("pause or submit the part before reviewing its time deviation")
@@ -1132,13 +1494,20 @@ class PlatformDatabase:
             item["total"] += 1
             if part["status"] in item:
                 item[part["status"]] += 1
+            if part.get("work_seconds_override") is not None:
+                item["work_seconds"] += float(part["work_seconds"])
+        overridden_parts = {
+            int(part["part_id"]) for part in parts if part.get("work_seconds_override") is not None
+        }
         with self.connection() as connection:
             sessions = connection.execute(
-                "SELECT s.annotator,s.started_at,s.ended_at,s.duration_seconds "
+                "SELECT s.part_id,s.annotator,s.started_at,s.ended_at,s.duration_seconds "
                 "FROM part_work_sessions s JOIN parts p ON p.part_id=s.part_id WHERE p.task_id=?",
                 (task_id,),
             ).fetchall()
             for session in sessions:
+                if int(session["part_id"]) in overridden_parts:
+                    continue
                 duration = (
                     float(session["duration_seconds"] or 0)
                     if session["ended_at"] else _elapsed_seconds(session["started_at"], now)
@@ -1150,6 +1519,14 @@ class PlatformDatabase:
         for item in grouped.values():
             item["display_name"] = names.get(item["username"], "")
             item["work_seconds"] = round(item["work_seconds"], 3)
+            item["bbox_count"] = sum(
+                part["bbox_count"] if part["bbox_count"] is not None else 1
+                for part in parts
+                if part.get("annotator") == item["username"] and part["status"] in {"submitted", "completed"}
+            )
+            item["bboxes_per_hour"] = round(
+                item["bbox_count"] / item["work_seconds"] * 3600, 3,
+            ) if item["work_seconds"] > 0 else 0.0
             item["image_count"] = sum(int(p.get("progress_count") or 0) for p in parts if p.get("annotator") == item["username"])
             item["images_per_hour"] = round(
                 item["image_count"] / item["work_seconds"] * 3600,
@@ -1160,17 +1537,21 @@ class PlatformDatabase:
     def task_annotation_statistics(self, task_id: str, now: str) -> dict[str, Any]:
         """Return the aggregate annotation statistics for a task.
 
-        Image counts come from each assigned Part's progress count, while work
-        time comes from all recorded work sessions (including an active one).
+        Image counts come from each assigned Part's progress count. Work time
+        uses a Part's manual override when present, otherwise its original work
+        sessions (including an active one).
         Keeping this derived from ``annotator_statistics`` ensures the task and
         per-person views use the same accounting rules.
         """
         stats = self.annotator_statistics(task_id, now)
         total_work_seconds = sum(float(item["work_seconds"]) for item in stats)
         total_image_count = sum(int(item["image_count"]) for item in stats)
+        total_bbox_count = sum(int(item["bbox_count"]) for item in stats)
         return {
             "work_seconds": round(total_work_seconds, 3),
             "image_count": total_image_count,
+            "bbox_count": total_bbox_count,
+            "bboxes_per_hour": round(total_bbox_count / total_work_seconds * 3600, 3) if total_work_seconds > 0 else 0.0,
             "images_per_hour": round(
                 total_image_count / total_work_seconds * 3600,
                 3,
@@ -1180,8 +1561,9 @@ class PlatformDatabase:
     def admin_annotation_statistics(self, start: str, end: str, now: str) -> dict[str, Any]:
         """Aggregate per-user and per-task annotation work for a time window.
 
-        A Part contributes work time when one of its sessions overlaps the
-        window.  Completed Part and image counts are attributed only to the
+        A Part normally contributes work time when one of its sessions overlaps
+        the window. A manual override replaces those sessions and is attributed
+        to the Part's completion window. Completed Part and image counts use the
         window containing the Part's latest submission.  This keeps rework
         sessions in the time total without counting the same image set again.
         Work time is clipped to the requested window so week/day/month reports
@@ -1213,7 +1595,7 @@ class PlatformDatabase:
                 "SELECT username,display_name,role,is_active FROM users ORDER BY username"
             ).fetchall()
             part_rows = connection.execute(
-                "SELECT p.part_id,p.task_id,p.annotator,p.image_count,p.progress_count,"
+                "SELECT p.part_id,p.task_id,p.annotator,p.image_count,p.progress_count,p.bbox_count,p.status,p.work_seconds_override,"
                 "p.submitted_at,p.reviewed_at,t.name,t.project,t.annotation_content "
                 "FROM parts p JOIN tasks t ON t.task_id=p.task_id "
                 "WHERE t.deleted=0 AND COALESCE(p.annotator,'')!=''"
@@ -1224,9 +1606,14 @@ class PlatformDatabase:
                 "JOIN tasks t ON t.task_id=p.task_id WHERE t.deleted=0"
             ).fetchall()
 
+        overridden_parts = {
+            int(part["part_id"]) for part in part_rows if part["work_seconds_override"] is not None
+        }
         session_seconds: dict[int, float] = {}
         for session in session_rows:
             part_id = int(session["part_id"])
+            if part_id in overridden_parts:
+                continue
             seconds = overlap_seconds(session["started_at"], session["ended_at"])
             if seconds <= 0:
                 continue
@@ -1254,6 +1641,7 @@ class PlatformDatabase:
                 "is_active": active.get(username, False),
                 "completed_parts": 0,
                 "image_count": 0,
+                "bbox_count": 0,
                 "work_seconds": 0.0,
                 "tasks": {},
             })
@@ -1268,7 +1656,11 @@ class PlatformDatabase:
             completed = in_window(part["submitted_at"]) or (
                 not part["submitted_at"] and in_window(part["reviewed_at"])
             )
-            seconds = session_seconds.get(part_id, 0.0)
+            seconds = (
+                float(part["work_seconds_override"])
+                if part["work_seconds_override"] is not None and completed
+                else session_seconds.get(part_id, 0.0)
+            )
             if not completed and seconds <= 0:
                 continue
             username = str(part["annotator"] or "")
@@ -1284,6 +1676,7 @@ class PlatformDatabase:
                 "annotation_content": str(part["annotation_content"] or ""),
                 "completed_parts": 0,
                 "image_count": 0,
+                "bbox_count": 0,
                 "work_seconds": 0.0,
             })
             if completed:
@@ -1292,12 +1685,19 @@ class PlatformDatabase:
                 image_count = max(0, int(part["progress_count"] or 0))
                 task_item["image_count"] += image_count
                 item["image_count"] += image_count
+                if part["status"] in {"submitted", "completed"}:
+                    bbox_count = part["bbox_count"] if part["bbox_count"] is not None else 1
+                    task_item["bbox_count"] += bbox_count
+                    item["bbox_count"] += bbox_count
             task_item["work_seconds"] += seconds
             item["work_seconds"] += seconds
 
         users: list[dict[str, Any]] = []
         for item in grouped.values():
             item["work_seconds"] = round(item["work_seconds"], 3)
+            item["bboxes_per_hour"] = round(
+                item["bbox_count"] / item["work_seconds"] * 3600, 3,
+            ) if item["work_seconds"] > 0 else 0.0
             item["images_per_hour"] = round(
                 item["image_count"] / item["work_seconds"] * 3600,
                 3,
@@ -1307,6 +1707,9 @@ class PlatformDatabase:
                     {
                         **task,
                         "work_seconds": round(task["work_seconds"], 3),
+                        "bboxes_per_hour": round(
+                            task["bbox_count"] / task["work_seconds"] * 3600, 3,
+                        ) if task["work_seconds"] > 0 else 0.0,
                         "images_per_hour": round(
                             task["image_count"] / task["work_seconds"] * 3600,
                             3,
@@ -1321,6 +1724,7 @@ class PlatformDatabase:
         users.sort(key=lambda item: (-item["image_count"], item["display_name"] or item["username"]))
         total_work_seconds = sum(float(item["work_seconds"]) for item in users)
         total_image_count = sum(int(item["image_count"]) for item in users)
+        total_bbox_count = sum(int(item["bbox_count"]) for item in users)
         total_completed_parts = sum(int(item["completed_parts"]) for item in users)
         return {
             "start": start,
@@ -1329,6 +1733,8 @@ class PlatformDatabase:
             "total": {
                 "completed_parts": total_completed_parts,
                 "image_count": total_image_count,
+                "bbox_count": total_bbox_count,
+                "bboxes_per_hour": round(total_bbox_count / total_work_seconds * 3600, 3) if total_work_seconds > 0 else 0.0,
                 "work_seconds": round(total_work_seconds, 3),
                 "images_per_hour": round(
                     total_image_count / total_work_seconds * 3600,
