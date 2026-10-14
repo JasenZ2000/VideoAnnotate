@@ -971,6 +971,8 @@ class PlatformDatabase:
                            "selected_date": selected_date, "users": [dict(row) for row in attendance_people]},
             "work": {"daily": [{"date": value, "count": work_counts.get(value, 0)} for value in dates],
                      "selected_date": selected_date,
+                     "total_expected_hours": round(sum(float(row["expected_hours"] or 0) for row in parts), 3),
+                     "total_actual_hours": round(sum(float(row["actual_seconds"] or 0) for row in parts) / 3600, 3),
                      "parts": [{**dict(row), "actual_hours": round(float(row["actual_seconds"] or 0) / 3600, 3)} for row in parts]},
         }
 

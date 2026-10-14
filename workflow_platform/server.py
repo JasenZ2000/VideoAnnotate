@@ -1096,6 +1096,10 @@ def build_task_overview(now: str):
             except (TypeError, ValueError):
                 hours = 0.0
         task["estimated_completion_hours"] = hours
+        if task["overview_status"] == "completed":
+            task["estimated_completion_days"] = None
+            task["estimated_completion_date"] = None
+            continue
         task["estimated_completion_days"] = max(1, math.ceil((cumulative + hours) / available_hours)) if available_hours and hours else None
         task["estimated_completion_date"] = working_day_completion(today, task["estimated_completion_days"]).isoformat() if task["estimated_completion_days"] else None
         cumulative += hours
