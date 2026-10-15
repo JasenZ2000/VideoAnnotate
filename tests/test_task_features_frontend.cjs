@@ -151,6 +151,25 @@ test('task tables paginate independently, resize and reset on tag filters',async
   context.filterTaskTables('missing');
   assert.match(html(),/当前 0-0/);assert.ok(!html().includes('第 0'));
 });
+test('completed tasks rank by newest completion before pagination and tag filtering',async()=>{
+  const {context}=frontend({'content':'','task-table-results':''});
+  const tasks=Array.from({length:7},(_,index)=>({task_id:'task-'+index,project:'Task'+index,product_tag:index%2?'QA':'BSD',overview_status:'completed',rank:100+index,priority:'high',part_summary:{completed:1,total:1},completed_at:index===0?null:'2026-10-'+String(10+index).padStart(2,'0')+'T18:00:00+08:00'}));
+  tasks.push({...tasks[0],task_id:'unfinished',overview_status:'pending',rank:88});
+  context.api=async()=>({tasks});
+  let rendered=[];
+  context.overviewTable=(columns,rows)=>{rendered.push(Array.from(rows));return '';};
+  await context.openMainView('tasks');
+  assert.deepEqual(rendered[1].map(row=>row.task_id),['task-6','task-5','task-4','task-3','task-2']);
+  assert.deepEqual(rendered[1].map(row=>row.rank),[1,2,3,4,5]);
+  assert.equal(rendered[0][0].rank,88);
+  rendered=[];context.moveTaskTablePage('completed',1);
+  assert.deepEqual(rendered[1].map(row=>row.task_id),['task-1','task-0']);
+  assert.deepEqual(rendered[1].map(row=>row.rank),[6,7]);
+  rendered=[];context.filterTaskTables('QA');
+  assert.deepEqual(rendered[1].map(row=>row.task_id),['task-5','task-3','task-1']);
+  assert.deepEqual(rendered[1].map(row=>row.rank),[1,2,3]);
+  assert.equal(tasks[6].rank,106);
+});
 test('completed task columns use actual hours, completion date and N/A for legacy records',async()=>{
   const {context,nodes}=frontend({'content':'','task-table-results':''});
   const task={project:'Project',annotation_content:'PrivateContent',overview_status:'completed',priority:'high',part_summary:{completed:1,total:1},estimated_completion_hours:99};

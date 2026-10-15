@@ -100,7 +100,8 @@ function paginatedTaskTable(kind,title,columns,rows){
 }
 function renderTaskTables(){
   const rows=taskTableTasks.filter(task=>!taskTableTag||task.product_tag===taskTableTag).map(task=>({...task,state:overviewStates[task.overview_status],priority_text:typeof priorityName==='undefined'?task.priority:priorityName[task.priority],part_progress:task.part_summary.completed+' / '+task.part_summary.total,hours:Number(task.estimated_completion_hours||0).toFixed(2)+' 小时',actual_hours_text:task.actual_hours==null?'N/A':Number(task.actual_hours).toFixed(2)+' 小时',completed_date:task.completed_at?task.completed_at.slice(0,10):'N/A',completion:task.overview_status==='completed'?'已完成':task.estimated_completion_date||'待估算'}));
-  const unfinished=rows.filter(task=>task.overview_status!=='completed'),completed=rows.filter(task=>task.overview_status==='completed');
+  const unfinished=rows.filter(task=>task.overview_status!=='completed');
+  const completed=rows.filter(task=>task.overview_status==='completed').sort((left,right)=>(Date.parse(right.completed_at)||0)-(Date.parse(left.completed_at)||0)||String(left.task_id||'').localeCompare(String(right.task_id||''))).map((task,index)=>({...task,rank:index+1}));
   const columns=[['rank','排名'],['priority_text','优先级'],['state','状态'],['product_tag','标签'],['project','项目'],['part_progress','Part 进度']];
   document.getElementById('task-table-results').innerHTML=paginatedTaskTable('unfinished','未完成任务',[...columns,['hours','预计工时'],['completion','预计完成']],unfinished)+paginatedTaskTable('completed','已完成任务',[...columns,['actual_hours_text','实际工时'],['completed_date','完成日期']],completed);
 }
@@ -114,7 +115,7 @@ async function openMainView(view){
       taskTableTasks=data.tasks;
       const tags=[...new Set(taskTableTasks.map(task=>task.product_tag).filter(Boolean))].sort();
       if(!tags.includes(taskTableTag))taskTableTag='';
-      document.getElementById('content').innerHTML='<div class="detail"><h1>任务表格</h1><p class="sub">未完成任务按预计完成日期升序排列，同一天按排名升序；排期跳过周六和周日，已完成任务不参与排期。</p><div class="field" style="max-width:280px"><label>产品标签筛选</label><select id="task-table-tag" onchange="filterTaskTables(this.value)"><option value="">全部标签</option>'+tags.map(tag=>'<option value="'+esc(tag)+'" '+(tag===taskTableTag?'selected':'')+'>'+esc(tag)+'</option>').join('')+'</select></div><div id="task-table-results"></div><div id="task-settings"></div></div>';
+      document.getElementById('content').innerHTML='<div class="detail"><h1>任务表格</h1><p class="sub">未完成任务按预计完成日期升序排列，同一天按排名升序；排期跳过周六和周日，已完成任务不参与排期，按完成时间由近到远重新编号，缺少完成日期的任务排在最后。</p><div class="field" style="max-width:280px"><label>产品标签筛选</label><select id="task-table-tag" onchange="filterTaskTables(this.value)"><option value="">全部标签</option>'+tags.map(tag=>'<option value="'+esc(tag)+'" '+(tag===taskTableTag?'selected':'')+'>'+esc(tag)+'</option>').join('')+'</select></div><div id="task-table-results"></div><div id="task-settings"></div></div>';
       renderTaskTables();
       if(typeof me!=='undefined'&&me?.role==='admin')await loadTaskSettings(data);
     }else{renderSettlement(await api('GET','/api/attendance/settlements?days=7'));}

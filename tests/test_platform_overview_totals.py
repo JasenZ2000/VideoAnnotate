@@ -15,7 +15,7 @@ def test_notification_daily_only_lists_first_five_unfinished_tasks(tmp_path, mon
     tasks = []
     for index in range(count):
         task = {"project": f"active-{index}END", "rank": index + 1, "priority": "medium",
-                "overview_status": "pending", "product_tag": "QA", "annotation_content": "标注",
+                "overview_status": "pending", "product_tag": "QA", "annotation_content": "不应出现在日报的内容", "publisher": f"publisher-{index}END",
                 "part_summary": {"completed": 0, "total": 1}, "estimated_completion_hours": 2,
                 "estimated_completion_date": "2026-10-15"}
         tasks.extend([{**task, "project": f"done-{index}END", "overview_status": "completed"}, task])
@@ -26,7 +26,11 @@ def test_notification_daily_only_lists_first_five_unfinished_tasks(tmp_path, mon
     for index in range(count):
         assert (f"active-{index}END" in content) == (index < 5)
         assert f"done-{index}END" not in content
+        assert (f"publisher-{index}END" in content) == (index < 5)
     assert "排名 | 优先级" in content
+    assert "项目 | 发布人 | 状态" in content
+    assert " | 内容 | " not in content
+    assert "不应出现在日报的内容" not in content
     if template == "{content}":
         assert "今日报到：3 人" in content
         assert "日报备注" in content
