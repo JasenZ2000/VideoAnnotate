@@ -1,8 +1,37 @@
+import pytest
+
 from workflow_platform.database import PlatformDatabase
 from workflow_platform import server
 
 
 NOW = "2026-10-14T18:00:00+08:00"
+
+
+@pytest.mark.parametrize("count", [0, 3, 7])
+@pytest.mark.parametrize("template", ["{content}", "{task_table}"])
+def test_notification_daily_only_lists_first_five_unfinished_tasks(tmp_path, monkeypatch, count, template):
+    db = PlatformDatabase(tmp_path / "notifications.sqlite3")
+    db.initialize()
+    tasks = []
+    for index in range(count):
+        task = {"project": f"active-{index}END", "rank": index + 1, "priority": "medium",
+                "overview_status": "pending", "product_tag": "QA", "annotation_content": "标注",
+                "part_summary": {"completed": 0, "total": 1}, "estimated_completion_hours": 2,
+                "estimated_completion_date": "2026-10-15"}
+        tasks.extend([{**task, "project": f"done-{index}END", "overview_status": "completed"}, task])
+    monkeypatch.setattr(server, "database", lambda: db)
+    monkeypatch.setattr(server, "build_task_overview", lambda now: {"tasks": tasks, "attendance": {"checked_in_count": 3}})
+    monkeypatch.setattr(server, "reminder_settings", lambda: {"task_template": "{content}", "daily_template": template})
+    content = server.notification_content(server.TaskNotificationReq(kind="daily", robot_id=1, note="日报备注"), NOW)
+    for index in range(count):
+        assert (f"active-{index}END" in content) == (index < 5)
+        assert f"done-{index}END" not in content
+    assert "排名 | 优先级" in content
+    if template == "{content}":
+        assert "今日报到：3 人" in content
+        assert "日报备注" in content
+    else:
+        assert "日报备注" not in content
 
 
 def test_completed_tasks_do_not_consume_schedule_capacity(tmp_path, monkeypatch):

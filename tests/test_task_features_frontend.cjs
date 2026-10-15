@@ -121,6 +121,33 @@ test('task tables split completion states and filter both by product tag', async
   context.filterTaskTables('');
   assert.match(nodes['task-table-results'].innerHTML,/DoneQA/);
 });
+test('task tables paginate independently, resize and reset on tag filters',async()=>{
+  const {context,nodes}=frontend({'content':'','task-table-results':''});
+  const tasks=[];
+  for(const state of ['pending','completed'])for(let index=1;index<=12;index++)tasks.push({project:state+'-'+index+'END',product_tag:index<=2?'QA':'BSD',overview_status:state,priority:'high',part_summary:{completed:0,total:1}});
+  context.api=async()=>({tasks});
+  await context.openMainView('tasks');
+  const html=()=>nodes['task-table-results'].innerHTML;
+  assert.match(html(),/pending-5END/);assert.ok(!html().includes('pending-6END'));
+  assert.match(html(),/completed-5END/);assert.ok(!html().includes('completed-6END'));
+  assert.match(html(),/value="5" selected/);assert.match(html(),/value="10"/);
+  context.moveTaskTablePage('unfinished',1);
+  assert.match(html(),/pending-6END/);assert.ok(!html().includes('pending-1END'));
+  assert.match(html(),/completed-1END/);
+  context.moveTaskTablePage('completed',2);
+  assert.match(html(),/completed-12END/);assert.ok(!html().includes('completed-10END'));
+  context.moveTaskTablePage('completed',1);
+  assert.ok(html().includes('第 3 / 3 页'));
+  context.changeTaskTablePageSize('unfinished','10');
+  assert.match(html(),/pending-10END/);assert.ok(!html().includes('pending-11END'));
+  context.changeTaskTablePageSize('unfinished','100');
+  assert.ok(!html().includes('pending-11END'));
+  context.filterTaskTables('QA');
+  assert.match(html(),/pending-1END/);assert.match(html(),/completed-1END/);
+  assert.ok(!html().includes('第 3'));
+  context.filterTaskTables('missing');
+  assert.match(html(),/当前 0-0/);assert.ok(!html().includes('第 0'));
+});
 test('settlement totals show actual and expected hours including empty dates',()=>{
   const {context,nodes}=frontend({'content':''});
   const data={attendance:{selected_date:'2026-10-14',daily:[],users:[]},work:{daily:[],parts:[{expected_hours:2,actual_hours:1.25},{expected_hours:3,actual_hours:0.75}]}};

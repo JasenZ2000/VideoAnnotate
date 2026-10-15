@@ -821,7 +821,8 @@ def notification_content(req: TaskNotificationReq, now: str, event: str = "任�
         actual = sum(float(item["actual_seconds"] or 0) for item in work) / 3600
         lines = [f"下班日报 · {work_date}", f"今日报到：{overview['attendance']['checked_in_count']} 人", f"今日完成：{len(work)} 个 Part",
                  f"完成工时：预计 {expected:.2f} 小时；实际 {actual:.2f} 小时", "", "任务表格", "排名 | 优先级 | 标签 | 项目 | 内容 | 状态 | Part进度 | 预计工时 | 预计完成"]
-        for task in overview["tasks"]:
+        daily_tasks = [task for task in overview["tasks"] if task["overview_status"] != "completed"][:5]
+        for task in daily_tasks:
             values = [task["rank"], priorities.get(task["priority"], task["priority"]), task["product_tag"], task["project"], task["annotation_content"],
                       statuses[task["overview_status"]], f"{task['part_summary']['completed']}/{task['part_summary']['total']}",
                       f"{task['estimated_completion_hours']:.2f}h", task["estimated_completion_date"] or "待估算"]
@@ -843,7 +844,7 @@ def notification_content(req: TaskNotificationReq, now: str, event: str = "任�
     else:
         values.update(completed_parts=len(work), expected_hours=f"{expected:.2f}", actual_hours=f"{actual:.2f}")
         table_start = lines.index("任务表格") + 1
-        values["task_table"] = "\n".join(lines[table_start:table_start + len(overview["tasks"]) + 1])
+        values["task_table"] = "\n".join(lines[table_start:table_start + len(daily_tasks) + 1])
     return template.format_map(values)
 
 
