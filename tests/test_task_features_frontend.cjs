@@ -5,10 +5,10 @@ const vm = require('node:vm');
 const {test} = require('node:test');
 const source = fs.readFileSync(path.join(__dirname, '../workflow_platform/static/task_features.js'), 'utf8');
 function frontend(values = {}) {
-  const nodes = Object.fromEntries(Object.entries(values).map(([key, value]) => [key, {value}]));
+  const nodes = Object.fromEntries(Object.entries(values).map(([key, value]) => [key, {value,children:[],appendChild(child){this.children.push(child);}}]));
   const requests = [];
   const context = vm.createContext({
-    document: {getElementById: key => nodes[key]},
+    document: {getElementById: key => nodes[key],createElement:()=>({innerHTML:''})},
     publishBody: () => ({clipboard_text: 'stale table', part_count: 10, part_manifest: 'stale manifest'}),
     openPublish: () => {}, addParts: () => {}, fields: ['project', 'applicant'],
     esc: value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;'),
@@ -45,11 +45,12 @@ test('ordinary users see task table without administrator settings requests', as
 });
 
 test('task table includes attendance and both notification forms for admins', async () => {
-  const {context,nodes}=frontend({'content':'','task-table-results':'','task-settings':'','notify-daily-robot':''});
+  const {context,nodes}=frontend({'content':'','task-table-results':'','task-settings':'','notify-daily-robot':'','task-rule-container':'','task-rule-list':''});
   context.me={username:'admin',role:'admin'};
   context.api=async (method,url)=>{
     if(url==='/api/task-overview')return {tasks:[{task_id:'task-1',rank:1,priority:'high',overview_status:'pending',product_tag:'BSD',project:'道路',annotation_content:'车辆',part_summary:{completed:0,total:2},estimated_completion_hours:4,estimated_completion_date:'2026-10-13'}]};
     if(url==='/api/admin/attendance')return {work_start:'09:00',work_end:'18:00'};
+    if(url==='/api/admin/task-reminders')return {rules:[]};
     if(url==='/api/admin/notifications')return {enabled:false,robot_id:1,usernames:['worker'],note:'日报备注',latest_run:null};
     if(url==='/api/admin/dingtalk')return {robots:[{robot_id:1,name:'Test'}]};
     if(url==='/api/users')return {users:[{username:'worker',display_name:'标注员',phone:'13800138000',is_active:true}]};
@@ -62,6 +63,8 @@ test('task table includes attendance and both notification forms for admins', as
   assert.ok(nodes['task-settings'].innerHTML.includes('下班日报提醒'));
   assert.ok(nodes['task-settings'].innerHTML.includes('notify-daily-enabled'));
   assert.ok(nodes['task-settings'].innerHTML.includes('notify-task-user'));
+  assert.ok(nodes.content.innerHTML.includes('任务表格'));
+  assert.ok(nodes['task-rule-container'].children[0].innerHTML.includes('任务自动提醒列表'));
   assert.ok(nodes['task-settings'].innerHTML.includes('previewTaskNotification(&quot;daily&quot;)'));
 });
 
@@ -147,6 +150,37 @@ test('task tables paginate independently, resize and reset on tag filters',async
   assert.ok(!html().includes('第 3'));
   context.filterTaskTables('missing');
   assert.match(html(),/当前 0-0/);assert.ok(!html().includes('第 0'));
+});
+test('completed task columns use actual hours, completion date and N/A for legacy records',async()=>{
+  const {context,nodes}=frontend({'content':'','task-table-results':''});
+  const task={project:'Project',annotation_content:'PrivateContent',overview_status:'completed',priority:'high',part_summary:{completed:1,total:1},estimated_completion_hours:99};
+  context.api=async()=>({tasks:[{...task,actual_hours:0,completed_at:'2026-10-15T18:00:00+08:00'},{...task,project:'Legacy'}]});
+  await context.openMainView('tasks');
+  const html=nodes['task-table-results'].innerHTML;
+  assert.ok(!html.includes('PrivateContent'));assert.ok(!html.includes('<th>内容</th>'));
+  const completed=html.split('已完成任务')[1];
+  assert.ok(completed.includes('实际工时'));assert.ok(completed.includes('完成日期'));
+  assert.ok(completed.includes('0.00 小时'));assert.ok(completed.includes('2026-10-15'));assert.ok(completed.includes('N/A'));
+  assert.ok(!completed.includes('预计工时'));assert.ok(!completed.includes('99.00'));
+});
+test('task reminder editor saves task-specific recipients and remarks and supports deletion',async()=>{
+  const {context,nodes,requests}=frontend({'task-rule-task':'task','task-rule-event':'priority','task-rule-robot':'1','task-rule-note':'请处理','task-rule-enabled':'','task-rule-error':'','task-rule-list':''});
+  nodes['task-rule-enabled'].checked=true;
+  const users=[{value:'worker',checked:true},{value:'other',checked:false}];
+  context.document.querySelectorAll=selector=>selector.includes(':checked')?users.filter(user=>user.checked):users;
+  context.crypto={randomUUID:()=> 'rule-123'};
+  context.toast=()=>{};context.confirm=()=>true;
+  context.api=async(method,url,body)=>{requests.push({method,url,body});return {rules:method==='DELETE'?[]:[{rule_id:'rule-123',...body}]};};
+  await context.saveTaskRule();
+  assert.equal(requests[0].method,'PUT');assert.equal(requests[0].body.task_id,'task');
+  assert.equal(requests[0].body.note,'请处理');assert.deepEqual(Array.from(requests[0].body.usernames),['worker']);
+  assert.ok(nodes['task-rule-list'].innerHTML.includes('请处理'));
+  context.editTaskRule('rule-123');
+  assert.equal(nodes['task-rule-note'].value,'请处理');
+  nodes['task-rule-note'].value='修改备注';
+  await context.saveTaskRule();assert.equal(requests[1].url,'/api/admin/task-reminders/rule-123');
+  await context.deleteTaskRule('rule-123');assert.equal(requests[2].method,'DELETE');
+  assert.ok(!nodes['task-rule-list'].innerHTML.includes('修改备注'));
 });
 test('settlement totals show actual and expected hours including empty dates',()=>{
   const {context,nodes}=frontend({'content':''});

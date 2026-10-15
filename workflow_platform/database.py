@@ -226,6 +226,10 @@ class PlatformDatabase:
                     id INTEGER PRIMARY KEY CHECK(id=1),
                     config TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS task_reminder_rules (
+                    rule_id TEXT PRIMARY KEY,
+                    config TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS reminder_events (
                     event_id TEXT PRIMARY KEY,
                     event_type TEXT NOT NULL,
@@ -876,6 +880,15 @@ class PlatformDatabase:
                 "SELECT p.task_id,p.status,COUNT(*) count FROM parts p JOIN tasks t ON t.task_id=p.task_id "
                 "WHERE t.deleted=0 GROUP BY p.task_id,p.status"
             ).fetchall()
+            tracking = connection.execute(
+                "SELECT p.task_id,COUNT(*) total,"
+                "SUM(CASE WHEN p.work_seconds_override IS NOT NULL OR p.work_seconds>0 OR EXISTS "
+                "(SELECT 1 FROM part_work_sessions s WHERE s.part_id=p.part_id) THEN 1 ELSE 0 END) tracked,"
+                "SUM(COALESCE(p.work_seconds_override,p.work_seconds)) seconds,"
+                "CASE WHEN COUNT(COALESCE(p.reviewed_at,p.submitted_at))=COUNT(*) THEN "
+                "MAX(COALESCE(p.reviewed_at,p.submitted_at)) END completed_at FROM parts p GROUP BY p.task_id"
+            ).fetchall()
+        tracking = {row["task_id"]: dict(row) for row in tracking}
         summaries: dict[str, dict[str, int]] = {}
         for row in counts:
             summaries.setdefault(row["task_id"], {status: 0 for status in PART_STATUSES})[row["status"]] = row["count"]
@@ -898,6 +911,9 @@ class PlatformDatabase:
                 state = "mixed"
             task.update(part_summary={**summary, "total": total}, overview_status=state,
                         completion_percent=round(summary["completed"] / total * 100, 1) if total else 0)
+            record = tracking.get(task["task_id"], {})
+            task["actual_hours"] = round(record["seconds"] / 3600, 3) if state == "completed" and record.get("tracked") == total and total else None
+            task["completed_at"] = record.get("completed_at") if state == "completed" else None
             result.append(task)
         return result
 
@@ -992,6 +1008,18 @@ class PlatformDatabase:
         with self.connection() as connection:
             row = connection.execute("SELECT config FROM reminder_config WHERE id=1").fetchone()
         return json.loads(row["config"]) if row else {}
+
+    def task_reminder_rules(self) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            return [{"rule_id": row["rule_id"], **json.loads(row["config"])} for row in connection.execute("SELECT * FROM task_reminder_rules ORDER BY rowid")]
+
+    def save_task_reminder_rule(self, rule_id: str, config: dict[str, Any]) -> None:
+        with self.transaction() as connection:
+            connection.execute("INSERT INTO task_reminder_rules(rule_id,config) VALUES(?,?) ON CONFLICT(rule_id) DO UPDATE SET config=excluded.config", (rule_id, json.dumps(config, ensure_ascii=False)))
+
+    def delete_task_reminder_rule(self, rule_id: str) -> None:
+        with self.transaction() as connection:
+            connection.execute("DELETE FROM task_reminder_rules WHERE rule_id=?", (rule_id,))
 
     def save_reminder_config(self, config: dict[str, Any]) -> None:
         with self.transaction() as connection:

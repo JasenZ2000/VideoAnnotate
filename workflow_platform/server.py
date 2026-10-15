@@ -771,23 +771,73 @@ def update_reminder_management(req: ReminderManagementReq):
     return reminder_settings()
 
 
+class TaskReminderRuleReq(BaseModel):
+    task_id: str
+    event: str
+    robot_id: int
+    usernames: list[str] = Field(min_length=1)
+    note: str = Field(default="", max_length=4000)
+    enabled: bool = True
+
+
+@app.get("/api/admin/task-reminders")
+def list_task_reminders():
+    require_admin()
+    return {"rules": database().task_reminder_rules()}
+
+
+@app.put("/api/admin/task-reminders/{rule_id}")
+def save_task_reminder(rule_id: uuid.UUID, req: TaskReminderRuleReq):
+    require_admin()
+    if req.event not in {"started", "priority", "completed"}:
+        raise HTTPException(400, "不支持的任务事件")
+    try:
+        database().get_task(req.task_id, now_iso())
+    except KeyError as exc:
+        raise HTTPException(404, "任务不存在") from exc
+    if req.enabled:
+        validate_notification_targets(req.robot_id, req.usernames)
+    database().save_task_reminder_rule(str(rule_id), req.model_dump())
+    return {"rules": database().task_reminder_rules()}
+
+
+@app.delete("/api/admin/task-reminders/{rule_id}")
+def delete_task_reminder(rule_id: uuid.UUID):
+    require_admin()
+    database().delete_task_reminder_rule(str(rule_id))
+    return {"rules": database().task_reminder_rules()}
+
+
 def enqueue_task_reminder(event: str, task_id: str, actor: str, event_id: str = "", note: str = "") -> None:
     try:
-        rule = reminder_settings()["rules"][event]
-        if not rule["enabled"]:
-            return
+        global_rule = reminder_settings()["rules"][event]
+        rules = [("global", global_rule)] if global_rule["enabled"] else []
+        rules.extend((rule["rule_id"], rule) for rule in database().task_reminder_rules()
+                     if rule["enabled"] and rule["task_id"] == task_id and rule["event"] == event)
         task = database().get_task(task_id, now_iso())
         users = {user["username"]: user for user in database().list_users()}
-        names = list(rule["usernames"])
-        if rule["notify_publisher"] and task["publisher"] not in names:
-            names.append(task["publisher"])
-        names = [name for name in names if name in users and users[name]["is_active"] and users[name]["phone"].strip()]
-        request = TaskNotificationReq(kind="task", task_id=task_id, robot_id=rule["robot_id"], usernames=names, note=note)
-        content = notification_content(request, now_iso(), event=EVENT_NAMES[event])
-        payload = DingTestReq(robot_id=rule["robot_id"], usernames=names, content=content).model_dump()
-        database().enqueue_reminder(event_id or uuid.uuid4().hex, event, task_id, payload, now_iso())
     except Exception:
-        logging.getLogger(__name__).exception("Could not queue task reminder for %s", task_id)
+        logging.getLogger(__name__).exception("Could not load task reminders for %s", task_id)
+        return
+    identifier = event_id or uuid.uuid4().hex
+    for rule_id, rule in rules:
+        try:
+            if rule_id != "global":
+                validate_notification_targets(rule["robot_id"], rule["usernames"])
+            names = list(rule["usernames"])
+            if rule.get("notify_publisher") and task["publisher"] not in names:
+                names.append(task["publisher"])
+            names = [name for name in names if name in users and users[name]["is_active"] and users[name]["phone"].strip()]
+            request = TaskNotificationReq(kind="task", task_id=task_id, robot_id=rule["robot_id"], usernames=names,
+                                          note="\n".join(value for value in (note, rule.get("note", "")) if value))
+            content = notification_content(request, now_iso(), event=EVENT_NAMES[event])
+            if rule.get("note") and rule["note"] not in content:
+                content += "\n备注：" + rule["note"]
+            payload = DingTestReq(robot_id=rule["robot_id"], usernames=names, content=content).model_dump()
+            database().enqueue_reminder(identifier if rule_id == "global" else identifier + ":task-rule:" + rule_id,
+                                        event, task_id, payload, now_iso())
+        except Exception:
+            logging.getLogger(__name__).exception("Could not queue task reminder %s for %s", rule_id, task_id)
 
 
 def process_reminder_events() -> None:
@@ -1303,7 +1353,7 @@ async def claim_next_part(task_id: str):
         _raise_database_error(exc)
     if part is None:
         raise HTTPException(409, "当前没有可领取的 Part")
-    if before["status"] == "ready":
+    if before["part_summary"]["pending"] == before["part_summary"]["total"]:
         enqueue_task_reminder("started", task_id, actor, "started:" + task_id)
     return {"part": part}
 
