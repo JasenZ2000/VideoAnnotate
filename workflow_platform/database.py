@@ -6,12 +6,12 @@ import ntpath
 import posixpath
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 _UNSET = object()
 PART_STATUSES = ("pending", "in_progress", "paused", "submitted", "rework", "completed")
 TIME_DEVIATION_THRESHOLD = 0.5
@@ -180,6 +180,25 @@ class PlatformDatabase:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_part_session
                     ON part_work_sessions(part_id) WHERE ended_at IS NULL;
+                CREATE TABLE IF NOT EXISTS part_submission_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    part_id INTEGER NOT NULL,
+                    task_id TEXT NOT NULL,
+                    annotator TEXT NOT NULL,
+                    submitted_at TEXT NOT NULL,
+                    progress_count INTEGER NOT NULL DEFAULT 0,
+                    credited_count INTEGER NOT NULL DEFAULT 0,
+                    event_kind TEXT NOT NULL,
+                    task_name TEXT NOT NULL DEFAULT '',
+                    project TEXT NOT NULL DEFAULT '',
+                    annotation_content TEXT NOT NULL DEFAULT '',
+                    part_name TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_part_submission_events_time
+                    ON part_submission_events(submitted_at,annotator);
+                CREATE INDEX IF NOT EXISTS idx_part_submission_events_part
+                    ON part_submission_events(part_id,event_id);
                 CREATE TABLE IF NOT EXISTS part_comments (
                     comment_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     part_id INTEGER NOT NULL REFERENCES parts(part_id) ON DELETE CASCADE,
@@ -317,6 +336,26 @@ class PlatformDatabase:
                 "UPDATE parts SET progress_count=image_count "
                 "WHERE image_count>0 AND progress_count=0 "
                 "AND status IN ('submitted','completed')"
+            )
+            connection.execute(
+                "INSERT INTO part_submission_events("
+                "part_id,task_id,annotator,submitted_at,progress_count,credited_count,event_kind,"
+                "task_name,project,annotation_content,part_name,created_at"
+                ") SELECT p.part_id,p.task_id,p.annotator,COALESCE(p.submitted_at,p.reviewed_at,p.created_at),"
+                "MAX(p.progress_count,p.image_count),MAX(p.progress_count,p.image_count),"
+                "'legacy_import',t.name,t.project,t.annotation_content,p.name,p.created_at "
+                "FROM parts p JOIN tasks t ON t.task_id=p.task_id "
+                "WHERE COALESCE(p.annotator,'')!='' "
+                "AND (p.submitted_at IS NOT NULL OR p.status IN ('submitted','completed','rework')) "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM part_submission_events e WHERE e.part_id=p.part_id"
+                ")"
+            )
+            # Legacy rows prevent duplicate rework credit, but cannot establish
+            # first-submission dates or daily splits. Reports exclude them.
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_info(key,value) VALUES('production_tracking_since',?)",
+                (datetime.now(timezone(timedelta(hours=8))).isoformat(timespec='seconds'),),
             )
             task_columns.update(additions)
             legacy_columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
@@ -788,7 +827,11 @@ class PlatformDatabase:
             if is_initiator:
                 if name is not None: changes["name"] = str(name).strip()
                 if work_path is not None: changes["work_path"] = str(work_path).strip()
-                if image_count is not None: changes["image_count"] = max(0, int(image_count))
+                if image_count is not None:
+                    credited, _ = self._submission_state(connection, part_id)
+                    if int(image_count) < credited:
+                        raise ValueError("图像总数不能小于已计入绩效的数量")
+                    changes["image_count"] = max(0, int(image_count))
             elif any(value is not None for value in (name, work_path, image_count)):
                 raise PermissionError("only publisher or applicant can edit part details")
             if progress_count is not None and is_annotator:
@@ -1157,7 +1200,10 @@ class PlatformDatabase:
             params.append(actor)
         with self.connection() as connection:
             rows = connection.execute(
-                f"SELECT p.*,t.expected_part_seconds,(SELECT started_at FROM part_work_sessions s WHERE s.part_id=p.part_id "
+                f"SELECT p.*,t.expected_part_seconds,"
+                f"(SELECT COALESCE(SUM(credited_count),0) FROM part_submission_events e WHERE e.part_id=p.part_id) credited_count,"
+                f"EXISTS(SELECT 1 FROM part_submission_events e WHERE e.part_id=p.part_id AND e.event_kind IN ('final_submission','legacy_import')) production_finalized,"
+                f"(SELECT started_at FROM part_work_sessions s WHERE s.part_id=p.part_id "
                 f"AND s.ended_at IS NULL ORDER BY session_id DESC LIMIT 1) active_started_at "
                 f"FROM parts p JOIN tasks t ON t.task_id=p.task_id WHERE {where} ORDER BY p.part_index", params
             ).fetchall()
@@ -1204,7 +1250,10 @@ class PlatformDatabase:
             pages = max(1, (total + page_size - 1) // page_size)
             page = min(page, pages)
             rows = connection.execute(
-                "SELECT p.*,t.expected_part_seconds,(SELECT started_at FROM part_work_sessions s "
+                "SELECT p.*,t.expected_part_seconds,"
+                "(SELECT COALESCE(SUM(credited_count),0) FROM part_submission_events e WHERE e.part_id=p.part_id) credited_count,"
+                "EXISTS(SELECT 1 FROM part_submission_events e WHERE e.part_id=p.part_id AND e.event_kind IN ('final_submission','legacy_import')) production_finalized,"
+                "(SELECT started_at FROM part_work_sessions s "
                 "WHERE s.part_id=p.part_id AND s.ended_at IS NULL ORDER BY session_id DESC LIMIT 1) active_started_at "
                 f"FROM parts p JOIN tasks t ON t.task_id=p.task_id WHERE {where} "
                 "ORDER BY CASE p.status WHEN 'submitted' THEN 0 WHEN 'rework' THEN 1 WHEN 'in_progress' THEN 2 "
@@ -1367,15 +1416,75 @@ class PlatformDatabase:
             self._open_session(connection, part_id, actor, now)
         return next(item for item in self.list_parts(task_id, now, actor) if item["part_id"] == part_id)
 
+    @staticmethod
+    def _submission_state(connection: sqlite3.Connection, part_id: int) -> tuple[int, bool]:
+        row = connection.execute(
+            "SELECT COALESCE(SUM(credited_count),0),"
+            "COALESCE(MAX(event_kind IN ('final_submission','legacy_import')),0) "
+            "FROM part_submission_events WHERE part_id=?", (part_id,),
+        ).fetchone()
+        return int(row[0]), bool(row[1])
+
+    def _record_submission(self, connection: sqlite3.Connection, task_id: str, part_id: int,
+                           actor: str, cumulative: int, kind: str, now: str) -> int:
+        """Credit only an unsubmitted cumulative increment, under BEGIN IMMEDIATE.
+
+        The management platform records counts, not image identities. A cumulative
+        count always describes the same fixed Part; final submission freezes it.
+        """
+        credited, finalized = self._submission_state(connection, part_id)
+        if not finalized and cumulative < credited:
+            raise ValueError("累计提交数量不能小于此前已提交数量")
+        delta = 0 if finalized else cumulative - credited
+        if kind == "progress_submission" and delta == 0:
+            return 0
+        connection.execute(
+            "INSERT INTO part_submission_events("
+            "part_id,task_id,annotator,submitted_at,progress_count,credited_count,event_kind,"
+            "task_name,project,annotation_content,part_name,created_at) "
+            "SELECT p.part_id,p.task_id,?,?,?,?,?,t.name,t.project,t.annotation_content,p.name,? "
+            "FROM parts p JOIN tasks t ON t.task_id=p.task_id WHERE p.task_id=? AND p.part_id=?",
+            (actor, now, cumulative, delta, kind, now, task_id, part_id),
+        )
+        return delta
+
+    def submit_progress(self, task_id: str, part_id: int, actor: str,
+                        progress_count: int, now: str) -> dict[str, Any]:
+        if type(progress_count) is not int or not 0 <= progress_count <= 2**53 - 1:
+            raise ValueError("累计提交数量必须是非负安全整数")
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT status,annotator,image_count FROM parts WHERE task_id=? AND part_id=?",
+                (task_id, part_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(part_id)
+            if row["annotator"] != actor or row["status"] not in {"in_progress", "paused"}:
+                raise PermissionError("只有当前标注员可以提交进行中或暂停的 Part 进度")
+            if self._submission_state(connection, part_id)[1]:
+                raise ValueError("该 Part 已完成首次提交，返工不再计入完成量")
+            if row["image_count"] > 0 and progress_count > row["image_count"]:
+                raise ValueError("累计提交数量不能超过 Part 图像总数")
+            self._record_submission(connection, task_id, part_id, actor,
+                                    progress_count, "progress_submission", now)
+            connection.execute(
+                "UPDATE parts SET progress_count=?,updated_at=? WHERE part_id=?",
+                (progress_count, now, part_id),
+            )
+        return next(item for item in self.list_parts(task_id, now, actor) if item["part_id"] == part_id)
+
     def submit_part(self, task_id: str, part_id: int, actor: str, note: str, now: str) -> dict[str, Any]:
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT status,annotator,image_count FROM parts WHERE task_id=? AND part_id=?", (task_id, part_id)
+                "SELECT status,annotator,image_count,progress_count FROM parts WHERE task_id=? AND part_id=?", (task_id, part_id)
             ).fetchone()
             if row is None:
                 raise KeyError(part_id)
             if row["annotator"] != actor or row["status"] != "in_progress":
                 raise PermissionError("only active annotator can submit")
+            cumulative = int(row["image_count"] or row["progress_count"] or 0)
+            self._record_submission(connection, task_id, part_id, actor,
+                                    cumulative, "final_submission", now)
             self._close_session(connection, part_id, now)
             connection.execute(
                 "UPDATE parts SET status='submitted',submitted_at=?,submission_note=?,"
@@ -1556,6 +1665,73 @@ class PlatformDatabase:
                 total_image_count / total_work_seconds * 3600,
                 3,
             ) if total_work_seconds > 0 else 0.0,
+        }
+
+    def production_report(self, start: str, end: str, *, workdays_only: bool = False) -> dict[str, Any]:
+        """Immutable first-submission increments, independent of latest Part status."""
+        china = timezone(timedelta(hours=8))
+        left, right = datetime.fromisoformat(start), datetime.fromisoformat(end)
+        if left.tzinfo is None or right.tzinfo is None or right <= left:
+            raise ValueError("绩效统计需要带时区且结束晚于开始的时间范围")
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM part_submission_events WHERE event_kind!='legacy_import' "
+                "AND julianday(submitted_at)>=julianday(?) AND julianday(submitted_at)<julianday(?) "
+                "ORDER BY julianday(submitted_at),event_id", (start, end),
+            ).fetchall()
+            accounts = connection.execute("SELECT username,display_name FROM users ORDER BY username").fetchall()
+            legacy_count = int(connection.execute(
+                "SELECT COUNT(*) FROM part_submission_events WHERE event_kind='legacy_import'"
+            ).fetchone()[0])
+            tracking = connection.execute(
+                "SELECT value FROM schema_info WHERE key='production_tracking_since'"
+            ).fetchone()[0]
+        grouped: dict[str, dict[str, Any]] = {}
+
+        def person(username: str, display_name: str = "") -> dict[str, Any]:
+            return grouped.setdefault(username, {
+                "username": username, "display_name": display_name,
+                "image_count": 0, "tasks": {}, "project_names": [],
+            })
+
+        for account in accounts:
+            person(account["username"], account["display_name"])
+        events = []
+        excluded_weekend_count = 0
+        for row in rows:
+            event = dict(row)
+            moment = datetime.fromisoformat(event["submitted_at"])
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=china)
+            event["submitted_at"] = moment.astimezone(china).isoformat(timespec="seconds")
+            if workdays_only and moment.astimezone(china).weekday() >= 5:
+                excluded_weekend_count += int(event["credited_count"])
+                continue
+            events.append(event)
+            user = person(event["annotator"])
+            count = int(event["credited_count"])
+            user["image_count"] += count
+            if count <= 0:
+                continue
+            name = event["task_name"] or event["project"] or event["task_id"]
+            key = (event["task_id"], name)
+            item = user["tasks"].setdefault(key, {
+                "task_id": event["task_id"], "name": name, "image_count": 0,
+            })
+            item["image_count"] += count
+            if name not in user["project_names"]:
+                user["project_names"].append(name)
+        for user in grouped.values():
+            user["tasks"] = list(user["tasks"].values())
+        return {
+            "start": start, "end": end, "timezone": "Asia/Shanghai",
+            "workdays_only": workdays_only, "tracking_since": tracking,
+            "includes_untracked_time": left < datetime.fromisoformat(tracking),
+            "legacy_parts_excluded": legacy_count,
+            "excluded_weekend_count": excluded_weekend_count,
+            "image_count": sum(user["image_count"] for user in grouped.values()),
+            "users": sorted(grouped.values(), key=lambda user: (user["display_name"] or user["username"], user["username"])),
+            "events": events,
         }
 
     def admin_annotation_statistics(self, start: str, end: str, now: str) -> dict[str, Any]:

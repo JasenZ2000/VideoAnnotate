@@ -124,7 +124,7 @@ async function deletePart(id){const p=(selected.parts||[]).find(item=>item.part_
  async function updateProgressInline(id,value){const n=parseInt(value,10);if(!Number.isInteger(n)||n<0){toast('数量必须是非负整数');return}try{await api('PATCH',`/api/tasks/${selected.task_id}/parts/${id}`,{progress_count:n});await loadTasks()}catch(e){toast(e.message)}}
  async function editPart(id){const p=(selected.parts||[]).find(x=>x.part_id===id);if(!p)return;const count=prompt('图像数量',String(p.image_count||0));if(count===null)return;await editPartInline(id,count)}
  async function editPartInline(id,value){const n=parseInt(value,10);if(!Number.isInteger(n)||n<0){toast('图像数量必须是非负整数');return}try{await api('PATCH',`/api/tasks/${selected.task_id}/parts/${id}`,{image_count:n});await loadTasks()}catch(e){toast(e.message)}}
-async function submitPart(id){const note=prompt('提交备注（可填写特殊情况或问题）','');if(note===null)return;try{await api('POST',`/api/tasks/${selected.task_id}/parts/${id}/submit`,{note});await loadTasks()}catch(e){toast(e.message)}}
+function submitPart(id){openPartSubmission(id,'complete')}
 async function notePart(id){const content=prompt('补充备注','');if(!content)return;try{await api('POST',`/api/tasks/${selected.task_id}/parts/${id}/comments`,{content});await loadTasks()}catch(e){toast(e.message)}}
 async function startRework(id){try{await api('POST',`/api/tasks/${selected.task_id}/parts/${id}/start-rework`);await loadTasks()}catch(e){toast(e.message)}}
 async function pausePart(id){try{await api('POST',`/api/tasks/${selected.task_id}/parts/${id}/pause`);await loadTasks()}catch(e){toast(e.message)}}
@@ -154,5 +154,6 @@ const _renderDetailOriginal=renderDetail;
  setInterval(()=>{if(me&&selected&&!adminStatsOpen&&!document.querySelector('dialog[open]')&&!document.activeElement?.matches('.part-count-input'))openTask(selected.task_id)},15000);init().catch(e=>toast(e.message));
 </script>
 <script src="/static/task_features.js?v=20261013"></script>
+<script src="/static/production.js?v=20261019-3"></script>
 </body>
 </html>

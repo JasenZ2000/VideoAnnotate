@@ -42,6 +42,113 @@ class PlatformDatabaseTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def _production_part(self) -> int:
+        self.db.create_task(task(), 0, "2026-07-14T09:00:00+08:00",
+                            part_specs=[{"name": "part-a", "image_count": 100}])
+        return self.db.claim_next_part("task-1", "worker", "2026-07-14T09:01:00+08:00")["part_id"]
+
+    def _production_day(self, day: int) -> dict:
+        return self.db.production_report(f"2026-07-{day:02}T00:00:00+08:00",
+                                         f"2026-07-{day + 1:02}T00:00:00+08:00")
+
+    def test_production_partial_final_rework_and_progress_edit(self) -> None:
+        part_id = self._production_part()
+        self.db.update_part("task-1", part_id, "worker", "2026-07-14T17:00:00+08:00", progress_count=60)
+        self.assertEqual(self._production_day(14)["image_count"], 0)
+        part = self.db.submit_progress("task-1", part_id, "worker", 60, "2026-07-14T18:00:00+08:00")
+        self.assertEqual((part["status"], part["credited_count"]), ("in_progress", 60))
+        self.db.submit_progress("task-1", part_id, "worker", 60, "2026-07-14T18:01:00+08:00")
+        self.assertEqual(len(self._production_day(14)["events"]), 1)
+        final = self.db.submit_part("task-1", part_id, "worker", "", "2026-07-15T18:00:00+08:00")
+        self.assertEqual((final["credited_count"], final["production_finalized"]), (100, 1))
+        self.assertEqual(self._production_day(14)["image_count"], 60)
+        self.assertEqual(self._production_day(15)["image_count"], 40)
+        self.db.review_part("task-1", part_id, "publisher", "rework", "", "2026-07-16T09:00:00+08:00")
+        self.db.start_rework("task-1", part_id, "worker", "2026-07-16T09:01:00+08:00")
+        self.db.update_part("task-1", part_id, "publisher", "2026-07-16T09:02:00+08:00", image_count=120)
+        with self.assertRaisesRegex(ValueError, "返工"):
+            self.db.submit_progress("task-1", part_id, "worker", 110, "2026-07-16T17:00:00+08:00")
+        self.db.submit_part("task-1", part_id, "worker", "", "2026-07-16T18:00:00+08:00")
+        self.assertEqual(self._production_day(16)["image_count"], 0)
+        self.assertEqual(self._production_day(16)["events"][0]["credited_count"], 0)
+        # Reinitialization must not convert new submissions to legacy records.
+        self.db.initialize()
+        self.assertEqual(self._production_day(14)["image_count"], 60)
+        self.assertEqual(self._production_day(15)["legacy_parts_excluded"], 0)
+
+    def test_production_concurrent_partial_submissions_do_not_double_credit(self) -> None:
+        part_id = self._production_part()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: self.db.submit_progress(
+                "task-1", part_id, "worker", 60, "2026-07-14T18:00:00+08:00"), range(2)))
+        self.assertEqual([item["credited_count"] for item in results], [60, 60])
+        self.assertEqual(self._production_day(14)["image_count"], 60)
+        self.assertEqual(len(self._production_day(14)["events"]), 1)
+
+    def test_production_return_reassign_preserves_original_actor(self) -> None:
+        part_id = self._production_part()
+        self.db.pause_part("task-1", part_id, "worker", "2026-07-14T17:59:00+08:00")
+        self.db.submit_progress("task-1", part_id, "worker", 60, "2026-07-14T18:00:00+08:00")
+        self.assertEqual(self.db.list_parts("task-1", "2026-07-14T18:00:00+08:00")[0]["status"], "paused")
+        self.db.return_part("task-1", part_id, "worker", "", "2026-07-14T18:01:00+08:00")
+        self.db.claim_next_part("task-1", "worker-2", "2026-07-15T09:00:00+08:00")
+        self.db.submit_part("task-1", part_id, "worker-2", "", "2026-07-15T18:00:00+08:00")
+        report = self.db.production_report("2026-07-14T00:00:00+08:00", "2026-07-21T00:00:00+08:00")
+        self.assertEqual({user["username"]: user["image_count"] for user in report["users"]},
+                         {"worker": 60, "worker-2": 40})
+        page = self.db.list_parts_page("task-1", "2026-07-15T18:00:00+08:00")
+        self.assertEqual(page["items"][0]["credited_count"], 100)
+
+    def test_production_validates_count_owner_and_does_not_mutate_on_error(self) -> None:
+        part_id = self._production_part()
+        with self.assertRaises(PermissionError):
+            self.db.submit_progress("task-1", part_id, "other", 60, "2026-07-14T18:00:00+08:00")
+        for count in (-1, True, 1.5, 101):
+            with self.assertRaises(ValueError):
+                self.db.submit_progress("task-1", part_id, "worker", count, "2026-07-14T18:00:00+08:00")
+        self.db.submit_progress("task-1", part_id, "worker", 60, "2026-07-14T18:00:00+08:00")
+        with self.assertRaises(ValueError):
+            self.db.submit_progress("task-1", part_id, "worker", 50, "2026-07-14T18:01:00+08:00")
+        with self.assertRaises(ValueError):
+            self.db.update_part("task-1", part_id, "publisher", "2026-07-14T18:02:00+08:00", image_count=50)
+        self.assertEqual(self._production_day(14)["image_count"], 60)
+
+    def test_production_legacy_migration_is_idempotent_excluded_and_blocks_rework_credit(self) -> None:
+        part_id = self._production_part()
+        self.db.submit_part("task-1", part_id, "worker", "", "2026-07-14T18:00:00+08:00")
+        with self.db.transaction() as connection:
+            connection.execute("DELETE FROM part_submission_events")
+            connection.execute("UPDATE schema_info SET value='10' WHERE key='schema_version'")
+        self.db.initialize()
+        self.db.initialize()
+        report = self._production_day(14)
+        self.assertEqual((report["image_count"], report["legacy_parts_excluded"]), (0, 1))
+        self.db.review_part("task-1", part_id, "publisher", "rework", "", "2026-07-15T09:00:00+08:00")
+        self.db.start_rework("task-1", part_id, "worker", "2026-07-15T09:01:00+08:00")
+        self.db.submit_part("task-1", part_id, "worker", "", "2026-07-15T18:00:00+08:00")
+        self.assertEqual(self._production_day(15)["image_count"], 0)
+
+    def test_production_china_midnight_workdays_and_end_exclusion(self) -> None:
+        part_id = self._production_part()
+        self.db.submit_progress("task-1", part_id, "worker", 20, "2026-07-14T16:00:00+00:00")
+        self.db.submit_progress("task-1", part_id, "worker", 40, "2026-07-18T12:00:00+08:00")
+        self.db.submit_part("task-1", part_id, "worker", "", "2026-07-21T00:00:00+08:00")
+        self.assertEqual(self._production_day(14)["image_count"], 0)
+        self.assertEqual(self._production_day(15)["image_count"], 20)
+        report = self.db.production_report("2026-07-14T00:00:00+08:00", "2026-07-21T00:00:00+08:00", workdays_only=True)
+        self.assertEqual((report["image_count"], report["excluded_weekend_count"]), (20, 20))
+        self.assertTrue(report["includes_untracked_time"])
+        self.assertEqual(len(report["events"]), 1)
+
+    def test_production_keeps_snapshot_and_credit_after_part_deleted(self) -> None:
+        part_id = self._production_part()
+        self.db.submit_progress("task-1", part_id, "worker", 60, "2026-07-14T18:00:00+08:00")
+        self.db.update_part("task-1", part_id, "publisher", "2026-07-15T09:00:00+08:00", name="renamed")
+        self.db.delete_part("task-1", part_id, "publisher", "2026-07-15T10:00:00+08:00")
+        report = self._production_day(14)
+        self.assertEqual(report["image_count"], 60)
+        self.assertEqual(report["events"][0]["part_name"], "part-a")
+
     def test_task_parts_timing_review_and_rework(self) -> None:
         created = self.db.create_task(task(), 2, "2026-07-15T10:00:00+08:00")
         self.assertEqual(created["product_tag"], "BSD")
@@ -187,7 +294,7 @@ class PlatformDatabaseTests(unittest.TestCase):
         parts = self.db.list_parts("task-1", "2026-07-15T10:00:00+08:00")
         self.assertEqual([part["name"] for part in parts], ["split_001", "group / split_002"])
         self.assertEqual(parts[1]["work_path"], r"\\server\data\group\split_002")
-        self.assertEqual(self.db.health()["schema_version"], 10)
+        self.assertEqual(self.db.health()["schema_version"], 11)
 
     def test_part_work_time_override_preserves_sessions_and_updates_statistics(self) -> None:
         self.db.create_task(task(), 1, "2026-07-15T10:00:00+08:00")
