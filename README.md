@@ -1,5 +1,7 @@
 # Process-isolated LocateAnything GPU Service
 
+标注平台的日报与周绩效规则、钉钉复制流程见 [docs/platform-performance-reports.md](docs/platform-performance-reports.md)。
+
 This is a separate test service. It keeps the existing LocateAnything job API
 and output layout, but replaces the in-process worker cache with one spawned
 Python process per CUDA device. This is required because LocateAnything's

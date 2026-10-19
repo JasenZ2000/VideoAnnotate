@@ -53,6 +53,47 @@ class WorkflowPlatformTests(unittest.TestCase):
         headerless = platform.parse_spreadsheet_rows(TABLE.splitlines()[1])
         self.assertEqual(headerless[0]["applicant"], "刘湛基")
 
+    def test_production_report_and_partial_submission_api(self) -> None:
+        task_id = self._publish(TABLE.splitlines()[1], 1)["tasks"][0]["task_id"]
+        part_id = self.client.get(f"/api/tasks/{task_id}").json()["parts"][0]["part_id"]
+        route = f"/api/tasks/{task_id}/parts/{part_id}"
+        self.assertEqual(self.client.patch(route, json={"image_count": 100}).status_code, 200)
+        self.assertEqual(self.client.get('/reports').status_code, 200)
+        self.assertEqual(self.client.post(route + '/submit-progress', json={"progress_count": 60}).status_code, 403)
+        self.client.post('/api/auth/logout')
+        self.assertEqual(self.client.get('/reports').status_code, 401)
+        self.assertEqual(self.client.get('/api/admin/production-report').status_code, 401)
+        self.client.post('/api/auth/login', json={"username": "worker", "password": "worker-pass"})
+        self.assertEqual(self.client.get('/reports').status_code, 403)
+        self.assertEqual(self.client.get('/api/admin/production-report').status_code, 403)
+        self.assertEqual(self.client.post(f"/api/tasks/{task_id}/parts/claim-next").status_code, 200)
+        for value in (-1, True, 1.2, "60", 2**53):
+            response = self.client.post(route + '/submit-progress', json={"progress_count": value})
+            self.assertEqual(response.status_code, 422, response.text)
+        with patch.object(platform, 'now_iso', return_value='2026-07-14T18:00:00+08:00'):
+            response = self.client.post(route + '/submit-progress', json={"progress_count": 60})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['part']['credited_count'], 60)
+        with patch.object(platform, 'now_iso', return_value='2026-07-15T18:00:00+08:00'):
+            self.assertEqual(self.client.post(route + '/submit', json={}).status_code, 200)
+        self.client.post('/api/auth/logout')
+        self.client.post('/api/auth/login', json={"username": "publisher", "password": "publisher-pass"})
+        report = self.client.get('/api/admin/production-report?period=day&date=2026-07-14')
+        self.assertEqual(report.status_code, 200, report.text)
+        self.assertEqual(report.json()['image_count'], 60)
+        self.assertEqual(next(user for user in report.json()['users'] if user['username'] == 'worker')['display_name'], '标注员')
+        week = self.client.get('/api/admin/production-report?period=week&date=2026-07-20&workdays_only=true').json()
+        self.assertEqual(week['start'], '2026-07-14T00:00:00+08:00')
+        self.assertEqual(week['image_count'], 100)
+        self.assertTrue(week['workdays_only'])
+        self.assertEqual(self.client.get('/api/admin/production-report?date=bad-date').status_code, 400)
+
+    def test_production_week_monday_tuesday_and_utc_host_boundaries(self) -> None:
+        self.assertEqual(platform.statistics_period_bounds('week', '2026-07-20')[0], '2026-07-14T00:00:00+08:00')
+        self.assertEqual(platform.statistics_period_bounds('week', '2026-07-21')[0], '2026-07-21T00:00:00+08:00')
+        self.assertEqual(platform.statistics_period_bounds('day', now='2026-07-14T18:00:00+00:00'),
+                         ('2026-07-15T00:00:00+08:00', '2026-07-16T00:00:00+08:00'))
+
     def test_statistics_period_bounds_support_day_week_and_month(self) -> None:
         self.assertEqual(
             platform.statistics_period_bounds(
@@ -64,7 +105,7 @@ class WorkflowPlatformTests(unittest.TestCase):
             platform.statistics_period_bounds(
                 "week", "2026-07-16", now="2026-07-16T12:00:00+08:00"
             ),
-            ("2026-07-13T00:00:00+08:00", "2026-07-20T00:00:00+08:00"),
+            ("2026-07-14T00:00:00+08:00", "2026-07-21T00:00:00+08:00"),
         )
         self.assertEqual(
             platform.statistics_period_bounds(
@@ -423,7 +464,7 @@ class WorkflowPlatformTests(unittest.TestCase):
 
     def test_health_and_authentication_contract(self) -> None:
         health = self.client.get("/api/health")
-        self.assertEqual(health.json()["api_schema_version"], 18)
+        self.assertEqual(health.json()["api_schema_version"], 19)
         self.client.post("/api/auth/logout")
         self.assertEqual(self.client.get("/api/tasks").status_code, 401)
 
