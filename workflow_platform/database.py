@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from workflow_platform.reporting import initialize_reporting
+
 
 SCHEMA_VERSION = 11
 _UNSET = object()
@@ -27,6 +29,7 @@ TASK_FIELDS = (
     "estimated_hours",
     "data_path",
     "guide_path",
+    "desired_completion_date",
 )
 
 
@@ -245,6 +248,10 @@ class PlatformDatabase:
                     id INTEGER PRIMARY KEY CHECK(id=1),
                     config TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS task_reminder_rules (
+                    rule_id TEXT PRIMARY KEY,
+                    config TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS reminder_events (
                     event_id TEXT PRIMARY KEY,
                     event_type TEXT NOT NULL,
@@ -300,6 +307,7 @@ class PlatformDatabase:
                 "estimated_hours": "TEXT NOT NULL DEFAULT ''",
                 "data_path": "TEXT NOT NULL DEFAULT ''",
                 "guide_path": "TEXT NOT NULL DEFAULT ''",
+                "desired_completion_date": "TEXT NOT NULL DEFAULT ''",
                 "expected_part_seconds": "REAL NOT NULL DEFAULT 0",
                 "priority": "TEXT NOT NULL DEFAULT 'medium'",
                 "rank": "INTEGER NOT NULL DEFAULT 0",
@@ -379,6 +387,7 @@ class PlatformDatabase:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(SCHEMA_VERSION),),
             )
+            initialize_reporting(connection)
 
     def health(self) -> dict[str, Any]:
         with self.connection() as connection:
@@ -919,6 +928,15 @@ class PlatformDatabase:
                 "SELECT p.task_id,p.status,COUNT(*) count FROM parts p JOIN tasks t ON t.task_id=p.task_id "
                 "WHERE t.deleted=0 GROUP BY p.task_id,p.status"
             ).fetchall()
+            tracking = connection.execute(
+                "SELECT p.task_id,COUNT(*) total,"
+                "SUM(CASE WHEN p.work_seconds_override IS NOT NULL OR p.work_seconds>0 OR EXISTS "
+                "(SELECT 1 FROM part_work_sessions s WHERE s.part_id=p.part_id) THEN 1 ELSE 0 END) tracked,"
+                "SUM(COALESCE(p.work_seconds_override,p.work_seconds)) seconds,"
+                "CASE WHEN COUNT(COALESCE(p.reviewed_at,p.submitted_at))=COUNT(*) THEN "
+                "MAX(COALESCE(p.reviewed_at,p.submitted_at)) END completed_at FROM parts p GROUP BY p.task_id"
+            ).fetchall()
+        tracking = {row["task_id"]: dict(row) for row in tracking}
         summaries: dict[str, dict[str, int]] = {}
         for row in counts:
             summaries.setdefault(row["task_id"], {status: 0 for status in PART_STATUSES})[row["status"]] = row["count"]
@@ -941,6 +959,9 @@ class PlatformDatabase:
                 state = "mixed"
             task.update(part_summary={**summary, "total": total}, overview_status=state,
                         completion_percent=round(summary["completed"] / total * 100, 1) if total else 0)
+            record = tracking.get(task["task_id"], {})
+            task["actual_hours"] = round(record["seconds"] / 3600, 3) if state == "completed" and record.get("tracked") == total and total else None
+            task["completed_at"] = record.get("completed_at") if state == "completed" else None
             result.append(task)
         return result
 
@@ -1014,6 +1035,8 @@ class PlatformDatabase:
                            "selected_date": selected_date, "users": [dict(row) for row in attendance_people]},
             "work": {"daily": [{"date": value, "count": work_counts.get(value, 0)} for value in dates],
                      "selected_date": selected_date,
+                     "total_expected_hours": round(sum(float(row["expected_hours"] or 0) for row in parts), 3),
+                     "total_actual_hours": round(sum(float(row["actual_seconds"] or 0) for row in parts) / 3600, 3),
                      "parts": [{**dict(row), "actual_hours": round(float(row["actual_seconds"] or 0) / 3600, 3)} for row in parts]},
         }
 
@@ -1033,6 +1056,18 @@ class PlatformDatabase:
         with self.connection() as connection:
             row = connection.execute("SELECT config FROM reminder_config WHERE id=1").fetchone()
         return json.loads(row["config"]) if row else {}
+
+    def task_reminder_rules(self) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            return [{"rule_id": row["rule_id"], **json.loads(row["config"])} for row in connection.execute("SELECT * FROM task_reminder_rules ORDER BY rowid")]
+
+    def save_task_reminder_rule(self, rule_id: str, config: dict[str, Any]) -> None:
+        with self.transaction() as connection:
+            connection.execute("INSERT INTO task_reminder_rules(rule_id,config) VALUES(?,?) ON CONFLICT(rule_id) DO UPDATE SET config=excluded.config", (rule_id, json.dumps(config, ensure_ascii=False)))
+
+    def delete_task_reminder_rule(self, rule_id: str) -> None:
+        with self.transaction() as connection:
+            connection.execute("DELETE FROM task_reminder_rules WHERE rule_id=?", (rule_id,))
 
     def save_reminder_config(self, config: dict[str, Any]) -> None:
         with self.transaction() as connection:
