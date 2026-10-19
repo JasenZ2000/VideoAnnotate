@@ -31,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from workflow_platform.database import PlatformDatabase, TASK_FIELDS
+from workflow_platform.reporting import daily_report, generate_daily_report, notifications, read_notifications, numeric_range
 from workflow_platform.tls import discover_tls_hosts, ensure_self_signed_certificate, normalize_tls_hosts
 
 
@@ -48,11 +49,15 @@ SPREADSHEET_HEADERS = (
     "数据量", "预计工时/单人", "数据路径", "标注说明书路径",
 )
 HEADER_TO_FIELD = dict(zip(SPREADSHEET_HEADERS, TASK_FIELDS))
+HEADER_TO_FIELD["希望完成时间"] = "desired_completion_date"
+SPREADSHEET_FIELDS = TASK_FIELDS
 
 async def automatic_report_loop():
     while True:
         try:
-            await asyncio.to_thread(run_automatic_report, now_iso())
+            current = now_iso()
+            await asyncio.to_thread(generate_daily_report, database())
+            await asyncio.to_thread(run_automatic_report, current)
             await asyncio.to_thread(process_reminder_events)
         except Exception:
             logging.getLogger(__name__).exception("Automatic daily report check failed")
@@ -126,8 +131,10 @@ class PublishTasksReq(BaseModel):
     part_prefix: str = ""
     part_manifest: str = ""
     annotation_tool: str = ""
+    manager: str = ""
     input_mode: str = "table"
     task: Optional[dict[str, str]] = None
+    registration: Optional[dict[str, str]] = None
 
 
 class AddPartsReq(BaseModel):
@@ -390,14 +397,14 @@ def parse_spreadsheet_rows(text: str) -> list[dict[str, str]]:
         mapping = [HEADER_TO_FIELD.get(cell) for cell in first]
         data_rows = rows[1:]
     else:
-        mapping = list(TASK_FIELDS)
+        mapping = list(SPREADSHEET_FIELDS)
         data_rows = rows
     if not data_rows:
         raise ValueError("只检测到表头，没有任务数据")
 
     result = []
     for row in data_rows:
-        record = {field: "" for field in TASK_FIELDS}
+        record = {field: "" for field in SPREADSHEET_FIELDS}
         for index, value in enumerate(row):
             if index < len(mapping) and mapping[index]:
                 record[str(mapping[index])] = value
@@ -781,25 +788,75 @@ def update_reminder_management(req: ReminderManagementReq):
     return reminder_settings()
 
 
+class TaskReminderRuleReq(BaseModel):
+    task_id: str
+    event: str
+    robot_id: int
+    usernames: list[str] = Field(min_length=1)
+    note: str = Field(default="", max_length=4000)
+    enabled: bool = True
+
+
+@app.get("/api/admin/task-reminders")
+def list_task_reminders():
+    require_admin()
+    return {"rules": database().task_reminder_rules()}
+
+
+@app.put("/api/admin/task-reminders/{rule_id}")
+def save_task_reminder(rule_id: uuid.UUID, req: TaskReminderRuleReq):
+    require_admin()
+    if req.event not in {"started", "priority", "completed"}:
+        raise HTTPException(400, "不支持的任务事件")
+    try:
+        database().get_task(req.task_id, now_iso())
+    except KeyError as exc:
+        raise HTTPException(404, "任务不存在") from exc
+    if req.enabled:
+        validate_notification_targets(req.robot_id, req.usernames)
+    database().save_task_reminder_rule(str(rule_id), req.model_dump())
+    return {"rules": database().task_reminder_rules()}
+
+
+@app.delete("/api/admin/task-reminders/{rule_id}")
+def delete_task_reminder(rule_id: uuid.UUID):
+    require_admin()
+    database().delete_task_reminder_rule(str(rule_id))
+    return {"rules": database().task_reminder_rules()}
+
+
 def enqueue_task_reminder(event: str, task_id: str, actor: str, event_id: str = "", note: str = "") -> None:
     try:
-        rule = reminder_settings()["rules"][event]
-        if not rule["enabled"]:
-            return
+        global_rule = reminder_settings()["rules"][event]
+        rules = [("global", global_rule)] if global_rule["enabled"] else []
+        rules.extend((rule["rule_id"], rule) for rule in database().task_reminder_rules()
+                     if rule["enabled"] and rule["task_id"] == task_id and rule["event"] == event)
         task = database().get_task(task_id, now_iso())
         users = {user["username"]: user for user in database().list_users()}
-        names = list(rule["usernames"])
-        if rule["notify_publisher"] and task["publisher"] not in names:
-            names.append(task["publisher"])
-        if rule.get("notify_applicant") and task["applicant"] in users and task["applicant"] not in names:
-            names.append(task["applicant"])
-        names = [name for name in names if name in users and users[name]["is_active"] and users[name]["phone"].strip()]
-        request = TaskNotificationReq(kind="task", task_id=task_id, robot_id=rule["robot_id"], usernames=names, note=note)
-        content = notification_content(request, now_iso(), event=EVENT_NAMES[event])
-        payload = DingTestReq(robot_id=rule["robot_id"], usernames=names, content=content).model_dump()
-        database().enqueue_reminder(event_id or uuid.uuid4().hex, event, task_id, payload, now_iso())
     except Exception:
-        logging.getLogger(__name__).exception("Could not queue task reminder for %s", task_id)
+        logging.getLogger(__name__).exception("Could not load task reminders for %s", task_id)
+        return
+    identifier = event_id or uuid.uuid4().hex
+    for rule_id, rule in rules:
+        try:
+            if rule_id != "global":
+                validate_notification_targets(rule["robot_id"], rule["usernames"])
+            names = list(rule["usernames"])
+            if rule.get("notify_publisher") and task["publisher"] not in names:
+                names.append(task["publisher"])
+            if rule.get("notify_applicant") and task.get("applicant") in users and task["applicant"] not in names:
+                names.append(task["applicant"])
+            names = [name for name in names if name in users and users[name]["is_active"] and users[name]["phone"].strip()]
+            request = TaskNotificationReq(kind="task", task_id=task_id, robot_id=rule["robot_id"], usernames=names,
+                                          note="\n".join(value for value in (note, rule.get("note", "")) if value))
+            content = notification_content(request, now_iso(), event=EVENT_NAMES[event])
+            if rule.get("note") and rule["note"] not in content:
+                content += "\n备注：" + rule["note"]
+            payload = DingTestReq(robot_id=rule["robot_id"], usernames=names, content=content).model_dump()
+            database().enqueue_reminder(identifier if rule_id == "global" else identifier + ":task-rule:" + rule_id,
+                                        event, task_id, payload, now_iso())
+        except Exception:
+            logging.getLogger(__name__).exception("Could not queue task reminder %s for %s", rule_id, task_id)
 
 
 def process_reminder_events() -> None:
@@ -832,9 +889,10 @@ def notification_content(req: TaskNotificationReq, now: str, event: str = "任�
         expected = sum(float(item["expected_hours"]) for item in work)
         actual = sum(float(item["actual_seconds"] or 0) for item in work) / 3600
         lines = [f"下班日报 · {work_date}", f"今日报到：{overview['attendance']['checked_in_count']} 人", f"今日完成：{len(work)} 个 Part",
-                 f"完成工时：预计 {expected:.2f} 小时；实际 {actual:.2f} 小时", "", "任务表格", "排名 | 优先级 | 标签 | 项目 | 内容 | 状态 | Part进度 | 预计工时 | 预计完成"]
-        for task in overview["tasks"]:
-            values = [task["rank"], priorities.get(task["priority"], task["priority"]), task["product_tag"], task["project"], task["annotation_content"],
+                 f"完成工时：预计 {expected:.2f} 小时；实际 {actual:.2f} 小时", "", "任务表格", "排名 | 优先级 | 标签 | 项目 | 发布人 | 状态 | Part进度 | 预计工时 | 预计完成"]
+        daily_tasks = [task for task in overview["tasks"] if task["overview_status"] != "completed"][:5]
+        for task in daily_tasks:
+            values = [task["rank"], priorities.get(task["priority"], task["priority"]), task["product_tag"], task["project"], task.get("publisher") or "N/A",
                       statuses[task["overview_status"]], f"{task['part_summary']['completed']}/{task['part_summary']['total']}",
                       f"{task['estimated_completion_hours']:.2f}h", task["estimated_completion_date"] or "待估算"]
             lines.append(" | ".join(str(value).replace("\n", " ").replace("\r", " ") for value in values))
@@ -855,8 +913,31 @@ def notification_content(req: TaskNotificationReq, now: str, event: str = "任�
     else:
         values.update(completed_parts=len(work), expected_hours=f"{expected:.2f}", actual_hours=f"{actual:.2f}")
         table_start = lines.index("任务表格") + 1
-        values["task_table"] = "\n".join(lines[table_start:table_start + len(overview["tasks"]) + 1])
+        values["task_table"] = "\n".join(lines[table_start:table_start + len(daily_tasks) + 1])
     return template.format_map(values)
+
+
+@app.get("/api/notifications")
+async def get_notifications():
+    return notifications(database(), require_user()["username"])
+
+
+@app.post("/api/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id: int):
+    user = require_user()
+    read_notifications(database(), user["username"], notification_id, now_iso())
+    return {"ok": True}
+
+
+@app.get("/api/daily-reports")
+async def get_daily_report(date: str = ""):
+    user = require_user()
+    if date:
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise HTTPException(400, "日期格式必须为 YYYY-MM-DD") from exc
+    return daily_report(database(), user, date)
 
 
 @app.get("/api/admin/notifications")
@@ -1001,15 +1082,47 @@ async def delete_user(username: str):
     return {"ok": True, "summary": summary}
 
 
+def validate_registration_row(row: dict[str, str]) -> dict[str, str]:
+    if not row["project"].strip():
+        raise ValueError("项目不能为空")
+    try:
+        datetime.strptime(row["application_date"], "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("申请日期必须使用 YYYY-MM-DD 格式") from exc
+    amount = numeric_range(row["data_amount"])
+    capacity = numeric_range(row["hourly_capacity"])
+    if not amount:
+        raise ValueError("数据量必须为正数")
+    if not capacity:
+        raise ValueError("每小时可标必须为正数或有效范围")
+    estimated = numeric_range(row["estimated_hours"])
+    if not estimated:
+        low = amount[0] / capacity[1]
+        high = amount[1] / capacity[0]
+        row["estimated_hours"] = f"{low:.2f}" if low == high else f"{low:.2f}-{high:.2f}"
+    return row
+
+
 def publication_rows(req: PublishTasksReq) -> list[dict[str, str]]:
+    if req.manager.strip():
+        users = {user["username"]: user for user in database().list_users()}
+        manager = users.get(req.manager.strip())
+        if not manager or not manager["is_active"]:
+            raise ValueError("协同查看人不存在或已停用")
+    if req.registration is not None:
+        row = {field: str(req.registration.get(field, "")).strip() for field in TASK_FIELDS}
+        row["applicant"] = resolve_applicant(row["applicant"])
+        return [validate_registration_row(row)]
     if req.input_mode == "table":
         rows = parse_spreadsheet_rows(req.clipboard_text)
         for row in rows:
             row["applicant"] = resolve_applicant(row["applicant"])
+            validate_registration_row(row)
         return rows
     if req.input_mode != "manual":
         raise ValueError("不支持的发布方式")
-    row = {field: str((req.task or {}).get(field, "")).strip() for field in TASK_FIELDS}
+    source = req.registration if req.registration is not None else req.task
+    row = {field: str((source or {}).get(field, "")).strip() for field in TASK_FIELDS}
     row["applicant"] = resolve_applicant(row["applicant"])
     if not row["project"] and not row["annotation_content"]:
         raise ValueError("手填任务至少需要项目或标注内容")
@@ -1082,7 +1195,7 @@ async def publish_tasks(req: PublishTasksReq):
                 "name": f"{project} · {content}",
                 "status": "ready",
                 "publisher": actor,
-                "manager": actor,
+                "manager": req.manager.strip() or actor,
                 "product_tag": tag,
                 "part_prefix": req.part_prefix.strip(),
                 "annotation_tool": req.annotation_tool.strip(),
@@ -1344,7 +1457,7 @@ async def claim_next_part(task_id: str):
     if part is None:
         raise HTTPException(409, "当前没有可领取的 Part")
     database().check_in(actor, datetime.fromisoformat(now).date().isoformat(), now)
-    if before["status"] == "ready":
+    if before["part_summary"]["pending"] == before["part_summary"]["total"]:
         enqueue_task_reminder("started", task_id, actor, "started:" + task_id)
     return {"part": part}
 

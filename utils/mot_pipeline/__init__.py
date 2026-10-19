@@ -1,2 +1,2 @@
-"""Minimal package for modular MOT and clip extraction."""
+"""Utility helpers for I/O and bounding boxes."""
 
