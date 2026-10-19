@@ -224,6 +224,7 @@ class EventReminderRule(BaseModel):
     robot_id: Optional[int] = None
     usernames: list[str] = Field(default_factory=list)
     notify_publisher: bool = False
+    notify_applicant: bool = False
 
 
 class ReminderManagementReq(BaseModel):
@@ -588,6 +589,15 @@ async def list_users():
     return {"users": database().list_users()}
 
 
+@app.get("/api/active-users")
+async def list_active_users():
+    require_user()
+    return {"users": [
+        {"username": user["username"], "display_name": user["display_name"]}
+        for user in database().list_users() if user["is_active"]
+    ]}
+
+
 @app.get("/api/attendance")
 async def attendance_status():
     user = require_user()
@@ -781,6 +791,8 @@ def enqueue_task_reminder(event: str, task_id: str, actor: str, event_id: str = 
         names = list(rule["usernames"])
         if rule["notify_publisher"] and task["publisher"] not in names:
             names.append(task["publisher"])
+        if rule.get("notify_applicant") and task["applicant"] in users and task["applicant"] not in names:
+            names.append(task["applicant"])
         names = [name for name in names if name in users and users[name]["is_active"] and users[name]["phone"].strip()]
         request = TaskNotificationReq(kind="task", task_id=task_id, robot_id=rule["robot_id"], usernames=names, note=note)
         content = notification_content(request, now_iso(), event=EVENT_NAMES[event])
@@ -991,13 +1003,36 @@ async def delete_user(username: str):
 
 def publication_rows(req: PublishTasksReq) -> list[dict[str, str]]:
     if req.input_mode == "table":
-        return parse_spreadsheet_rows(req.clipboard_text)
+        rows = parse_spreadsheet_rows(req.clipboard_text)
+        for row in rows:
+            row["applicant"] = resolve_applicant(row["applicant"])
+        return rows
     if req.input_mode != "manual":
         raise ValueError("不支持的发布方式")
     row = {field: str((req.task or {}).get(field, "")).strip() for field in TASK_FIELDS}
+    row["applicant"] = resolve_applicant(row["applicant"])
     if not row["project"] and not row["annotation_content"]:
         raise ValueError("手填任务至少需要项目或标注内容")
     return [row]
+
+
+def resolve_applicant(value: str) -> str:
+    applicant = value.strip()
+    if not applicant:
+        return applicant
+    users = database().list_users()
+    by_username = {user["username"].casefold(): user for user in users}
+    account = by_username.get(applicant.casefold())
+    matches = [user for user in users if user["display_name"].strip().casefold() == applicant.casefold()]
+    if account and not account["is_active"]:
+        raise ValueError("申请人账号已停用")
+    if len(matches) > 1:
+        raise ValueError("申请人显示名对应多个用户，请填写用户名")
+    if account and account["is_active"]:
+        return account["username"]
+    if matches and matches[0]["is_active"]:
+        return matches[0]["username"]
+    return applicant
 
 
 @app.post("/api/tasks/preview")
@@ -1096,6 +1131,10 @@ def build_task_overview(now: str):
             except (TypeError, ValueError):
                 hours = 0.0
         task["estimated_completion_hours"] = hours
+        if task["overview_status"] == "completed":
+            task["estimated_completion_days"] = None
+            task["estimated_completion_date"] = None
+            continue
         task["estimated_completion_days"] = max(1, math.ceil((cumulative + hours) / available_hours)) if available_hours and hours else None
         task["estimated_completion_date"] = working_day_completion(today, task["estimated_completion_days"]).isoformat() if task["estimated_completion_days"] else None
         cumulative += hours
@@ -1196,6 +1235,11 @@ async def update_task(task_id: str, req: UpdateTaskReq):
             if not target["is_active"]:
                 raise HTTPException(400, "指定的协同查看人已停用")
         changes["manager"] = manager
+    if "applicant" in changes:
+        try:
+            changes["applicant"] = resolve_applicant(changes["applicant"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     try:
         task = database().update_task(task_id, actor, changes, now_iso())
     except BaseException as exc:
@@ -1291,13 +1335,15 @@ async def update_part(task_id: str, part_id: int, req: UpdatePartReq):
 @app.post("/api/tasks/{task_id}/parts/claim-next")
 async def claim_next_part(task_id: str):
     actor = require_user()["username"]
+    now = now_iso()
     try:
-        before = database().get_task(task_id, now_iso())
-        part = database().claim_next_part(task_id, actor, now_iso())
+        before = database().get_task(task_id, now)
+        part = database().claim_next_part(task_id, actor, now)
     except BaseException as exc:
         _raise_database_error(exc)
     if part is None:
         raise HTTPException(409, "当前没有可领取的 Part")
+    database().check_in(actor, datetime.fromisoformat(now).date().isoformat(), now)
     if before["status"] == "ready":
         enqueue_task_reminder("started", task_id, actor, "started:" + task_id)
     return {"part": part}
@@ -1306,10 +1352,12 @@ async def claim_next_part(task_id: str):
 @app.post("/api/tasks/{task_id}/parts/{part_id}/start-rework")
 async def start_rework(task_id: str, part_id: int):
     actor = require_user()["username"]
+    now = now_iso()
     try:
-        part = database().start_rework(task_id, part_id, actor, now_iso())
+        part = database().start_rework(task_id, part_id, actor, now)
     except BaseException as exc:
         _raise_database_error(exc)
+    database().check_in(actor, datetime.fromisoformat(now).date().isoformat(), now)
     return {"part": part}
 
 
@@ -1326,10 +1374,12 @@ async def pause_part(task_id: str, part_id: int):
 @app.post("/api/tasks/{task_id}/parts/{part_id}/resume")
 async def resume_part(task_id: str, part_id: int):
     actor = require_user()["username"]
+    now = now_iso()
     try:
-        part = database().resume_part(task_id, part_id, actor, now_iso())
+        part = database().resume_part(task_id, part_id, actor, now)
     except BaseException as exc:
         _raise_database_error(exc)
+    database().check_in(actor, datetime.fromisoformat(now).date().isoformat(), now)
     return {"part": part}
 
 

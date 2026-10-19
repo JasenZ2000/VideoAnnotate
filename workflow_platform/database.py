@@ -971,6 +971,8 @@ class PlatformDatabase:
                            "selected_date": selected_date, "users": [dict(row) for row in attendance_people]},
             "work": {"daily": [{"date": value, "count": work_counts.get(value, 0)} for value in dates],
                      "selected_date": selected_date,
+                     "total_expected_hours": round(sum(float(row["expected_hours"] or 0) for row in parts), 3),
+                     "total_actual_hours": round(sum(float(row["actual_seconds"] or 0) for row in parts) / 3600, 3),
                      "parts": [{**dict(row), "actual_hours": round(float(row["actual_seconds"] or 0) / 3600, 3)} for row in parts]},
         }
 
@@ -1596,7 +1598,7 @@ class PlatformDatabase:
             ).fetchall()
             part_rows = connection.execute(
                 "SELECT p.part_id,p.task_id,p.annotator,p.image_count,p.progress_count,p.bbox_count,p.status,p.work_seconds_override,"
-                "p.submitted_at,p.reviewed_at,t.name,t.project,t.annotation_content "
+                "p.submitted_at,p.reviewed_at,t.name,t.project,t.annotation_content,t.product_tag "
                 "FROM parts p JOIN tasks t ON t.task_id=p.task_id "
                 "WHERE t.deleted=0 AND COALESCE(p.annotator,'')!=''"
             ).fetchall()
@@ -1632,6 +1634,7 @@ class PlatformDatabase:
         roles = {str(row["username"]): str(row["role"] or "user") for row in user_rows}
         active = {str(row["username"]): bool(row["is_active"]) for row in user_rows}
         grouped: dict[str, dict[str, Any]] = {}
+        product_groups: dict[str, dict[str, Any]] = {}
 
         def user_item(username: str) -> dict[str, Any]:
             return grouped.setdefault(username, {
@@ -1668,6 +1671,16 @@ class PlatformDatabase:
                 continue
             item = user_item(username)
             task_id = str(part["task_id"])
+            product_tag = str(part["product_tag"] or "未分类")
+            product_item = product_groups.setdefault(product_tag, {
+                "product_tag": product_tag,
+                "task_ids": set(),
+                "completed_parts": 0,
+                "image_count": 0,
+                "bbox_count": 0,
+                "work_seconds": 0.0,
+            })
+            product_item["task_ids"].add(task_id)
             tasks = item["tasks"]
             task_item = tasks.setdefault(task_id, {
                 "task_id": task_id,
@@ -1682,15 +1695,19 @@ class PlatformDatabase:
             if completed:
                 task_item["completed_parts"] += 1
                 item["completed_parts"] += 1
+                product_item["completed_parts"] += 1
                 image_count = max(0, int(part["progress_count"] or 0))
                 task_item["image_count"] += image_count
                 item["image_count"] += image_count
+                product_item["image_count"] += image_count
                 if part["status"] in {"submitted", "completed"}:
                     bbox_count = part["bbox_count"] if part["bbox_count"] is not None else 1
                     task_item["bbox_count"] += bbox_count
                     item["bbox_count"] += bbox_count
+                    product_item["bbox_count"] += bbox_count
             task_item["work_seconds"] += seconds
             item["work_seconds"] += seconds
+            product_item["work_seconds"] += seconds
 
         users: list[dict[str, Any]] = []
         for item in grouped.values():
@@ -1722,6 +1739,20 @@ class PlatformDatabase:
             users.append(item)
 
         users.sort(key=lambda item: (-item["image_count"], item["display_name"] or item["username"]))
+        products = []
+        for item in product_groups.values():
+            work_seconds = round(float(item["work_seconds"]), 3)
+            products.append({
+                "product_tag": item["product_tag"],
+                "task_count": len(item["task_ids"]),
+                "completed_parts": item["completed_parts"],
+                "image_count": item["image_count"],
+                "bbox_count": item["bbox_count"],
+                "work_seconds": work_seconds,
+                "bboxes_per_hour": round(item["bbox_count"] / work_seconds * 3600, 3) if work_seconds > 0 else 0.0,
+                "images_per_hour": round(item["image_count"] / work_seconds * 3600, 3) if work_seconds > 0 else 0.0,
+            })
+        products.sort(key=lambda item: (-item["image_count"], item["product_tag"]))
         total_work_seconds = sum(float(item["work_seconds"]) for item in users)
         total_image_count = sum(int(item["image_count"]) for item in users)
         total_bbox_count = sum(int(item["bbox_count"]) for item in users)
@@ -1730,6 +1761,7 @@ class PlatformDatabase:
             "start": start,
             "end": end,
             "users": users,
+            "products": products,
             "total": {
                 "completed_parts": total_completed_parts,
                 "image_count": total_image_count,

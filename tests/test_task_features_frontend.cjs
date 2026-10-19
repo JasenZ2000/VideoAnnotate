@@ -35,7 +35,7 @@ test('publish modes discard inactive Part inputs and validate integer counts', (
 });
 
 test('ordinary users see task table without administrator settings requests', async () => {
-  const {context,nodes,requests}=frontend({'content':''});
+  const {context,nodes,requests}=frontend({'content':'','task-table-results':''});
   context.me={username:'worker',role:'user'};
   context.api=async(method,url)=>{requests.push(url);return {tasks:[]};};
   await context.openMainView('tasks');
@@ -45,7 +45,7 @@ test('ordinary users see task table without administrator settings requests', as
 });
 
 test('task table includes attendance and both notification forms for admins', async () => {
-  const {context,nodes}=frontend({'content':'','task-settings':'','notify-daily-robot':''});
+  const {context,nodes}=frontend({'content':'','task-table-results':'','task-settings':'','notify-daily-robot':''});
   context.me={username:'admin',role:'admin'};
   context.api=async (method,url)=>{
     if(url==='/api/task-overview')return {tasks:[{task_id:'task-1',rank:1,priority:'high',overview_status:'pending',product_tag:'BSD',project:'道路',annotation_content:'车辆',part_summary:{completed:0,total:2},estimated_completion_hours:4,estimated_completion_date:'2026-10-13'}]};
@@ -56,7 +56,7 @@ test('task table includes attendance and both notification forms for admins', as
     throw Error(url);
   };
   await context.openMainView('tasks');
-  assert.ok(nodes.content.innerHTML.includes('排名'));
+  assert.ok(nodes['task-table-results'].innerHTML.includes('排名'));
   assert.ok(nodes['task-settings'].innerHTML.includes('table-work-start'));
   assert.ok(nodes['task-settings'].innerHTML.includes('任务提醒'));
   assert.ok(nodes['task-settings'].innerHTML.includes('下班日报提醒'));
@@ -66,7 +66,7 @@ test('task table includes attendance and both notification forms for admins', as
 });
 
 test('combined settlement view requests seven days and renders both tables', async () => {
-  const {context,nodes,requests}=frontend({'content':''});
+  const {context,nodes,requests}=frontend({'content':'','task-table-results':''});
   context.api=async (...args)=>{requests.push(args);return {attendance:{selected_date:'2026-10-13',daily:[{date:'2026-10-13',count:2}],users:[{username:'worker',display_name:'张三',checked_in_at:'08:30'}]},work:{daily:[{date:'2026-10-13',count:1}],parts:[{product_tag:'BSD',project:'道路',username:'worker',expected_hours:2,actual_hours:1}]}};};
   await context.openMainView('attendance');
   assert.ok(requests[0][1].includes('days=7'));
@@ -100,4 +100,32 @@ test('overview escapes user text and sends directory filters with pagination', a
   assert.equal(url.searchParams.get('page'), '2');
   assert.equal(url.searchParams.get('page_size'), '50');
   assert.ok(nodes['overview-results'].innerHTML.includes('没有符合条件'));
+});
+
+test('task tables split completion states and filter both by product tag', async () => {
+  const {context,nodes}=frontend({'content':'','task-table-results':''});
+  context.me={username:'worker',role:'user'};
+  const task=(project,tag,state)=>({project,product_tag:tag,overview_status:state,priority:'high',part_summary:{completed:state==='completed'?1:0,total:1},estimated_completion_hours:4});
+  context.api=async()=>({tasks:[task('ActiveBSD','BSD','pending'),task('DoneBSD','BSD','completed'),task('ActiveQA','QA','in_progress'),task('DoneQA','QA','completed')]});
+  await context.openMainView('tasks');
+  assert.match(nodes.content.innerHTML,/产品标签筛选/);
+  let html=nodes['task-table-results'].innerHTML;
+  assert.match(html,/未完成任务（2）/);
+  assert.match(html,/已完成任务（2）/);
+  assert.ok(!html.split('已完成任务')[1].includes('待估算'));
+  assert.ok(!html.split('已完成任务')[1].includes('预计完成'));
+  context.filterTaskTables('BSD');
+  html=nodes['task-table-results'].innerHTML;
+  assert.match(html,/ActiveBSD/);assert.match(html,/DoneBSD/);
+  assert.ok(!html.includes('ActiveQA'));assert.ok(!html.includes('DoneQA'));
+  context.filterTaskTables('');
+  assert.match(nodes['task-table-results'].innerHTML,/DoneQA/);
+});
+test('settlement totals show actual and expected hours including empty dates',()=>{
+  const {context,nodes}=frontend({'content':''});
+  const data={attendance:{selected_date:'2026-10-14',daily:[],users:[]},work:{daily:[],parts:[{expected_hours:2,actual_hours:1.25},{expected_hours:3,actual_hours:0.75}]}};
+  context.renderSettlement(data);
+  assert.match(nodes.content.innerHTML,/预计 5.00 小时；实际总耗时 2.00 小时/);
+  data.work.parts=[];context.renderSettlement(data);
+  assert.match(nodes.content.innerHTML,/预计 0.00 小时；实际总耗时 0.00 小时/);
 });

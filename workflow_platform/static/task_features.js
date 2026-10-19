@@ -27,10 +27,11 @@ openPublish=function(){
   if(!me){openAuth();return;}
   const grid=document.getElementById('pub-manual-grid');
   if(!grid.childElementCount){
-    grid.innerHTML=fields.map((f,i)=>'<div class="field"><label>'+esc(headers[i])+'</label><input id="pub-'+f+'"'+(f==='application_date'?' type="date"':'')+'></div>').join('');
+    grid.innerHTML=fields.map((f,i)=>'<div class="field"><label>'+esc(headers[i])+'</label><input id="pub-'+f+'"'+(f==='application_date'?' type="date"':'')+(f==='applicant'?' list="applicant-users" autocomplete="off"':'')+'></div>').join('')+'<datalist id="applicant-users"></datalist>';
     document.getElementById('pub-application_date').value=localDateValue();
     document.getElementById('pub-applicant').value=me.username;
   }
+  api('GET','/api/active-users').then(data=>{const list=document.getElementById('applicant-users');if(list)list.innerHTML=data.users.map(user=>'<option value="'+esc(user.username)+'">'+esc(user.display_name||user.username)+'</option>').join('');}).catch(()=>{});
   originalOpenPublish();togglePublishMode();
 };
 function localDateValue(){const date=new Date();return date.getFullYear()+'-'+String(date.getMonth()+1).padStart(2,'0')+'-'+String(date.getDate()).padStart(2,'0');}
@@ -80,21 +81,33 @@ async function renderOverview(){
 }
 async function moveOverviewPage(delta){overviewPage+=delta;try{await renderOverview();}catch(error){document.getElementById('overview-error').textContent=error.message;}}
 const _updateUserAttendance=typeof updateUser==='function'?updateUser:function(){};
-updateUser=function(){_updateUserAttendance();const reminders=document.getElementById('reminders-btn');if(reminders)reminders.classList.toggle('hidden',!(me&&me.role==='admin'));const button=document.getElementById('attendance-btn');if(button)button.classList.toggle('hidden',!me);loadAttendanceStatus().catch(()=>{});};
-async function loadAttendanceStatus(){if(!me)return;const status=await api('GET','/api/attendance');const button=document.getElementById('attendance-btn'),count=document.getElementById('attendance-count');button.classList.remove('hidden');button.textContent=status.checked_in?'已报到':'标注员报到';button.disabled=status.checked_in;count.classList.remove('hidden');count.textContent='今日已报到 '+status.checked_in_count+' 人';}
-async function checkInAttendance(){try{await api('POST','/api/attendance/check-in',{});await loadAttendanceStatus();toast('今日报到成功')}catch(error){toast(error.message)}}
+document.getElementById('attendance-btn')?.remove();
+updateUser=function(){_updateUserAttendance();const reminders=document.getElementById('reminders-btn');if(reminders)reminders.classList.toggle('hidden',!(me&&me.role==='admin'));document.getElementById('attendance-btn')?.remove();loadAttendanceStatus().catch(()=>{});};
+async function loadAttendanceStatus(){if(!me)return;const status=await api('GET','/api/attendance');const count=document.getElementById('attendance-count');if(!count)return;count.classList.remove('hidden');count.textContent='今日已报到 '+status.checked_in_count+' 人';}
 
 if(typeof me!=='undefined'&&me)updateUser();
 
 let mainView='tasks';
+let taskTableTasks=[],taskTableTag='';
+function filterTaskTables(tag){taskTableTag=tag;renderTaskTables();}
+function renderTaskTables(){
+  const rows=taskTableTasks.filter(task=>!taskTableTag||task.product_tag===taskTableTag).map(task=>({...task,state:overviewStates[task.overview_status],priority_text:typeof priorityName==='undefined'?task.priority:priorityName[task.priority],part_progress:task.part_summary.completed+' / '+task.part_summary.total,hours:Number(task.estimated_completion_hours||0).toFixed(2)+' 小时',completion:task.overview_status==='completed'?'已完成':task.estimated_completion_date||'待估算'}));
+  const unfinished=rows.filter(task=>task.overview_status!=='completed'),completed=rows.filter(task=>task.overview_status==='completed');
+  const columns=[['rank','排名'],['priority_text','优先级'],['state','状态'],['product_tag','标签'],['project','项目'],['annotation_content','内容'],['part_progress','Part 进度'],['hours','预计工时']];
+  document.getElementById('task-table-results').innerHTML='<section><h2>未完成任务（'+unfinished.length+'）</h2><div class="table-wrap">'+overviewTable([...columns,['completion','预计完成']],unfinished)+'</div></section><section><h2>已完成任务（'+completed.length+'）</h2><div class="table-wrap">'+overviewTable(columns,completed)+'</div></section>';
+}
+
 function barChart(items,valueKey){const max=Math.max(1,...items.map(x=>Number(x[valueKey]||0)));return '<div class="bar-chart">'+items.map(x=>'<div class="bar-item"><div class="bar" style="height:'+Math.max(6,Number(x[valueKey]||0)/max*100)+'%"><b>'+esc(x[valueKey]??0)+'</b></div><small>'+esc(x.date.slice(5))+'</small></div>').join('')+'</div>'}
 async function openMainView(view){
   mainView=view;selected=null;document.getElementById('content').innerHTML='<div class="detail"><div class="hint">正在加载...</div></div>';
   try{
     if(view==='tasks'){
       const data=await api('GET','/api/task-overview');
-      const rows=data.tasks.map(task=>({...task,state:overviewStates[task.overview_status],priority_text:typeof priorityName==='undefined'?task.priority:priorityName[task.priority],part_progress:task.part_summary.completed+' / '+task.part_summary.total,hours:Number(task.estimated_completion_hours||0).toFixed(2)+' 小时',completion:task.estimated_completion_date||'待估算'}));
-      document.getElementById('content').innerHTML='<div class="detail"><h1>任务表格</h1><p class="sub">按预计完成日期升序排列，同一天按排名升序；排期跳过周六和周日。</p><div class="table-wrap">'+overviewTable([['rank','排名'],['priority_text','优先级'],['state','状态'],['product_tag','标签'],['project','项目'],['annotation_content','内容'],['part_progress','Part 进度'],['hours','预计工时'],['completion','预计完成']],rows)+'</div><div id="task-settings"></div></div>';
+      taskTableTasks=data.tasks;
+      const tags=[...new Set(taskTableTasks.map(task=>task.product_tag).filter(Boolean))].sort();
+      if(!tags.includes(taskTableTag))taskTableTag='';
+      document.getElementById('content').innerHTML='<div class="detail"><h1>任务表格</h1><p class="sub">未完成任务按预计完成日期升序排列，同一天按排名升序；排期跳过周六和周日，已完成任务不参与排期。</p><div class="field" style="max-width:280px"><label>产品标签筛选</label><select id="task-table-tag" onchange="filterTaskTables(this.value)"><option value="">全部标签</option>'+tags.map(tag=>'<option value="'+esc(tag)+'" '+(tag===taskTableTag?'selected':'')+'>'+esc(tag)+'</option>').join('')+'</select></div><div id="task-table-results"></div><div id="task-settings"></div></div>';
+      renderTaskTables();
       if(typeof me!=='undefined'&&me?.role==='admin')await loadTaskSettings(data);
     }else{renderSettlement(await api('GET','/api/attendance/settlements?days=7'));}
   }catch(error){document.getElementById('content').innerHTML='<div class="detail"><div class="error">'+esc(error.message)+'</div></div>';}
@@ -115,7 +128,7 @@ function taskNotificationBody(kind){return {kind,robot_id:Number(document.getEle
 async function previewTaskNotification(kind){try{const result=await api('POST','/api/admin/notifications/preview',taskNotificationBody(kind));const preview=document.getElementById('notify-'+kind+'-preview');preview.textContent=result.content;preview.classList.remove('hidden');document.getElementById('notify-'+kind+'-error').textContent=''}catch(error){document.getElementById('notify-'+kind+'-error').textContent=error.message}}
 async function sendTaskNotification(kind){const button=document.getElementById('notify-'+kind+'-send');button.disabled=true;try{await api('POST','/api/admin/notifications/send',taskNotificationBody(kind));document.getElementById('notify-'+kind+'-error').textContent='';toast('通知已发送')}catch(error){document.getElementById('notify-'+kind+'-error').textContent=error.message}finally{button.disabled=false}}
 async function saveAutomaticReport(){try{const body=taskNotificationBody('daily');await api('PATCH','/api/admin/notifications',{enabled:document.getElementById('notify-daily-enabled').checked,robot_id:body.robot_id||null,usernames:body.usernames,note:body.note});document.getElementById('notify-daily-error').textContent='';toast('自动日报设置已保存')}catch(error){document.getElementById('notify-daily-error').textContent=error.message}}
-function renderSettlement(data){document.getElementById('content').innerHTML=`<div class="detail"><h1>考勤与工时结算</h1><div class="field" style="max-width:240px"><label>选择日期（时间轴为截至该日的七天）</label><input type="date" value="${esc(data.attendance.selected_date)}" onchange="loadSettlementDate(this.value)"></div><h2>每日报到人数</h2>${barChart(data.attendance.daily,'count')}${attendanceDetail(data.attendance.users)}<h2>每日完成 Part 数</h2><p class="sub">每 Part 预计工时 = 任务总预计工时 ÷ Part 总数；实际耗时使用累计计时或管理员修正值。</p>${barChart(data.work.daily,'count')}${workDetail(data.work.parts)}</div>`;}
+function renderSettlement(data){document.getElementById('content').innerHTML=`<div class="detail"><h1>考勤与工时结算</h1><div class="field" style="max-width:240px"><label>选择日期（时间轴为截至该日的七天）</label><input type="date" value="${esc(data.attendance.selected_date)}" onchange="loadSettlementDate(this.value)"></div><h2>每日报到人数</h2>${barChart(data.attendance.daily,'count')}${attendanceDetail(data.attendance.users)}<h2>每日完成 Part 数</h2><p class="sub">每 Part 预计工时 = 任务总预计工时 ÷ Part 总数；实际耗时使用累计计时或管理员修正值。</p>${barChart(data.work.daily,'count')}<div class="hint">所选日期完成 Part 工时合计：预计 ${Number(data.work.total_expected_hours??data.work.parts.reduce((total,part)=>total+Number(part.expected_hours||0),0)).toFixed(2)} 小时；实际总耗时 ${Number(data.work.total_actual_hours??data.work.parts.reduce((total,part)=>total+Number(part.actual_hours||0),0)).toFixed(2)} 小时</div>${workDetail(data.work.parts)}</div>`;}
 function attendanceDetail(rows){return '<div class="table-wrap"><table><thead><tr><th>用户名</th><th>显示名</th><th>报到时间</th></tr></thead><tbody>'+rows.map(x=>'<tr><td>'+esc(x.username)+'</td><td>'+esc(x.display_name||'-')+'</td><td>'+esc(x.checked_in_at)+'</td></tr>').join('')+(rows.length?'':'<tr><td colspan="3">当天没有报到记录</td></tr>')+'</tbody></table></div>'}
 function workDetail(rows){return '<div class="table-wrap"><table><thead><tr><th>标签</th><th>项目</th><th>完成者</th><th>预计工时</th><th>实际耗时</th></tr></thead><tbody>'+rows.map(x=>'<tr><td>'+esc(x.product_tag)+'</td><td>'+esc(x.project||x.annotation_content)+'</td><td>'+esc(x.display_name||x.username||'-')+'</td><td>'+Number(x.expected_hours||0).toFixed(2)+' 小时</td><td>'+Number(x.actual_hours||0).toFixed(2)+' 小时</td></tr>').join('')+(rows.length?'':'<tr><td colspan="5">当天没有完成 Part</td></tr>')+'</tbody></table></div>'}
 async function loadSettlementDate(date){try{const data=await api("GET","/api/attendance/settlements?days=7&date="+encodeURIComponent(date));renderSettlement(data)}catch(e){toast(e.message)}}
