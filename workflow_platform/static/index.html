@@ -150,7 +150,7 @@ const _partCardOriginal=partCard;
 const _renderDetailOriginal=renderDetail;
  const _workerViewOriginal=workerView;
  workerView=function(t){return t.is_applicant?applicantView(t):_workerViewOriginal(t)};
- renderDetail=function(){_renderDetailOriginal();const grid=document.querySelector('.info-grid');if(grid){[...grid.children].forEach(node=>{const label=node.querySelector('label')?.textContent||'';if(['数据集溯源','数据路径','标注说明书路径','标注工具'].some(item=>label.startsWith(item)))node.remove();});const priority=document.createElement('div');priority.className='info';priority.innerHTML='<label>优先级</label><div class="value">'+esc(priorityName[selected.priority]||'中')+'</div>';grid.insertBefore(priority,grid.firstChild);}};
+ renderDetail=function(){_renderDetailOriginal();const grid=document.querySelector('.info-grid');if(grid){const priority=document.createElement('div');priority.className='info';priority.innerHTML='<label>优先级</label><div class="value">'+esc(priorityName[selected.priority]||'中')+'</div>';grid.insertBefore(priority,grid.firstChild);}};
  setInterval(()=>{if(me&&selected&&!adminStatsOpen&&!document.querySelector('dialog[open]')&&!document.activeElement?.matches('.part-count-input'))openTask(selected.task_id)},15000);init().catch(e=>toast(e.message));
 </script>
 
