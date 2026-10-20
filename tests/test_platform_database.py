@@ -551,7 +551,7 @@ class PlatformDatabaseTests(unittest.TestCase):
         self.db.submit_part(
             "task-1", claimed["part_id"], "worker", "已完成", "2026-07-15T10:02:00+08:00"
         )
-        with self.assertRaisesRegex(PermissionError, "publisher, manager or admin"):
+        with self.assertRaisesRegex(PermissionError, "publisher, manager, applicant or admin"):
             self.db.review_part(
                 "task-1", claimed["part_id"], "other-user", "approve", "", "2026-07-15T10:03:00+08:00"
             )

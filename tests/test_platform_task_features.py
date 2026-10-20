@@ -71,6 +71,45 @@ def test_applicant_matches_active_user_by_username_or_display_name(clients):
     assert publish(publisher, 1, applicant='外部申请人')
 
 
+@pytest.mark.parametrize('applicant_name', ['viewer', '目录申请人'])
+def test_matched_applicant_reviews_other_workers_without_task_management(clients, applicant_name, monkeypatch):
+    admin, publisher, applicant = clients
+    assert admin.patch('/api/users/viewer', json={'display_name': '目录申请人'}).status_code == 200
+    for username in ('annotator', 'outsider'):
+        assert admin.post('/api/users', json={'username': username, 'password': username + '-pass'}).status_code == 200
+    task_id = publish(publisher, 1, applicant=applicant_name)
+    route = f'/api/tasks/{task_id}'
+    with TestClient(platform.app) as annotator, TestClient(platform.app) as outsider:
+        for client, username in ((annotator, 'annotator'), (outsider, 'outsider')):
+            assert client.post('/api/auth/login', json={'username': username, 'password': username + '-pass'}).status_code == 200
+        claim = annotator.post(route + '/parts/claim-next')
+        assert claim.status_code == 200, claim.text
+        part_id = claim.json()['part']['part_id']
+        part_route = f'{route}/parts/{part_id}'
+        assert annotator.post(part_route + '/submit', json={'note': 'ready for applicant'}).status_code == 200
+        detail = applicant.get(route).json()
+        assert detail['applicant'] == 'viewer'
+        assert detail['is_applicant'] and detail['can_review'] and detail['can_view_all']
+        assert detail['parts'][0]['annotator'] == 'annotator'
+        listed = next(task for task in applicant.get('/api/tasks').json()['tasks'] if task['task_id'] == task_id)
+        assert listed['can_review'] and listed['is_applicant']
+        assert not outsider.get(route).json()['can_review']
+        assert outsider.post(part_route + '/review', json={'action': 'approve'}).status_code == 403
+        assert annotator.post(part_route + '/review', json={'action': 'approve'}).status_code == 403
+        assert applicant.post(part_route + '/review', json={'action': 'rework', 'note': '请修正'}).status_code == 200
+        assert annotator.post(part_route + '/start-rework').status_code == 200
+        assert annotator.post(part_route + '/submit', json={'note': 'fixed'}).status_code == 200
+        events = []
+        monkeypatch.setattr(platform, 'enqueue_task_reminder', lambda *args, **kwargs: events.append(args))
+        assert applicant.post(part_route + '/review', json={'action': 'approve'}).status_code == 200
+        assert events == [('completed', task_id, 'viewer', 'completed:' + task_id)]
+        assert applicant.get(route).json()['status'] == 'completed'
+        assert applicant.patch(route, json={'project': 'unauthorized'}).status_code == 403
+        assert applicant.post(route + '/parts', json={'count': 1}).status_code == 403
+        assert applicant.delete(route).status_code == 403
+        assert applicant.post(part_route + '/time-review', json={'decision': 'estimate_reasonable'}).status_code == 403
+
+
 def test_admin_manages_other_publishers_task_and_audits_actor(clients):
     admin, publisher, viewer = clients
     task_id = publish(publisher, 1)

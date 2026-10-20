@@ -4,7 +4,9 @@ const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 (async () => {
   const browser = await chromium.launch({headless: true, executablePath: process.env.CHROMIUM_PATH || chromium.executablePath()});
   try {
-    const page = await browser.newPage();
+    const platformUrl = process.env.PLATFORM_URL || 'http://127.0.0.1:8000/';
+    const target = new URL(platformUrl);
+    const page = await browser.newPage({ignoreHTTPSErrors: target.protocol === 'https:' && ['127.0.0.1', 'localhost'].includes(target.hostname)});
     const errors = [], requests = [];
     page.on('pageerror', error => errors.push(error.message));
     // Exercise the served UI without changing real users, Parts, or performance data.
@@ -13,8 +15,26 @@ const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
       if (url.pathname === '/api/auth/me') return route.fulfill({json: {user: {username: 'worker', role: 'user'}, bootstrap_required: false}});
       return route.fulfill({json: {tasks: [], items: [], users: []}});
     });
-    await page.goto(process.env.PLATFORM_URL || 'http://127.0.0.1:8000/');
+    await page.goto(platformUrl);
     await page.waitForFunction(() => typeof window.submitDailyProgress === 'function');
+    await page.evaluate(async () => {
+      await openPublish();
+      const modes = document.querySelectorAll('#pub-mode');
+      if (modes.length !== 1) throw new Error('Duplicate publish mode controls');
+      document.getElementById('pub-mode').value = 'manual';
+      document.getElementById('pub-parts-mode').value = 'later';
+      togglePublishMode();
+      document.getElementById('pub-project').value = 'Integration project';
+      document.getElementById('pub-applicant').value = 'worker';
+      const body = publishBody();
+      if (body.input_mode !== 'manual' || body.task.project !== 'Integration project' || body.part_count !== 0 || body.manager !== '') throw new Error('Publish wrappers conflict');
+      document.getElementById('publish-dialog').close();
+      if (!document.getElementById('inbox-button')) throw new Error('Inbox entry is missing');
+      me = {username: 'admin', role: 'admin'};
+      updateUser();
+      const reportLink = document.getElementById('production-reports-link');
+      if (!reportLink || reportLink.classList.contains('hidden')) throw new Error('Production report entry is missing');
+    });
     await page.evaluate(() => {
       window.prompt = () => {throw new Error('Native prompt must not be used');};
       const part = {part_id: 1, name: '测试 Part', annotator: 'worker', status: 'in_progress', progress_count: 60, credited_count: 40, image_count: 100};

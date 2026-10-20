@@ -1562,14 +1562,14 @@ class PlatformDatabase:
             raise ValueError("action must be approve or rework")
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT p.status,t.publisher,t.manager FROM parts p "
+                "SELECT p.status,t.publisher,t.manager,t.applicant FROM parts p "
                 "JOIN tasks t ON t.task_id=p.task_id "
                 "WHERE p.task_id=? AND p.part_id=?", (task_id, part_id)
             ).fetchone()
             if row is None:
                 raise KeyError(part_id)
-            if actor not in {row["publisher"], row["manager"]} and not is_admin:
-                raise PermissionError("only publisher, manager or admin can review")
+            if actor not in {row["publisher"], row["manager"], row["applicant"]} and not is_admin:
+                raise PermissionError("only publisher, manager, applicant or admin can review")
             if row["status"] != "submitted":
                 raise ValueError("only submitted part can be reviewed")
             status = "completed" if action == "approve" else "rework"

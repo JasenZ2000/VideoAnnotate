@@ -19,52 +19,26 @@ function showFeature(title, html, view) {
   if (!featureDialog.open) featureDialog.showModal();
 }
 const publishGrid = document.querySelector('#publish-dialog .form-grid');
-const registrationForm = document.createElement('div');
-registrationForm.className = 'span2';
-registrationForm.innerHTML = '<div class="field"><label>提交方式</label><select id="pub-mode" onchange="changePublishMode()"><option value="form">填写任务登记表</option><option value="paste">从 Excel/WPS 粘贴</option></select></div><div id="registration-fields" class="form-grid" style="margin-top:13px">' + fields.map((f,i) => `<div class="field"><label>${esc(headers[i])}${['application_date','applicant','project','annotation_content','hourly_capacity','data_amount','data_path'].includes(f)?' *':''}</label><input id="registration-${f}" ${f==='application_date'?'type="date"':''} ${f==='estimated_hours'?'readonly placeholder="根据数据量和产能自动计算"':''} ${f==='hourly_capacity'?'placeholder="例如 150 或 150-200"':''}></div>`).join('') + '</div>';
-publishGrid.prepend(registrationForm);
 const collaborator = document.createElement('div');
 collaborator.className = 'field';
-collaborator.innerHTML = '<label>协同查看人 *</label><select id="pub-manager"><option value="">请选择平台账号</option></select>';
-publishGrid.insertBefore(collaborator, document.getElementById('pub-table').parentElement);
-function changePublishMode(){
-  const paste = document.getElementById('pub-mode').value === 'paste';
-  document.getElementById('registration-fields').classList.toggle('hidden', paste);
-  document.getElementById('pub-table').parentElement.classList.toggle('hidden', !paste);
-  document.getElementById('pub-preview').classList.add('hidden');
-}
-function formNumber(s){return /^\d+(\.\d+)?$/.test(s)?Number(s):NaN}
-function updateEstimatedHours(){
-  const amount = formNumber(document.getElementById('registration-data_amount').value.replace(/[,，]/g,''));
-  const rates = document.getElementById('registration-hourly_capacity').value.trim().split(/[-–—~～]/).map(s=>formNumber(s.trim()));
-  const low = rates[0], high = rates[1] ?? low;
-  document.getElementById('registration-estimated_hours').value = amount>0 && low>0 && high>=low && rates.length<=2 ? (low===high?(amount/low).toFixed(2):`${(amount/high).toFixed(2)}-${(amount/low).toFixed(2)}`) : '';
-}
-['data_amount','hourly_capacity'].forEach(f=>document.getElementById('registration-'+f).addEventListener('input',updateEstimatedHours));
-const originalOpenPublish = openPublish;
+collaborator.innerHTML = '<label>协同查看人（可选）</label><select id="pub-manager"><option value="">不设置额外协同查看人</option></select>';
+publishGrid.appendChild(collaborator);
+const previousRegistrationOpenPublish = openPublish;
 openPublish = async function(){
   if (!me){openAuth();return}
   try {
     const options = await api('GET','/api/user-options');
     const select = document.getElementById('pub-manager');
     const chosen = select.value;
-    select.innerHTML = '<option value="">请选择平台账号</option>' + options.users.map(u=>`<option value="${esc(u.username)}">${esc(u.display_name||u.username)} (${esc(u.username)})</option>`).join('');
+    select.innerHTML = '<option value="">不设置额外协同查看人</option>' + options.users.map(user=>`<option value="${esc(user.username)}">${esc(user.display_name||user.username)} (${esc(user.username)})</option>`).join('');
     select.value = chosen;
-    document.getElementById('registration-application_date').value ||= new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Shanghai'}).format(new Date());
-    document.getElementById('registration-applicant').value ||= me.display_name||me.username;
-    changePublishMode();
-    originalOpenPublish();
-  } catch(e){toast(e.message)}
+    previousRegistrationOpenPublish();
+  } catch(error){toast(error.message)}
 };
-const originalPublishBody = publishBody;
+const previousRegistrationPublishBody = publishBody;
 publishBody = function(){
-  const body = originalPublishBody();
+  const body = previousRegistrationPublishBody();
   body.manager = document.getElementById('pub-manager').value;
-  if (!body.manager) throw new Error('请选择协同查看人');
-  if(document.getElementById('pub-mode').value==='form'){
-    body.clipboard_text = '';
-    body.registration = Object.fromEntries(fields.map(f=>[f,document.getElementById('registration-'+f).value]));
-  }
   return body;
 };
 function registrationTable(rows){

@@ -1138,7 +1138,11 @@ def publication_rows(req: PublishTasksReq) -> list[dict[str, str]]:
         rows = parse_spreadsheet_rows(req.clipboard_text)
         for row in rows:
             row["applicant"] = resolve_applicant(row["applicant"])
-            validate_registration_row(row)
+            amount = numeric_range(row["data_amount"])
+            capacity = numeric_range(row["hourly_capacity"])
+            if amount and capacity and not numeric_range(row["estimated_hours"]):
+                low, high = amount[0] / capacity[1], amount[1] / capacity[0]
+                row["estimated_hours"] = f"{low:.2f}" if low == high else f"{low:.2f}-{high:.2f}"
         return rows
     if req.input_mode != "manual":
         raise ValueError("不支持的发布方式")
@@ -1291,8 +1295,9 @@ async def list_tasks():
         task["can_manage_task"] = task["publisher"] == actor or user.get("role") == "admin"
         task["is_publisher"] = task["publisher"] == actor
         task["is_manager"] = bool(task.get("manager")) and task["manager"] == actor and not task["is_publisher"]
-        task["can_review"] = task["is_publisher"] or task["is_manager"] or user.get("role") == "admin"
-        task["can_view_all"] = task["can_review"] or task["is_manager"]
+        task["is_applicant"] = bool(task.get("applicant")) and task["applicant"] == actor
+        task["can_review"] = task["is_publisher"] or task["is_manager"] or task["is_applicant"] or user.get("role") == "admin"
+        task["can_view_all"] = task["can_review"]
         task["can_manage_ordering"] = user.get("role") == "admin"
         mine = database().actor_part_summary(task["task_id"], actor)
         task["my_parts"] = mine["total"]
@@ -1314,8 +1319,8 @@ async def get_task(task_id: str, part_status: str = "", part_query: str = "",
     publisher = task["publisher"] == actor
     applicant = bool(task.get("applicant")) and task["applicant"] == actor
     manager = bool(task.get("manager")) and task["manager"] == actor and not publisher
-    can_review = publisher or manager or user.get("role") == "admin"
-    can_view_all = can_review or manager or task.get("applicant") == actor
+    can_review = publisher or manager or applicant or user.get("role") == "admin"
+    can_view_all = can_review
     task["can_manage_task"] = publisher or user.get("role") == "admin"
     task["is_publisher"] = publisher
     task["is_applicant"] = applicant
