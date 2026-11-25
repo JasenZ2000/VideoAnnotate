@@ -259,8 +259,9 @@ class PlatformDatabaseTests(unittest.TestCase):
             "2026-07-16T12:00:00+08:00",
         )
         first_worker = next(item for item in first_day["users"] if item["username"] == "worker")
-        self.assertEqual(first_worker["completed_parts"], 0)
-        self.assertEqual(first_worker["image_count"], 0)
+        self.assertEqual(first_worker["completed_parts"], 1)
+        self.assertEqual(first_worker["image_count"], 80)
+        self.assertEqual(first_worker["rework_count"], 1)
         self.assertEqual(first_worker["work_seconds"], 3600.0)
 
         second_day = self.db.admin_annotation_statistics(
@@ -269,8 +270,9 @@ class PlatformDatabaseTests(unittest.TestCase):
             "2026-07-16T12:00:00+08:00",
         )
         second_worker = next(item for item in second_day["users"] if item["username"] == "worker")
-        self.assertEqual(second_worker["completed_parts"], 1)
-        self.assertEqual(second_worker["image_count"], 80)
+        self.assertEqual(second_worker["completed_parts"], 0)
+        self.assertEqual(second_worker["image_count"], 0)
+        self.assertEqual(second_worker["rework_count"], 0)
         self.assertEqual(second_worker["work_seconds"], 3600.0)
 
         full_period = self.db.admin_annotation_statistics(
@@ -281,7 +283,11 @@ class PlatformDatabaseTests(unittest.TestCase):
         full_worker = next(item for item in full_period["users"] if item["username"] == "worker")
         self.assertEqual(full_worker["completed_parts"], 1)
         self.assertEqual(full_worker["image_count"], 80)
+        self.assertEqual(full_worker["rework_count"], 1)
         self.assertEqual(full_worker["work_seconds"], 7200.0)
+        self.assertEqual(full_period["total"]["rework_count"], 1)
+        self.assertEqual(full_period["products"][0]["image_count"], 80)
+        self.assertEqual(full_period["products"][0]["rework_count"], 1)
 
     def test_task_can_create_parts_from_work_directory_specs(self) -> None:
         self.db.create_task(

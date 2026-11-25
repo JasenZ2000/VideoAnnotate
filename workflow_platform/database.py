@@ -1816,6 +1816,23 @@ class PlatformDatabase:
                 "FROM part_work_sessions s JOIN parts p ON p.part_id=s.part_id "
                 "JOIN tasks t ON t.task_id=p.task_id WHERE t.deleted=0"
             ).fetchall()
+            submission_rows = connection.execute(
+                "SELECT e.event_id,e.part_id,e.task_id,e.annotator,e.submitted_at,e.credited_count,e.event_kind,"
+                "CASE WHEN e.event_kind='final_submission' AND NOT EXISTS ("
+                "SELECT 1 FROM part_submission_events old WHERE old.part_id=e.part_id "
+                "AND old.event_kind='final_submission' AND old.event_id<e.event_id) THEN 1 ELSE 0 END first_final,"
+                "p.bbox_count,p.name,t.name task_name,t.project,t.annotation_content,t.product_tag "
+                "FROM part_submission_events e JOIN parts p ON p.part_id=e.part_id "
+                "JOIN tasks t ON t.task_id=e.task_id WHERE t.deleted=0 AND e.event_kind!='legacy_import' "
+                "ORDER BY e.event_id"
+            ).fetchall()
+            rework_rows = connection.execute(
+                "SELECT c.part_id,c.created_at,p.task_id,p.annotator,p.name,"
+                "t.name task_name,t.project,t.annotation_content,t.product_tag "
+                "FROM part_comments c JOIN parts p ON p.part_id=c.part_id "
+                "JOIN tasks t ON t.task_id=p.task_id "
+                "WHERE t.deleted=0 AND c.kind='review_rework' AND COALESCE(p.annotator,'')!=''"
+            ).fetchall()
 
         overridden_parts = {
             int(part["part_id"]) for part in part_rows if part["work_seconds_override"] is not None
@@ -1854,6 +1871,7 @@ class PlatformDatabase:
                 "completed_parts": 0,
                 "image_count": 0,
                 "bbox_count": 0,
+                "rework_count": 0,
                 "work_seconds": 0.0,
                 "tasks": {},
             })
@@ -1887,6 +1905,7 @@ class PlatformDatabase:
                 "completed_parts": 0,
                 "image_count": 0,
                 "bbox_count": 0,
+                "rework_count": 0,
                 "work_seconds": 0.0,
             })
             product_item["task_ids"].add(task_id)
@@ -1899,6 +1918,7 @@ class PlatformDatabase:
                 "completed_parts": 0,
                 "image_count": 0,
                 "bbox_count": 0,
+                "rework_count": 0,
                 "work_seconds": 0.0,
             })
             if completed:
@@ -1917,6 +1937,76 @@ class PlatformDatabase:
             task_item["work_seconds"] += seconds
             item["work_seconds"] += seconds
             product_item["work_seconds"] += seconds
+
+        # Image production is credited from immutable submission deltas. A
+        # rejected submission is counted separately as a rework request.
+        for item in grouped.values():
+            item.update(completed_parts=0, image_count=0, rework_count=0)
+            for task_item in item["tasks"].values():
+                task_item.update(completed_parts=0, image_count=0, rework_count=0)
+        for item in product_groups.values():
+            item.update(completed_parts=0, image_count=0, rework_count=0)
+            item["completed_part_ids"] = set()
+
+        for event in submission_rows:
+            if event["event_kind"] == "legacy_import" or not in_window(event["submitted_at"]):
+                continue
+            username = str(event["annotator"] or "")
+            if not username:
+                continue
+            item = user_item(username)
+            task_id = str(event["task_id"])
+            product_tag = str(event["product_tag"] or "未分类")
+            product_item = product_groups.setdefault(product_tag, {
+                "product_tag": product_tag, "task_ids": set(), "completed_parts": 0,
+                "image_count": 0, "bbox_count": 0, "rework_count": 0,
+                "work_seconds": 0.0, "completed_part_ids": set(),
+            })
+            product_item["task_ids"].add(task_id)
+            task_item = item["tasks"].setdefault(task_id, {
+                "task_id": task_id, "name": str(event["task_name"] or ""),
+                "project": str(event["project"] or ""),
+                "annotation_content": str(event["annotation_content"] or ""),
+                "completed_parts": 0, "image_count": 0, "bbox_count": 0,
+                "rework_count": 0, "work_seconds": 0.0,
+            })
+            credited = max(0, int(event["credited_count"] or 0))
+            item["image_count"] += credited
+            task_item["image_count"] += credited
+            product_item["image_count"] += credited
+            if event["first_final"]:
+                part_id = int(event["part_id"])
+                if part_id not in product_item["completed_part_ids"]:
+                    product_item["completed_part_ids"].add(part_id)
+                    item["completed_parts"] += 1
+                    task_item["completed_parts"] += 1
+                    product_item["completed_parts"] += 1
+
+        for event in rework_rows:
+            if not in_window(event["created_at"]):
+                continue
+            username = str(event["annotator"] or "")
+            if not username:
+                continue
+            item = user_item(username)
+            task_id = str(event["task_id"])
+            product_tag = str(event["product_tag"] or "未分类")
+            product_item = product_groups.setdefault(product_tag, {
+                "product_tag": product_tag, "task_ids": set(), "completed_parts": 0,
+                "image_count": 0, "bbox_count": 0, "rework_count": 0,
+                "work_seconds": 0.0, "completed_part_ids": set(),
+            })
+            product_item["task_ids"].add(task_id)
+            task_item = item["tasks"].setdefault(task_id, {
+                "task_id": task_id, "name": str(event["task_name"] or ""),
+                "project": str(event["project"] or ""),
+                "annotation_content": str(event["annotation_content"] or ""),
+                "completed_parts": 0, "image_count": 0, "bbox_count": 0,
+                "rework_count": 0, "work_seconds": 0.0,
+            })
+            item["rework_count"] += 1
+            task_item["rework_count"] += 1
+            product_item["rework_count"] += 1
 
         users: list[dict[str, Any]] = []
         for item in grouped.values():
@@ -1955,6 +2045,7 @@ class PlatformDatabase:
                 "product_tag": item["product_tag"],
                 "task_count": len(item["task_ids"]),
                 "completed_parts": item["completed_parts"],
+                "rework_count": item["rework_count"],
                 "image_count": item["image_count"],
                 "bbox_count": item["bbox_count"],
                 "work_seconds": work_seconds,
@@ -1966,6 +2057,7 @@ class PlatformDatabase:
         total_image_count = sum(int(item["image_count"]) for item in users)
         total_bbox_count = sum(int(item["bbox_count"]) for item in users)
         total_completed_parts = sum(int(item["completed_parts"]) for item in users)
+        total_rework_count = sum(int(item["rework_count"]) for item in users)
         return {
             "start": start,
             "end": end,
@@ -1973,6 +2065,7 @@ class PlatformDatabase:
             "products": products,
             "total": {
                 "completed_parts": total_completed_parts,
+                "rework_count": total_rework_count,
                 "image_count": total_image_count,
                 "bbox_count": total_bbox_count,
                 "bboxes_per_hour": round(total_bbox_count / total_work_seconds * 3600, 3) if total_work_seconds > 0 else 0.0,
