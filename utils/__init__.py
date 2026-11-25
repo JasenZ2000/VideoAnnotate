@@ -1,1 +1,2 @@
-"""Implementation packages used by the user-facing services."""
+"""Utility helpers for I/O and bounding boxes."""
+

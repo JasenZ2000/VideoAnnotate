@@ -588,11 +588,15 @@ class WorkflowPlatformTests(unittest.TestCase):
         self.assertIn("partReviewTools", page.text)
         self.assertIn("展开全部", page.text)
         self.assertIn("openAdminStatistics", page.text)
+        self.assertIn("info('数据集溯源',t.dataset_source)", page.text)
+        self.assertIn("info('数据路径',t.data_path,true,true)", page.text)
+        self.assertIn("info('标注说明书路径',t.guide_path,true,true)", page.text)
+        self.assertNotIn("node.remove()", page.text)
         self.assertIn("/api/admin/statistics", page.text)
         self.assertIn("人员任务统计", page.text)
         self.assertIn("完成数据量", page.text)
         self.assertIn("返修次数", page.text)
-        self.assertIn("总体完成图片", page.text)
+        self.assertNotIn("总体完成图片", page.text)
 
     def test_main_enables_https_and_secure_cookie_with_pem_files(self) -> None:
         cert = Path(self.temporary.name) / "server.crt"
