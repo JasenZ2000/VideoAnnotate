@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>日报与周绩效</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;background:#f4f6fa;color:#26334a;font:15px/1.6 system-ui,sans-serif}main{max-width:1180px;margin:auto;padding:28px}h1{margin:12px 0}h2{font-size:20px}a{color:#235fc1}section,.notice{background:white;border:1px solid #dde4ee;border-radius:10px;padding:18px;margin:16px 0}.tools{display:flex;align-items:center;flex-wrap:wrap;gap:14px}label{display:inline-flex;align-items:center;gap:8px}button,input,select{font:inherit;padding:7px 10px;border:1px solid #bac6d8;border-radius:5px}button{background:#fff;color:#2357a0;cursor:pointer}button:disabled{opacity:.5;cursor:wait}.sub{color:#59677e}.warning{background:#fff7e4;border-color:#e3c37a}#error{color:#b42318}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:10px;text-align:left;border-bottom:1px solid #e1e7ee;vertical-align:top}th{background:#f0f4fa}.scroll{overflow:auto}.copy-buttons{display:flex;gap:8px;flex-wrap:wrap}textarea{width:100%;min-height:90px;font:inherit}#copy-fallback[hidden]{display:none}.totals{font-size:19px}.user-head{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap}#copy-status{min-height:24px;color:#2357a0}
+  </style>
+  <style>[hidden]{display:none!important}</style>
+</head>
+<body><main>
+  <a href="/">← 返回标注平台</a>
+  <h1>日报与周绩效</h1>
+  <p class="sub">按北京时间的首次成功提交增量统计，单位为图片。分批提交只计新增量，返工不再计数。</p>
+  <section class="tools">
+    <label>报表<select id="period"><option value="day">日报</option><option value="week">周绩效（周二至下周一）</option></select></label>
+    <label>日期<input id="anchor" type="date"></label>
+    <label>人员<select id="person"><option value="">全部人员</option></select></label>
+    <label id="workdays-label" hidden><input id="workdays" type="checkbox" checked>仅周一至周五</label>
+    <button id="refresh">查询 / 刷新</button>
+  </section>
+  <p id="error" role="alert"></p>
+  <div id="coverage" class="notice"></div>
+  <div class="notice">复制后打开钉钉文档，在对应人员、日期的单元格中粘贴。日报复制到 D 列和 F 列；周报复制到 A—D 列和 F 列。请逐项核对目标行。计划量、是否完成、得分、评级和备注由你填写。页面不会直接更新钉钉表格。</div>
+  <div id="summary" class="totals"></div>
+  <div id="copy-status" role="status"></div>
+  <section id="copy-fallback" hidden><label for="copy-text">剪贴板不可用，请手动复制：</label><textarea id="copy-text" readonly></textarea></section>
+  <div id="users"></div>
+  <section><h2>提交明细</h2><p class="sub">“本次新增”为本次计入完成量的数量。这里保留返工、最终提交的零增量记录，便于核对。</p><div class="scroll"><table><thead><tr><th>时间（北京时间）</th><th>账号</th><th>项目 / Part</th><th>累计提交</th><th>本次新增</th><th>类型</th></tr></thead><tbody id="events"></tbody></table></div></section>
+  <p class="sub">工作日筛选默认指周一至周五，未配置法定节假日或调休。周末上班时可取消筛选，纳入本周期所有实际提交。历史报表请保留原有记录。</p>
+</main><script src="/static/production_reports.js?v=20261019"></script></body>
+</html>

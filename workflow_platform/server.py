@@ -38,7 +38,7 @@ APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 PROJECT_ROOT = APP_DIR.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "platform_tasks"
-API_SCHEMA_VERSION = 18
+API_SCHEMA_VERSION = 19
 SESSION_COOKIE_NAME = "annotation_platform_session"
 SESSION_TTL_DAYS = int(os.environ.get("ANNOTATION_PLATFORM_SESSION_DAYS", "7"))
 PASSWORD_ITERATIONS = 200_000
@@ -162,6 +162,10 @@ class SubmitPartReq(BaseModel):
     note: str = ""
 
 
+class SubmitProgressReq(BaseModel):
+    progress_count: int = Field(strict=True, ge=0, le=2**53 - 1)
+
+
 class ReviewPartReq(BaseModel):
     action: str
     note: str = ""
@@ -256,19 +260,20 @@ def working_day_completion(start: date, work_days: int) -> date:
 
 
 def statistics_period_bounds(period: str, anchor: str = "", *, now: Optional[str] = None) -> tuple[str, str]:
-    """Resolve a day/week/month report window in the platform's local timezone."""
+    """Resolve China-time windows; a reporting week starts on Tuesday."""
     value = period.strip().lower()
     if value not in {"day", "week", "month"}:
         raise ValueError("统计周期必须是 day、week 或 month")
-    current = datetime.fromisoformat(now) if now else datetime.now().astimezone()
-    tz = current.tzinfo or timezone.utc
+    tz = timezone(timedelta(hours=8))
+    current = datetime.fromisoformat(now) if now else datetime.now(tz)
+    current = current.replace(tzinfo=tz) if current.tzinfo is None else current.astimezone(tz)
     try:
         selected = date.fromisoformat(anchor) if anchor.strip() else current.date()
     except ValueError as exc:
         raise ValueError("统计日期必须使用 YYYY-MM-DD 格式") from exc
     start_date = selected
     if value == "week":
-        start_date = selected - timedelta(days=selected.weekday())
+        start_date = selected - timedelta(days=(selected.weekday() - 1) % 7)
     elif value == "month":
         start_date = selected.replace(day=1)
     start = datetime.combine(start_date, datetime.min.time(), tzinfo=tz)
@@ -505,6 +510,12 @@ async def overview_page():
 async def users_page():
     require_admin()
     return FileResponse(STATIC_DIR / "users.html")
+
+
+@app.get("/reports")
+async def production_reports_page():
+    require_admin()
+    return FileResponse(STATIC_DIR / "production_reports.html")
 
 
 @app.get("/api/health")
@@ -919,6 +930,16 @@ async def admin_statistics(period: str = "month", date: str = ""):
         current = now_iso()
         start, end = statistics_period_bounds(period, date, now=current)
         return database().admin_annotation_statistics(start, end, current)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/admin/production-report")
+async def production_report(period: str = "day", date: str = "", workdays_only: bool = False):
+    require_admin()
+    try:
+        start, end = statistics_period_bounds(period, date, now=now_iso())
+        return database().production_report(start, end, workdays_only=workdays_only)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -1348,6 +1369,16 @@ async def submit_part(task_id: str, part_id: int, req: SubmitPartReq):
     actor = require_user()["username"]
     try:
         part = database().submit_part(task_id, part_id, actor, req.note, now_iso())
+    except BaseException as exc:
+        _raise_database_error(exc)
+    return {"part": part}
+
+
+@app.post("/api/tasks/{task_id}/parts/{part_id}/submit-progress")
+async def submit_progress(task_id: str, part_id: int, req: SubmitProgressReq):
+    actor = require_user()["username"]
+    try:
+        part = database().submit_progress(task_id, part_id, actor, req.progress_count, now_iso())
     except BaseException as exc:
         _raise_database_error(exc)
     return {"part": part}
